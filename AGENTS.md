@@ -1,0 +1,64 @@
+# QuickFox Agent Rules
+
+本文件是 QuickFox 仓库的 Codex/agent 项目级规则。长期工程纪律放在这里；
+具体产品范围和变更细节放在 `openspec/` 和 `docs/superpowers/specs/`。
+
+## 沟通与文档
+
+- 默认用中文与项目维护者沟通。
+- 面向维护者的项目文档默认写中文。
+- 代码标识符、依赖配置、第三方工具配置遵循对应生态的常见英文约定。
+- 新增复杂模块、Provider、Action、平台 Adapter 时，必须补充或更新文档。
+
+## 流程
+
+- 非平凡功能、行为变化、架构变化必须先走 OpenSpec + Superpowers 流程。
+- 需求不清楚时先 brainstorming；需求清楚时先写 OpenSpec proposal。
+- 实现行为变化时按 TDD 执行：先写能失败的测试，再写实现。
+- 声称完成前必须执行 verification-before-completion，并给出实际验证结果。
+- 遇到 bug、测试失败或异常行为时，先系统化定位根因，再修复。
+
+## 架构边界
+
+- QuickFox 使用 Tauri：前端 TypeScript，后端 Rust。
+- 前端负责 UI 展示和交互；Rust core 负责查询、Provider、Action、配置、
+  索引、历史和排序。
+- 平台差异必须隔离在 Adapter 层，例如快捷键、打开文件/URL、外部终端、
+  系统路径。
+- Provider 只产出统一结果，不直接执行动作。
+- Action 执行必须通过 Rust core，保证平台适配和安全检查集中。
+- 第一版只做内部可扩展边界，不开放第三方插件 API，除非有新的 OpenSpec
+  变更明确要求。
+
+## 代码质量
+
+- 不保留死代码、废弃代码、未使用的生成示例代码。
+- Rust 后端逻辑不能堆在一个巨大的 `main.rs` 中。
+- 前端 UI 不能堆在一个巨大的根组件中。
+- 模块要小而清楚，每个模块有明确职责和可测试边界。
+- 只在非显而易见的逻辑处写注释，避免解释显然代码。
+- 优先使用结构化 API、解析器和类型边界，不用脆弱的字符串拼接承载核心逻辑。
+
+## 测试与检查
+
+- Rust 代码必须通过 `rustfmt`、`clippy` 和相关单元测试。
+- 前端代码必须通过 TypeScript、ESLint、Prettier 和相关测试。
+- 新增 Provider、Action、查询解析、配置、索引、历史、排序、安全规则时，
+  必须补充对应测试。
+- Windows/Linux 行为不能只靠 macOS 推断；能自动化的部分必须进入 CI。
+- 真实桌面行为，例如全局快捷键、窗口行为、Windows Terminal 执行，需要在
+  Windows 机器上手工验收，问题通过 GitHub issue 回流并尽量补回归测试。
+
+## CI 与发布
+
+- GitHub Actions 使用标准 GitHub-hosted runner，不使用 larger runner。
+- 普通 push/PR 只跑检查和构建验证，不默认发布安装包。
+- 发布打包应通过手动 workflow 或 tag release workflow 触发。
+
+## 安全与隐私
+
+- 命令执行默认关闭。
+- 启用命令执行前必须提示风险；每次执行前必须确认。
+- 危险命令识别只是防护栏，不是安全沙箱；文档必须说明命令以当前用户权限运行。
+- 命令历史默认保留最近 15 条，但必须提供清空、关闭和调整条数的设置。
+- 不要把 token、密钥、个人路径等敏感信息写入示例、测试快照或日志。
