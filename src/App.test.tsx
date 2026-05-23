@@ -2,10 +2,12 @@ import { fireEvent, render, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { App } from "./App";
-import { executeAction, search } from "./tauriClient";
+import { executeAction, loadConfig, saveConfig, search } from "./tauriClient";
 
 vi.mock("./tauriClient", () => ({
   executeAction: vi.fn(),
+  loadConfig: vi.fn(),
+  saveConfig: vi.fn(),
   search: vi.fn(),
 }));
 
@@ -38,10 +40,42 @@ const fileResults = [
   },
 ];
 
+const appConfig = {
+  index: {
+    include_dirs: ["/tmp"],
+    exclude_dirs: [],
+    exclude_patterns: [],
+  },
+  query: {
+    regex_prefix: "re:",
+  },
+  web_search: {
+    engines: {},
+  },
+  command: {
+    prefix: ">",
+    enabled: false,
+  },
+  history: {
+    file_history_enabled: true,
+    calculator_history_enabled: false,
+    web_search_history_enabled: false,
+    command_history_enabled: true,
+    command_max_entries: 15,
+  },
+  results: {
+    limit: 20,
+  },
+};
+
 describe("App", () => {
   beforeEach(() => {
     vi.mocked(search).mockReset();
     vi.mocked(executeAction).mockReset();
+    vi.mocked(loadConfig).mockReset();
+    vi.mocked(saveConfig).mockReset();
+    vi.mocked(loadConfig).mockResolvedValue(appConfig);
+    vi.mocked(saveConfig).mockResolvedValue("saved");
   });
 
   it("renders the compact launcher shell", () => {
@@ -171,6 +205,23 @@ describe("App", () => {
 
     expect(screen.getByRole("form", { name: "基础设置" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "返回搜索" })).toBeInTheDocument();
+  });
+
+  it("saves updated command settings through the Tauri config command", async () => {
+    render(<App />);
+
+    fireEvent.click(screen.getByRole("button", { name: "打开设置" }));
+    await screen.findByDisplayValue("/tmp");
+    fireEvent.click(screen.getByLabelText("命令执行"));
+    fireEvent.click(screen.getByRole("button", { name: "保存设置" }));
+
+    expect(saveConfig).toHaveBeenCalledWith({
+      ...appConfig,
+      command: {
+        ...appConfig.command,
+        enabled: true,
+      },
+    });
   });
 
   it("renders the basic settings view", () => {

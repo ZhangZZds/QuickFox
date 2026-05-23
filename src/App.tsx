@@ -1,6 +1,12 @@
 import { type KeyboardEvent, useEffect, useState } from "react";
 
-import { executeAction, search as searchResults } from "./tauriClient";
+import {
+  executeAction,
+  loadConfig,
+  type QuickFoxConfig,
+  saveConfig,
+  search as searchResults,
+} from "./tauriClient";
 
 type LauncherAction =
   | { type: "openPath"; path: string }
@@ -30,6 +36,34 @@ type AppProps = {
   initialView?: "launcher" | "settings";
   onClose?: () => void;
   onExecuteAction?: (action: LauncherAction) => void;
+};
+
+const fallbackConfig: QuickFoxConfig = {
+  index: {
+    include_dirs: [],
+    exclude_dirs: [],
+    exclude_patterns: [],
+  },
+  query: {
+    regex_prefix: "re:",
+  },
+  web_search: {
+    engines: {},
+  },
+  command: {
+    prefix: ">",
+    enabled: false,
+  },
+  history: {
+    file_history_enabled: true,
+    calculator_history_enabled: false,
+    web_search_history_enabled: false,
+    command_history_enabled: true,
+    command_max_entries: 15,
+  },
+  results: {
+    limit: 20,
+  },
 };
 
 function labelForAction(action: LauncherAction) {
@@ -67,16 +101,33 @@ export function App({
   onExecuteAction = executeAction,
 }: AppProps) {
   const [view, setView] = useState<"launcher" | "settings">(initialView);
+  const [config, setConfig] = useState<QuickFoxConfig>(fallbackConfig);
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<LauncherResult[]>([]);
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [menuResultId, setMenuResultId] = useState<string | null>(null);
+  const effectiveCommandEnabled = commandEnabled ?? config.command.enabled;
 
   const isCommandQuery = query.trim().startsWith(">");
   const isCommandMode = isCommandQuery;
   const commandText = query.trim().slice(1).trim();
   const selectedResult = results[Math.min(selectedIndex, Math.max(results.length - 1, 0))];
   const menuResult = results.find((result) => result.id === menuResultId);
+
+  useEffect(() => {
+    let cancelled = false;
+    void loadConfig()
+      .then((nextConfig) => {
+        if (!cancelled) {
+          setConfig(nextConfig as QuickFoxConfig);
+        }
+      })
+      .catch(() => undefined);
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     if (!query.trim() || isCommandQuery) {
@@ -110,6 +161,10 @@ export function App({
 
   const executeSelected = () => {
     if (isCommandMode && commandText) {
+      if (!effectiveCommandEnabled) {
+        return;
+      }
+
       onExecuteAction({
         type: "executeCommand",
         command: commandText,
@@ -160,20 +215,78 @@ export function App({
           <form aria-label="基础设置" className="settings-form">
             <label>
               索引目录
-              <textarea defaultValue={"~/Documents\n~/Downloads"} />
+              <textarea
+                value={config.index.include_dirs.join("\n")}
+                onChange={(event) =>
+                  setConfig((current) => ({
+                    ...current,
+                    index: {
+                      ...current.index,
+                      include_dirs: event.target.value
+                        .split("\n")
+                        .map((item) => item.trim())
+                        .filter(Boolean),
+                    },
+                  }))
+                }
+              />
             </label>
             <label>
               正则前缀
-              <input defaultValue="re:" />
+              <input
+                value={config.query.regex_prefix}
+                onChange={(event) =>
+                  setConfig((current) => ({
+                    ...current,
+                    query: {
+                      ...current.query,
+                      regex_prefix: event.target.value,
+                    },
+                  }))
+                }
+              />
             </label>
             <label className="toggle-row">
-              <input aria-label="命令执行" type="checkbox" defaultChecked={commandEnabled} />
+              <input
+                aria-label="命令执行"
+                type="checkbox"
+                checked={effectiveCommandEnabled}
+                onChange={(event) =>
+                  setConfig((current) => ({
+                    ...current,
+                    command: {
+                      ...current.command,
+                      enabled: event.target.checked,
+                    },
+                  }))
+                }
+              />
               <span>命令执行</span>
             </label>
             <label>
               命令历史条数
-              <input type="number" defaultValue={15} min={0} />
+              <input
+                type="number"
+                value={config.history.command_max_entries}
+                min={0}
+                onChange={(event) =>
+                  setConfig((current) => ({
+                    ...current,
+                    history: {
+                      ...current.history,
+                      command_max_entries: Number(event.target.value),
+                    },
+                  }))
+                }
+              />
             </label>
+            <button
+              type="button"
+              className="primary-button"
+              onClick={() => void saveConfig(config)}
+            >
+              保存设置
+            </button>
           </form>
         </section>
       </main>
@@ -199,13 +312,15 @@ export function App({
         </header>
         {isCommandMode ? (
           <section className="command-preview" aria-label="命令预览">
-            <span className="result-title">{commandEnabled ? commandText : "命令执行未启用"}</span>
+            <span className="result-title">
+              {effectiveCommandEnabled ? commandText : "命令执行未启用"}
+            </span>
             <span className="result-detail">
-              {commandEnabled ? "外部终端" : "设置中开启后可用"}
+              {effectiveCommandEnabled ? "外部终端" : "设置中开启后可用"}
             </span>
             <button
               type="button"
-              disabled={!commandEnabled || !commandText}
+              disabled={!effectiveCommandEnabled || !commandText}
               onClick={executeSelected}
             >
               确认执行

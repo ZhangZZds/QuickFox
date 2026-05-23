@@ -131,7 +131,8 @@ input {
 }
 
 .action-menu button,
-.command-preview button {
+.command-preview button,
+.primary-button {
   min-height: 34px;
   border: 1px solid #cbd5cf;
   border-radius: 6px;
@@ -140,7 +141,8 @@ input {
   cursor: pointer;
 }
 
-.command-preview button:disabled {
+.command-preview button:disabled,
+.primary-button:disabled {
   color: #8a928d;
   cursor: default;
   opacity: 0.65;
@@ -148,7 +150,8 @@ input {
 
 .toolbar-button:hover,
 .action-menu button:hover,
-.command-preview button:hover:not(:disabled) {
+.command-preview button:hover:not(:disabled),
+.primary-button:hover:not(:disabled) {
   background: #eef3f0;
 }
 

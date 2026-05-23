@@ -30,3 +30,31 @@ export function saveConfig(config: unknown) {
 export function clearCommandHistory() {
   return invoke("clear_command_history");
 }
+
+export type QuickFoxConfig = {
+  index: {
+    include_dirs: string[];
+    exclude_dirs: string[];
+    exclude_patterns: string[];
+  };
+  query: {
+    regex_prefix: string;
+  };
+  web_search: {
+    engines: Record<string, { name: string; url: string }>;
+  };
+  command: {
+    prefix: string;
+    enabled: boolean;
+  };
+  history: {
+    file_history_enabled: boolean;
+    calculator_history_enabled: boolean;
+    web_search_history_enabled: boolean;
+    command_history_enabled: boolean;
+    command_max_entries: number;
+  };
+  results: {
+    limit: number;
+  };
+};
