@@ -2678,6 +2678,7 @@ dependencies = [
 name = "quickfox"
 version = "0.1.0"
 dependencies = [
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",
