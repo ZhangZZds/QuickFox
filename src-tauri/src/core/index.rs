@@ -3,29 +3,30 @@
 use crate::core::actions::Action;
 use crate::core::search::{QueryRequest, SearchMode, SearchResult, SearchResultKind};
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IndexedEntryKind {
     File,
     Directory,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexedEntry {
     pub path: String,
     pub name: String,
     pub kind: IndexedEntryKind,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexFailure {
     pub root: String,
     pub message: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct IndexReport {
     pub entries: Vec<IndexedEntry>,
     pub failures: Vec<IndexFailure>,

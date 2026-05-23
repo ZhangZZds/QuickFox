@@ -208,6 +208,64 @@ impl CommandSafetyChecker {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyPress {
+    Shift,
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HotkeyState {
+    last_shift_at_ms: Option<u64>,
+    double_shift_window_ms: u64,
+}
+
+impl Default for HotkeyState {
+    fn default() -> Self {
+        Self {
+            last_shift_at_ms: None,
+            double_shift_window_ms: 500,
+        }
+    }
+}
+
+impl HotkeyState {
+    pub fn register_key_press(&mut self, key: KeyPress, timestamp_ms: u64) -> bool {
+        match key {
+            KeyPress::Other => {
+                self.last_shift_at_ms = None;
+                false
+            }
+            KeyPress::Shift => {
+                let should_show = self.last_shift_at_ms.is_some_and(|last| {
+                    timestamp_ms.saturating_sub(last) <= self.double_shift_window_ms
+                });
+                self.last_shift_at_ms = Some(timestamp_ms);
+                should_show
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LauncherWindowState {
+    visible: bool,
+}
+
+impl LauncherWindowState {
+    pub fn show(&mut self) {
+        self.visible = true;
+    }
+
+    pub fn hide(&mut self) {
+        self.visible = false;
+    }
+
+    pub fn is_visible(&self) -> bool {
+        self.visible
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -383,5 +441,34 @@ mod tests {
                 reason: "命令会提升权限或修改系统状态".to_owned()
             }
         );
+    }
+
+    #[test]
+    fn hotkey_state_detects_double_shift_within_window() {
+        let mut state = HotkeyState::default();
+
+        assert!(!state.register_key_press(KeyPress::Shift, 1_000));
+        assert!(state.register_key_press(KeyPress::Shift, 1_300));
+    }
+
+    #[test]
+    fn hotkey_state_ignores_slow_or_interrupted_shift_presses() {
+        let mut state = HotkeyState::default();
+
+        assert!(!state.register_key_press(KeyPress::Shift, 1_000));
+        assert!(!state.register_key_press(KeyPress::Shift, 2_000));
+        assert!(!state.register_key_press(KeyPress::Other, 2_100));
+        assert!(!state.register_key_press(KeyPress::Shift, 2_200));
+    }
+
+    #[test]
+    fn launcher_window_state_tracks_show_and_hide() {
+        let mut window = LauncherWindowState::default();
+
+        window.show();
+        assert!(window.is_visible());
+
+        window.hide();
+        assert!(!window.is_visible());
     }
 }
