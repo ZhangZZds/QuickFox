@@ -108,6 +108,9 @@ fn save_config(
         .runtime
         .lock()
         .expect("quickfox runtime lock poisoned");
+    if let Some(store) = config_store() {
+        store.save(&config).map_err(|error| format!("{error:?}"))?;
+    }
     runtime.config = config;
     let _ = refresh_runtime_index(&mut runtime)?;
 

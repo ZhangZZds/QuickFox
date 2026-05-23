@@ -171,6 +171,15 @@ impl ConfigStore {
         Self { path }
     }
 
+    pub fn save(&self, config: &QuickFoxConfig) -> Result<(), ConfigError> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let content = toml::to_string_pretty(config)?;
+        fs::write(&self.path, content)?;
+        Ok(())
+    }
+
     pub fn load(&self) -> Result<QuickFoxConfig, ConfigError> {
         let content = fs::read_to_string(&self.path)?;
         Ok(toml::from_str(&content)?)
@@ -265,6 +274,23 @@ limit = 20
             config.web_search.engines["g"].url,
             "https://www.google.com/search?q={query}"
         );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn save_persists_updated_command_settings() {
+        let path = temp_config_path("save");
+        let store = ConfigStore::new(path.clone());
+        let mut config = QuickFoxConfig::default_with_index_dirs(vec!["/Users/frank".to_owned()]);
+        config.command.enabled = true;
+        config.history.command_max_entries = 30;
+
+        store.save(&config).unwrap();
+
+        let loaded = store.load().unwrap();
+        assert!(loaded.command.enabled);
+        assert_eq!(loaded.history.command_max_entries, 30);
 
         let _ = fs::remove_file(path);
     }

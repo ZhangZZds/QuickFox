@@ -95,7 +95,7 @@ function toLauncherResults(results: BackendSearchResult[]): LauncherResult[] {
 }
 
 export function App({
-  commandEnabled = false,
+  commandEnabled,
   initialView = "launcher",
   onClose = () => undefined,
   onExecuteAction = executeAction,
@@ -283,7 +283,7 @@ export function App({
             <button
               type="button"
               className="primary-button"
-              onClick={() => void saveConfig(config)}
+              onClick={() => void saveConfig(config).then(() => setView("launcher"))}
             >
               保存设置
             </button>

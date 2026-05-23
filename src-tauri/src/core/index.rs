@@ -58,9 +58,10 @@ impl IndexScanner {
 
             self.scan_dir(
                 &root,
+                &root,
                 &exclude_dirs,
                 &options.exclude_patterns,
-                &mut report.entries,
+                &mut report,
             )?;
         }
 
@@ -74,12 +75,27 @@ impl IndexScanner {
 
     fn scan_dir(
         &self,
+        root: &Path,
         dir: &Path,
         exclude_dirs: &[PathBuf],
         exclude_patterns: &[String],
-        entries: &mut Vec<IndexedEntry>,
+        report: &mut IndexReport,
     ) -> Result<(), std::io::Error> {
-        for entry in fs::read_dir(dir)? {
+        let read_dir = match fs::read_dir(dir) {
+            Ok(read_dir) => read_dir,
+            Err(error) => {
+                report.failures.push(IndexFailure {
+                    root: path_to_string(dir),
+                    message: error.to_string(),
+                });
+                if dir == root {
+                    return Err(error);
+                }
+                return Ok(());
+            }
+        };
+
+        for entry in read_dir {
             let entry = entry?;
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().to_string();
@@ -91,14 +107,14 @@ impl IndexScanner {
 
             let file_type = entry.file_type()?;
             if file_type.is_dir() {
-                entries.push(IndexedEntry {
+                report.entries.push(IndexedEntry {
                     path: path_to_string(&path),
                     name,
                     kind: IndexedEntryKind::Directory,
                 });
-                self.scan_dir(&path, exclude_dirs, exclude_patterns, entries)?;
+                self.scan_dir(root, &path, exclude_dirs, exclude_patterns, report)?;
             } else if file_type.is_file() {
-                entries.push(IndexedEntry {
+                report.entries.push(IndexedEntry {
                     path: path_to_string(&path),
                     name,
                     kind: IndexedEntryKind::File,
@@ -366,6 +382,36 @@ mod tests {
         assert_eq!(second_report.failures[0].root, missing.to_string_lossy());
         assert!(index.entries().iter().any(|entry| entry.name == "new.md"));
         assert!(!index.entries().iter().any(|entry| entry.name == "old.md"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scanner_reports_unreadable_nested_directories_without_dropping_other_results() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_dir("scan-unreadable");
+        let locked = root.join("locked");
+        fs::create_dir_all(&locked).unwrap();
+        fs::write(root.join("keep.md"), "").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let report = IndexScanner
+            .scan(IndexScanOptions {
+                include_dirs: vec![root.clone()],
+                exclude_dirs: Vec::new(),
+                exclude_patterns: Vec::new(),
+            })
+            .unwrap();
+
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(report.entries.iter().any(|entry| entry.name == "keep.md"));
+        assert!(report
+            .failures
+            .iter()
+            .any(|failure| failure.root.ends_with("locked")));
 
         let _ = fs::remove_dir_all(root);
     }
