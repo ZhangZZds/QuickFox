@@ -40,14 +40,14 @@
 
 ## 5. 内置 Providers
 
-- [ ] 5.1 先为 FileProvider 返回文件/目录结果和主动作写测试
-- [ ] 5.2 实现 FileProvider 并接入 Provider registry
-- [ ] 5.3 先为计算器表达式写测试，覆盖 `2^10`、`sqrt(9)`、`0xff` 和百分比
-- [ ] 5.4 实现 CalculatorProvider 和复制结果动作
-- [ ] 5.5 先为网页搜索前缀、URL 编码和显式触发规则写测试
-- [ ] 5.6 实现 WebSearchProvider，确保无本地结果时不自动网页搜索
-- [ ] 5.7 先为命令执行开关、命令前缀和命令结果确认状态写测试
-- [ ] 5.8 实现 CommandProvider，未启用时返回启用提示，启用时返回确认型命令结果
+- [x] 5.1 先为 FileProvider 返回文件/目录结果和主动作写测试
+- [x] 5.2 实现 FileProvider 并接入 Provider registry
+- [x] 5.3 先为计算器表达式写测试，覆盖 `2^10`、`sqrt(9)`、`0xff` 和百分比
+- [x] 5.4 实现 CalculatorProvider 和复制结果动作
+- [x] 5.5 先为网页搜索前缀、URL 编码和显式触发规则写测试
+- [x] 5.6 实现 WebSearchProvider，确保无本地结果时不自动网页搜索
+- [x] 5.7 先为命令执行开关、命令前缀和命令结果确认状态写测试
+- [x] 5.8 实现 CommandProvider，未启用时返回启用提示，启用时返回确认型命令结果
 
 ## 6. Actions 与平台 Adapter
 
