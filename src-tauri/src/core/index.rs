@@ -232,6 +232,12 @@ fn entry_to_result(entry: &IndexedEntry) -> SearchResult {
         },
     )
     .with_detail(entry.path.clone())
+    .with_secondary_action(Action::OpenContainingFolder {
+        path: entry.path.clone(),
+    })
+    .with_secondary_action(Action::CopyText {
+        text: entry.path.clone(),
+    })
 }
 
 fn fuzzy_matches(query: &str, haystack: &str) -> bool {

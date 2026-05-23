@@ -1,6 +1,6 @@
 :root {
   color: #17201a;
-  background: #f3f0ea;
+  background: transparent;
   font-family:
     Inter,
     ui-sans-serif,
@@ -19,6 +19,7 @@ body {
   margin: 0;
   min-width: 320px;
   min-height: 100vh;
+  background: transparent;
 }
 
 button,
@@ -30,7 +31,8 @@ input {
   min-height: 100vh;
   display: grid;
   place-items: start center;
-  padding: 12vh 24px 24px;
+  padding: 24px 24px 24px;
+  background: transparent;
 }
 
 .launcher-panel {
@@ -42,16 +44,32 @@ input {
   overflow: hidden;
 }
 
+.panel-toolbar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: stretch;
+}
+
 .search-input {
   width: 100%;
   height: 58px;
   border: 0;
-  border-bottom: 1px solid #dfdbd2;
+  border-right: 1px solid #dfdbd2;
   padding: 0 20px;
   font-size: 18px;
   outline: none;
   color: #17201a;
   background: #ffffff;
+}
+
+.toolbar-button {
+  min-width: 88px;
+  border: 0;
+  border-bottom: 1px solid #dfdbd2;
+  padding: 0 16px;
+  color: #4c5750;
+  background: #f6f4ef;
+  cursor: pointer;
 }
 
 .result-list {
@@ -122,6 +140,18 @@ input {
   cursor: pointer;
 }
 
+.command-preview button:disabled {
+  color: #8a928d;
+  cursor: default;
+  opacity: 0.65;
+}
+
+.toolbar-button:hover,
+.action-menu button:hover,
+.command-preview button:hover:not(:disabled) {
+  background: #eef3f0;
+}
+
 .action-menu button {
   text-align: left;
   padding: 0 10px;
@@ -179,6 +209,20 @@ input {
 @media (max-width: 520px) {
   .launcher-shell {
     padding: 8vh 12px 12px;
+  }
+
+  .panel-toolbar {
+    grid-template-columns: 1fr;
+  }
+
+  .search-input {
+    border-right: 0;
+    border-bottom: 1px solid #dfdbd2;
+  }
+
+  .toolbar-button {
+    min-width: 0;
+    min-height: 42px;
   }
 
   .result-item {

@@ -115,6 +115,28 @@ impl WindowsTerminalAdapter {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MacosTerminalAdapter;
+
+impl MacosTerminalAdapter {
+    pub fn build_command(&self, command: &str) -> PlatformResult<ProcessCommand> {
+        let escaped = command
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', " ");
+        Ok(ProcessCommand {
+            program: "osascript".to_owned(),
+            args: vec![
+                "-e".to_owned(),
+                format!(
+                    "tell application \"Terminal\" to do script \"{}\"\ntell application \"Terminal\" to activate",
+                    escaped
+                ),
+            ],
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinuxTerminalAdapter {
     preferred_terminals: Vec<String>,
 }
@@ -388,6 +410,18 @@ mod tests {
                 "git status".to_owned()
             ]
         );
+    }
+
+    #[test]
+    fn macos_terminal_adapter_builds_osascript_command() {
+        let command = MacosTerminalAdapter
+            .build_command("git status && echo \"ok\"")
+            .unwrap();
+
+        assert_eq!(command.program, "osascript");
+        assert_eq!(command.args[0], "-e");
+        assert!(command.args[1].contains("tell application \"Terminal\""));
+        assert!(command.args[1].contains("git status && echo \\\"ok\\\""));
     }
 
     #[test]

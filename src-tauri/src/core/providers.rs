@@ -517,6 +517,19 @@ mod tests {
                         path: "/home/frank/Documents".to_owned(),
                     }
         }));
+        assert!(results
+            .iter()
+            .all(|result| result.secondary_actions.len() == 2));
+        assert!(results.iter().any(|result| {
+            result
+                .secondary_actions
+                .contains(&Action::OpenContainingFolder {
+                    path: result.detail.clone().unwrap_or_default(),
+                })
+                && result.secondary_actions.contains(&Action::CopyText {
+                    text: result.detail.clone().unwrap_or_default(),
+                })
+        }));
     }
 
     #[test]

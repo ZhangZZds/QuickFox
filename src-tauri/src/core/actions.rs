@@ -19,6 +19,7 @@ pub enum Action {
     },
     ExecuteCommand {
         command: String,
+        #[serde(rename = "requiresConfirmation")]
         requires_confirmation: bool,
     },
 }
@@ -176,5 +177,19 @@ mod tests {
             Err(ActionDispatchError::CommandRequiresConfirmation)
         );
         assert!(handler.commands.is_empty());
+    }
+
+    #[test]
+    fn execute_command_serializes_confirmation_flag_in_camel_case() {
+        let action = Action::ExecuteCommand {
+            command: "git status".to_owned(),
+            requires_confirmation: true,
+        };
+
+        let value = serde_json::to_value(action).unwrap();
+
+        assert_eq!(value["type"], "executeCommand");
+        assert_eq!(value["command"], "git status");
+        assert_eq!(value["requiresConfirmation"], true);
     }
 }
