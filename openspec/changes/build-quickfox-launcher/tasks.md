@@ -85,18 +85,18 @@
 
 ## 9. 文档与 CI
 
-- [ ] 9.1 编写中文 `README.md`，说明依赖安装、本地运行、测试、构建和基础使用
-- [ ] 9.2 编写 `docs/architecture.md`，说明模块职责、数据流和 Provider/Action/Adapter 边界
-- [ ] 9.3 编写 `docs/development.md`，说明项目结构、常用命令和新增 Provider/Action/Adapter 方法
-- [ ] 9.4 编写排错文档，覆盖 Windows Terminal、Linux 终端 fallback、全局快捷键和索引刷新
-- [ ] 9.5 配置 GitHub Actions Windows/Linux 标准 runner 检查，不使用 larger runner
-- [ ] 9.6 确保普通 push/PR workflow 不构建或上传发布安装包
+- [x] 9.1 编写中文 `README.md`，说明依赖安装、本地运行、测试、构建和基础使用
+- [x] 9.2 编写 `docs/architecture.md`，说明模块职责、数据流和 Provider/Action/Adapter 边界
+- [x] 9.3 编写 `docs/development.md`，说明项目结构、常用命令和新增 Provider/Action/Adapter 方法
+- [x] 9.4 编写排错文档，覆盖 Windows Terminal、Linux 终端 fallback、全局快捷键和索引刷新
+- [x] 9.5 配置 GitHub Actions Windows/Linux 标准 runner 检查，不使用 larger runner
+- [x] 9.6 确保普通 push/PR workflow 不构建或上传发布安装包
 
 ## 10. 验证与收口
 
-- [ ] 10.1 运行前端 lint、format check、测试和 build
-- [ ] 10.2 运行 Rust fmt check、clippy 和测试
-- [ ] 10.3 运行统一本地检查命令
-- [ ] 10.4 运行 `openspec validate build-quickfox-launcher`
-- [ ] 10.5 整理 Windows 手工验收清单，覆盖快捷键、窗口行为、Windows Terminal 执行和权限提示
-- [ ] 10.6 检查仓库中没有死代码、未使用生成示例代码或敏感信息
+- [x] 10.1 运行前端 lint、format check、测试和 build
+- [x] 10.2 运行 Rust fmt check、clippy 和测试
+- [x] 10.3 运行统一本地检查命令
+- [x] 10.4 运行 `openspec validate build-quickfox-launcher`
+- [x] 10.5 整理 Windows 手工验收清单，覆盖快捷键、窗口行为、Windows Terminal 执行和权限提示
+- [x] 10.6 检查仓库中没有死代码、未使用生成示例代码或敏感信息
