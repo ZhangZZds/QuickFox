@@ -89,6 +89,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingActionHandler {
         opened_paths: Vec<String>,
+        opened_containing_folders: Vec<String>,
         copied_text: Vec<String>,
         opened_urls: Vec<String>,
         commands: Vec<String>,
@@ -102,6 +103,11 @@ mod tests {
 
         fn copy_text(&mut self, text: &str) -> ActionDispatchResult {
             self.copied_text.push(text.to_owned());
+            Ok(ActionOutcome::Completed)
+        }
+
+        fn open_containing_folder(&mut self, path: &str) -> ActionDispatchResult {
+            self.opened_containing_folders.push(path.to_owned());
             Ok(ActionOutcome::Completed)
         }
 
@@ -132,6 +138,11 @@ mod tests {
             })
             .unwrap();
         dispatcher
+            .dispatch(&Action::OpenContainingFolder {
+                path: "/tmp/readme.md".to_owned(),
+            })
+            .unwrap();
+        dispatcher
             .dispatch(&Action::OpenUrl {
                 url: "https://example.com".to_owned(),
             })
@@ -144,6 +155,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(handler.opened_paths, ["/tmp/readme.md"]);
+        assert_eq!(handler.opened_containing_folders, ["/tmp/readme.md"]);
         assert_eq!(handler.copied_text, ["42"]);
         assert_eq!(handler.opened_urls, ["https://example.com"]);
         assert_eq!(handler.commands, ["git status"]);

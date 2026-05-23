@@ -51,16 +51,16 @@
 
 ## 6. Actions 与平台 Adapter
 
-- [ ] 6.1 先为 Action dispatcher 路由到 Adapter 写单元测试
-- [ ] 6.2 实现 Action dispatcher，集中处理打开、复制、网页 URL 和命令执行动作
-- [ ] 6.3 先为 OpenAdapter 的文件、目录、所在目录和 URL 行为写 mock 测试
-- [ ] 6.4 实现 OpenAdapter 平台抽象
-- [ ] 6.5 先为 Windows Terminal `wt.exe` 命令构造写测试
-- [ ] 6.6 实现 Windows TerminalAdapter
-- [ ] 6.7 先为 Linux 终端 fallback 顺序写测试
-- [ ] 6.8 实现 Linux TerminalAdapter fallback
-- [ ] 6.9 先为危险命令 deny/confirm 规则写测试
-- [ ] 6.10 实现命令执行安全检查、普通确认和危险命令强确认/阻止
+- [x] 6.1 先为 Action dispatcher 路由到 Adapter 写单元测试
+- [x] 6.2 实现 Action dispatcher，集中处理打开、复制、网页 URL 和命令执行动作
+- [x] 6.3 先为 OpenAdapter 的文件、目录、所在目录和 URL 行为写 mock 测试
+- [x] 6.4 实现 OpenAdapter 平台抽象
+- [x] 6.5 先为 Windows Terminal `wt.exe` 命令构造写测试
+- [x] 6.6 实现 Windows TerminalAdapter
+- [x] 6.7 先为 Linux 终端 fallback 顺序写测试
+- [x] 6.8 实现 Linux TerminalAdapter fallback
+- [x] 6.9 先为危险命令 deny/confirm 规则写测试
+- [x] 6.10 实现命令执行安全检查、普通确认和危险命令强确认/阻止
 
 ## 7. 前端启动器 UI
 
