@@ -178,6 +178,21 @@ fn load_startup_config() -> QuickFoxConfig {
 }
 
 fn build_scan_options(config: &QuickFoxConfig) -> IndexScanOptions {
+    let mut exclude_dirs: Vec<_> = config
+        .index
+        .exclude_dirs
+        .iter()
+        .map(|path| PathBuf::from(expand_user_path(path)))
+        .collect();
+    exclude_dirs.extend(implicit_exclude_dirs(config));
+
+    let mut exclude_patterns = config.index.exclude_patterns.clone();
+    for pattern in implicit_exclude_patterns() {
+        if !exclude_patterns.contains(&pattern) {
+            exclude_patterns.push(pattern);
+        }
+    }
+
     IndexScanOptions {
         include_dirs: config
             .index
@@ -185,14 +200,32 @@ fn build_scan_options(config: &QuickFoxConfig) -> IndexScanOptions {
             .iter()
             .map(|path| PathBuf::from(expand_user_path(path)))
             .collect(),
-        exclude_dirs: config
-            .index
-            .exclude_dirs
-            .iter()
-            .map(|path| PathBuf::from(expand_user_path(path)))
-            .collect(),
-        exclude_patterns: config.index.exclude_patterns.clone(),
+        exclude_dirs,
+        exclude_patterns,
     }
+}
+
+fn implicit_exclude_patterns() -> Vec<String> {
+    vec![".*".to_owned()]
+}
+
+fn implicit_exclude_dirs(config: &QuickFoxConfig) -> Vec<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(home) = home_dir() {
+            let home_text = home.to_string_lossy().to_string();
+            if config
+                .index
+                .include_dirs
+                .iter()
+                .any(|dir| expand_user_path(dir) == home_text)
+            {
+                return vec![home.join("Library")];
+            }
+        }
+    }
+
+    Vec::new()
 }
 
 fn build_query_parser_config(config: &QuickFoxConfig) -> QueryParserConfig {
@@ -234,7 +267,9 @@ fn perform_search(config: &QuickFoxConfig, index: &SearchIndex, query: &str) -> 
 
     let registry = build_provider_registry(config, index.clone());
     let results = registry.search(&request);
-    Ranker::default().rank(&request.text, results, &HistoryScores::default())
+    let mut ranked = Ranker::default().rank(&request.text, results, &HistoryScores::default());
+    ranked.truncate(config.results.limit.max(1));
+    ranked
 }
 
 fn refresh_runtime_index(runtime: &mut QuickFoxRuntime) -> Result<IndexReport, String> {
@@ -458,6 +493,37 @@ mod tests {
         assert!(command_results
             .iter()
             .any(|result| result.title == "git status"));
+    }
+
+    #[test]
+    fn perform_search_limits_result_count() {
+        let mut config = QuickFoxConfig::default_with_index_dirs(vec!["/tmp".to_owned()]);
+        config.results.limit = 1;
+        let index = SearchIndex::from_entries(vec![
+            crate::core::index::IndexedEntry {
+                path: "/tmp/Documents".to_owned(),
+                name: "Documents".to_owned(),
+                kind: crate::core::index::IndexedEntryKind::Directory,
+            },
+            crate::core::index::IndexedEntry {
+                path: "/tmp/Documents-2".to_owned(),
+                name: "Documents-2".to_owned(),
+                kind: crate::core::index::IndexedEntryKind::Directory,
+            },
+        ]);
+
+        let results = perform_search(&config, &index, "doc");
+
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn build_scan_options_adds_hidden_exclude_pattern() {
+        let config = QuickFoxConfig::default_with_index_dirs(vec!["/tmp".to_owned()]);
+
+        let options = build_scan_options(&config);
+
+        assert!(options.exclude_patterns.contains(&".*".to_owned()));
     }
 
     #[test]

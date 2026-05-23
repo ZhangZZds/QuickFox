@@ -108,6 +108,18 @@ describe("App", () => {
     );
   });
 
+  it("shows empty-state feedback when a non-empty query returns no results", async () => {
+    vi.mocked(search).mockResolvedValueOnce([]);
+
+    render(<App />);
+
+    fireEvent.change(screen.getByLabelText("搜索文件、目录、计算器、网页搜索或命令"), {
+      target: { value: "does-not-exist" },
+    });
+
+    expect(await screen.findByText("未找到结果")).toBeInTheDocument();
+  });
+
   it("moves selection with arrow keys and executes the selected primary action with Enter", async () => {
     const onExecuteAction = vi.fn();
     vi.mocked(search).mockResolvedValueOnce(fileResults);

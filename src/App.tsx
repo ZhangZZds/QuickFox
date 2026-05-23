@@ -328,22 +328,30 @@ export function App({
           </section>
         ) : (
           <ul className="result-list" aria-label="搜索结果">
-            {results.map((result, index) => (
-              <li
-                aria-selected={index === selectedIndex}
-                className="result-item"
-                key={result.id}
-                onContextMenu={(event) => {
-                  event.preventDefault();
-                  setMenuResultId(result.id);
-                  setSelectedIndex(index);
-                }}
-                role="option"
-              >
-                <span className="result-title">{result.title}</span>
-                <span className="result-detail">{result.detail ?? ""}</span>
-              </li>
-            ))}
+            {results.length > 0
+              ? results.map((result, index) => (
+                  <li
+                    aria-selected={index === selectedIndex}
+                    className="result-item"
+                    key={result.id}
+                    onContextMenu={(event) => {
+                      event.preventDefault();
+                      setMenuResultId(result.id);
+                      setSelectedIndex(index);
+                    }}
+                    role="option"
+                  >
+                    <span className="result-title">{result.title}</span>
+                    <span className="result-detail">{result.detail ?? ""}</span>
+                  </li>
+                ))
+              : query.trim()
+                ? [
+                    <li className="empty-state" key="empty-state">
+                      未找到结果
+                    </li>,
+                  ]
+                : null}
           </ul>
         )}
         {menuResult ? (
