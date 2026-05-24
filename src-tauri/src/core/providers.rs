@@ -1,6 +1,6 @@
 //! Query providers will live here.
 
-use crate::core::actions::Action;
+use crate::core::actions::{Action, OpenApplication};
 use crate::core::index::SearchIndex;
 use crate::core::search::{QueryRequest, SearchMode, SearchResult, SearchResultKind};
 
@@ -65,6 +65,19 @@ impl Provider for FileProvider {
             .into_iter()
             .map(|mut result| {
                 result.provider = self.id().to_owned();
+                if matches!(
+                    result.kind,
+                    SearchResultKind::Application
+                        | SearchResultKind::File
+                        | SearchResultKind::Directory
+                ) {
+                    if let Action::OpenPath { path } = result.main_action.clone() {
+                        result = result.with_secondary_action(Action::OpenWithApplication {
+                            path,
+                            application: OpenApplication::DevelopmentTool,
+                        });
+                    }
+                }
                 result
             })
             .collect()
@@ -519,7 +532,7 @@ mod tests {
         }));
         assert!(results
             .iter()
-            .all(|result| result.secondary_actions.len() == 2));
+            .all(|result| result.secondary_actions.len() == 3));
         assert!(results.iter().any(|result| {
             result
                 .secondary_actions
@@ -529,6 +542,12 @@ mod tests {
                 && result.secondary_actions.contains(&Action::CopyText {
                     text: result.detail.clone().unwrap_or_default(),
                 })
+                && result
+                    .secondary_actions
+                    .contains(&Action::OpenWithApplication {
+                        path: result.detail.clone().unwrap_or_default(),
+                        application: OpenApplication::DevelopmentTool,
+                    })
         }));
     }
 

@@ -76,7 +76,10 @@ const appConfig = {
     regex_prefix: "re:",
   },
   web_search: {
-    engines: {},
+    engines: {
+      g: { name: "Google", url: "https://www.google.com/search?q={query}" },
+      bd: { name: "Baidu", url: "https://www.baidu.com/s?wd={query}" },
+    },
   },
   command: {
     prefix: ">",
@@ -205,6 +208,36 @@ describe("App", () => {
     });
   });
 
+  it("offers a development open action from the result context menu", async () => {
+    const onExecuteAction = vi.fn();
+    vi.mocked(search).mockResolvedValueOnce([
+      {
+        ...fileResults[0],
+        secondaryActions: [
+          ...fileResults[0].secondaryActions,
+          {
+            type: "openWithApplication",
+            path: "/tmp/Documents",
+            application: "developmentTool",
+          },
+        ],
+      },
+    ]);
+    render(<App onExecuteAction={onExecuteAction} />);
+    fireEvent.change(screen.getByLabelText("搜索文件、目录、计算器、网页搜索或命令"), {
+      target: { value: "doc" },
+    });
+
+    fireEvent.contextMenu(await screen.findByRole("option", { name: /Documents/ }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "用开发工具打开" }));
+
+    expect(onExecuteAction).toHaveBeenCalledWith({
+      type: "openWithApplication",
+      path: "/tmp/Documents",
+      application: "developmentTool",
+    });
+  });
+
   it("positions the action menu near the context-clicked result", async () => {
     vi.mocked(search).mockResolvedValueOnce(fileResults);
     render(<App />);
@@ -319,15 +352,49 @@ describe("App", () => {
     expect(await screen.findByText("索引已刷新")).toBeInTheDocument();
   });
 
-  it("recalls recent confirmed input history with arrow keys", async () => {
+  it("shows recent input history in Shift history mode", async () => {
     vi.mocked(recentInputHistory).mockResolvedValueOnce(["g 1234", "notes"]);
     render(<App />);
     const input = screen.getByLabelText("搜索文件、目录、计算器、网页搜索或命令");
 
     await waitFor(() => expect(recentInputHistory).toHaveBeenCalledOnce());
-    fireEvent.keyDown(input, { key: "ArrowUp" });
+    fireEvent.keyDown(input, { key: "Shift" });
 
-    expect(input).toHaveValue("g 1234");
+    expect(screen.getByRole("list", { name: "输入历史" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "g 1234" })).toHaveAttribute("aria-selected", "true");
+  });
+
+  it("keeps arrow keys on search results until Shift history mode is active", async () => {
+    vi.mocked(recentInputHistory).mockResolvedValueOnce(["g 1234", "notes"]);
+    vi.mocked(search).mockResolvedValueOnce(fileResults);
+    render(<App />);
+    const input = screen.getByLabelText("搜索文件、目录、计算器、网页搜索或命令");
+
+    fireEvent.change(input, { target: { value: "doc" } });
+    await screen.findByText("Documents");
+    fireEvent.keyDown(input, { key: "ArrowDown" });
+
+    expect(input).toHaveValue("doc");
+    expect(screen.getByRole("option", { name: /Downloads/ })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+  });
+
+  it("fills the input from history mode without executing immediately", async () => {
+    const onExecuteAction = vi.fn();
+    vi.mocked(recentInputHistory).mockResolvedValueOnce(["g 1234", "notes"]);
+    render(<App onExecuteAction={onExecuteAction} />);
+    const input = screen.getByLabelText("搜索文件、目录、计算器、网页搜索或命令");
+
+    await waitFor(() => expect(recentInputHistory).toHaveBeenCalledOnce());
+    fireEvent.keyDown(input, { key: "Shift" });
+    fireEvent.keyDown(input, { key: "ArrowDown" });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    expect(input).toHaveValue("notes");
+    expect(screen.queryByRole("list", { name: "输入历史" })).not.toBeInTheDocument();
+    expect(onExecuteAction).not.toHaveBeenCalled();
   });
 
   it("records input history only after Enter executes an action", async () => {
@@ -371,6 +438,22 @@ describe("App", () => {
       type: "openUrl",
       url: "https://www.google.com/search?q=1234",
     });
+  });
+
+  it("opens Baidu web search directly on Enter without waiting for rendered results", async () => {
+    const onExecuteAction = vi.fn();
+    vi.mocked(recordInputHistory).mockResolvedValueOnce("recorded");
+    render(<App onExecuteAction={onExecuteAction} />);
+    const input = screen.getByLabelText("搜索文件、目录、计算器、网页搜索或命令");
+
+    fireEvent.change(input, { target: { value: "bd 1234" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    expect(onExecuteAction).toHaveBeenCalledWith({
+      type: "openUrl",
+      url: "https://www.baidu.com/s?wd=1234",
+    });
+    await waitFor(() => expect(recordInputHistory).toHaveBeenCalledWith("bd 1234"));
   });
 
   it("does not render a result list when the query is empty", () => {

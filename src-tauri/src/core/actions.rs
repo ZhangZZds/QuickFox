@@ -11,6 +11,10 @@ pub enum Action {
     OpenContainingFolder {
         path: String,
     },
+    OpenWithApplication {
+        path: String,
+        application: OpenApplication,
+    },
     CopyText {
         text: String,
     },
@@ -22,6 +26,12 @@ pub enum Action {
         #[serde(rename = "requiresConfirmation")]
         requires_confirmation: bool,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum OpenApplication {
+    DevelopmentTool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +49,14 @@ pub type ActionDispatchResult = Result<ActionOutcome, ActionDispatchError>;
 
 pub trait ActionHandler {
     fn open_path(&mut self, path: &str) -> ActionDispatchResult;
+    fn open_with_application(
+        &mut self,
+        path: &str,
+        application: &OpenApplication,
+    ) -> ActionDispatchResult {
+        let _ = application;
+        self.open_path(path)
+    }
     fn copy_text(&mut self, text: &str) -> ActionDispatchResult;
     fn open_url(&mut self, url: &str) -> ActionDispatchResult;
     fn execute_command(&mut self, command: &str) -> ActionDispatchResult;
@@ -67,6 +85,9 @@ where
         match action {
             Action::OpenPath { path } => self.handler.open_path(path),
             Action::OpenContainingFolder { path } => self.handler.open_containing_folder(path),
+            Action::OpenWithApplication { path, application } => {
+                self.handler.open_with_application(path, application)
+            }
             Action::CopyText { text } => self.handler.copy_text(text),
             Action::OpenUrl { url } => self.handler.open_url(url),
             Action::ExecuteCommand {
@@ -90,6 +111,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingActionHandler {
         opened_paths: Vec<String>,
+        opened_with_applications: Vec<(String, OpenApplication)>,
         opened_containing_folders: Vec<String>,
         copied_text: Vec<String>,
         opened_urls: Vec<String>,
@@ -99,6 +121,16 @@ mod tests {
     impl ActionHandler for RecordingActionHandler {
         fn open_path(&mut self, path: &str) -> ActionDispatchResult {
             self.opened_paths.push(path.to_owned());
+            Ok(ActionOutcome::Completed)
+        }
+
+        fn open_with_application(
+            &mut self,
+            path: &str,
+            application: &OpenApplication,
+        ) -> ActionDispatchResult {
+            self.opened_with_applications
+                .push((path.to_owned(), application.clone()));
             Ok(ActionOutcome::Completed)
         }
 
@@ -144,6 +176,12 @@ mod tests {
             })
             .unwrap();
         dispatcher
+            .dispatch(&Action::OpenWithApplication {
+                path: "/tmp/readme.md".to_owned(),
+                application: OpenApplication::DevelopmentTool,
+            })
+            .unwrap();
+        dispatcher
             .dispatch(&Action::OpenUrl {
                 url: "https://example.com".to_owned(),
             })
@@ -156,6 +194,13 @@ mod tests {
             .unwrap();
 
         assert_eq!(handler.opened_paths, ["/tmp/readme.md"]);
+        assert_eq!(
+            handler.opened_with_applications,
+            [(
+                "/tmp/readme.md".to_owned(),
+                OpenApplication::DevelopmentTool
+            )]
+        );
         assert_eq!(handler.opened_containing_folders, ["/tmp/readme.md"]);
         assert_eq!(handler.copied_text, ["42"]);
         assert_eq!(handler.opened_urls, ["https://example.com"]);
@@ -191,5 +236,19 @@ mod tests {
         assert_eq!(value["type"], "executeCommand");
         assert_eq!(value["command"], "git status");
         assert_eq!(value["requiresConfirmation"], true);
+    }
+
+    #[test]
+    fn open_with_application_serializes_development_tool_action() {
+        let action = Action::OpenWithApplication {
+            path: "/tmp/readme.md".to_owned(),
+            application: OpenApplication::DevelopmentTool,
+        };
+
+        let value = serde_json::to_value(action).unwrap();
+
+        assert_eq!(value["type"], "openWithApplication");
+        assert_eq!(value["path"], "/tmp/readme.md");
+        assert_eq!(value["application"], "developmentTool");
     }
 }

@@ -17,6 +17,7 @@ type LauncherAction =
   | { type: "openContainingFolder"; path: string }
   | { type: "copyText"; text: string }
   | { type: "openUrl"; url: string }
+  | { type: "openWithApplication"; path: string; application: "developmentTool" }
   | { type: "executeCommand"; command: string; requiresConfirmation: boolean };
 
 type LauncherResult = {
@@ -52,7 +53,10 @@ const fallbackConfig: QuickFoxConfig = {
     regex_prefix: "re:",
   },
   web_search: {
-    engines: {},
+    engines: {
+      g: { name: "Google", url: "https://www.google.com/search?q={query}" },
+      bd: { name: "Baidu", url: "https://www.baidu.com/s?wd={query}" },
+    },
   },
   command: {
     prefix: ">",
@@ -82,9 +86,34 @@ function labelForAction(action: LauncherAction) {
       return "复制路径";
     case "openUrl":
       return "打开链接";
+    case "openWithApplication":
+      return "用开发工具打开";
     case "executeCommand":
       return "确认执行";
   }
+}
+
+function buildWebSearchAction(
+  query: string,
+  engines: QuickFoxConfig["web_search"]["engines"],
+): LauncherAction | null {
+  const trimmed = query.trim();
+  const separator = trimmed.search(/\s/);
+  if (separator <= 0) {
+    return null;
+  }
+
+  const prefix = trimmed.slice(0, separator);
+  const searchText = trimmed.slice(separator).trim();
+  const engine = engines[prefix];
+  if (!engine || !searchText || !engine.url.includes("{query}")) {
+    return null;
+  }
+
+  return {
+    type: "openUrl",
+    url: engine.url.replace("{query}", encodeURIComponent(searchText)),
+  };
 }
 
 function toLauncherResults(results: BackendSearchResult[]): LauncherResult[] {
@@ -115,6 +144,7 @@ export function App({
   const [menuPosition, setMenuPosition] = useState<{ left: number; top: number } | null>(null);
   const [inputHistory, setInputHistory] = useState<string[]>([]);
   const [historyIndex, setHistoryIndex] = useState<number | null>(null);
+  const [historyMode, setHistoryMode] = useState(false);
   const [refreshStatus, setRefreshStatus] = useState<string | null>(null);
   const effectiveCommandEnabled = commandEnabled ?? config.command.enabled;
 
@@ -178,12 +208,22 @@ export function App({
     setQuery(value);
     setSelectedIndex(0);
     setHistoryIndex(null);
+    setHistoryMode(false);
     setMenuResultId(null);
     setMenuPosition(null);
   };
 
   const executeSelected = async () => {
     const executedInput = query.trim();
+    const webSearchAction = buildWebSearchAction(query, config.web_search.engines);
+    if (webSearchAction) {
+      await onExecuteAction(webSearchAction);
+      if (executedInput) {
+        await recordInputHistory(executedInput);
+      }
+      return;
+    }
+
     if (isCommandMode && commandText) {
       if (!effectiveCommandEnabled) {
         return;
@@ -209,19 +249,32 @@ export function App({
   };
 
   const handleKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
+    if (event.key === "Shift") {
+      if (inputHistory.length > 0) {
+        event.preventDefault();
+        setHistoryMode(true);
+        setHistoryIndex((index) => index ?? 0);
+      }
+      return;
+    }
+
     if (event.key === "Escape") {
       event.preventDefault();
+      if (historyMode) {
+        setHistoryMode(false);
+        setHistoryIndex(null);
+        return;
+      }
       onClose();
       return;
     }
 
     if (event.key === "ArrowDown") {
       event.preventDefault();
-      if (results.length === 0 && inputHistory.length > 0) {
+      if (historyMode && inputHistory.length > 0) {
         const nextIndex =
-          historyIndex === null ? inputHistory.length - 1 : Math.max(historyIndex - 1, 0);
+          historyIndex === null ? 0 : Math.min(historyIndex + 1, inputHistory.length - 1);
         setHistoryIndex(nextIndex);
-        setQuery(inputHistory[nextIndex]);
         return;
       }
       setSelectedIndex((index) => Math.min(index + 1, Math.max(results.length - 1, 0)));
@@ -230,11 +283,9 @@ export function App({
 
     if (event.key === "ArrowUp") {
       event.preventDefault();
-      if (results.length === 0 && inputHistory.length > 0) {
-        const nextIndex =
-          historyIndex === null ? 0 : Math.min(historyIndex + 1, inputHistory.length - 1);
+      if (historyMode && inputHistory.length > 0) {
+        const nextIndex = historyIndex === null ? 0 : Math.max(historyIndex - 1, 0);
         setHistoryIndex(nextIndex);
-        setQuery(inputHistory[nextIndex]);
         return;
       }
       setSelectedIndex((index) => Math.max(index - 1, 0));
@@ -243,6 +294,15 @@ export function App({
 
     if (event.key === "Enter") {
       event.preventDefault();
+      if (historyMode) {
+        const selectedHistory = inputHistory[historyIndex ?? 0];
+        if (selectedHistory) {
+          setQuery(selectedHistory);
+        }
+        setHistoryMode(false);
+        setHistoryIndex(null);
+        return;
+      }
       void executeSelected();
     }
   };
@@ -397,6 +457,20 @@ export function App({
           </section>
         ) : (
           <>
+            {historyMode ? (
+              <ul className="history-list" aria-label="输入历史">
+                {inputHistory.map((item, index) => (
+                  <li
+                    aria-selected={index === (historyIndex ?? 0)}
+                    className="history-item"
+                    key={`${item}:${index}`}
+                    role="option"
+                  >
+                    {item}
+                  </li>
+                ))}
+              </ul>
+            ) : null}
             {query.trim() ? (
               <ul className="result-list" aria-label="搜索结果">
                 {results.length > 0

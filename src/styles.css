@@ -73,7 +73,8 @@ input {
   cursor: pointer;
 }
 
-.result-list {
+.result-list,
+.history-list {
   list-style: none;
   margin: 0;
   padding: 8px;
@@ -82,12 +83,14 @@ input {
   scrollbar-width: none;
 }
 
-.result-list::-webkit-scrollbar {
+.result-list::-webkit-scrollbar,
+.history-list::-webkit-scrollbar {
   width: 0;
   height: 0;
 }
 
-.result-item {
+.result-item,
+.history-item {
   min-height: 48px;
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
@@ -97,15 +100,18 @@ input {
   border-radius: 6px;
 }
 
-.result-item[aria-selected="true"] {
+.result-item[aria-selected="true"],
+.history-item[aria-selected="true"] {
   background: #e8f1ed;
 }
 
-.result-item {
+.result-item,
+.history-item {
   outline: none;
 }
 
-.result-item:hover {
+.result-item:hover,
+.history-item:hover {
   background: #f2f6f4;
 }
 

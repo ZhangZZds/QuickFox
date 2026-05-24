@@ -19,6 +19,7 @@ npm run test
 npm run rust:test
 npm run check
 openspec validate build-quickfox-launcher
+npm run tauri build
 ```
 
 ## 开发流程
@@ -30,6 +31,22 @@ openspec validate build-quickfox-launcher
 3. 写最小实现让测试转绿
 4. 跑 `npm run check`
 5. 跑 `openspec validate build-quickfox-launcher`
+
+## 发布流程
+
+本项目普通 CI 不产出安装包。正式发布使用 tag 触发：
+
+```bash
+npm run check
+npm run tauri build
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+`release.yml` 会使用 GitHub-hosted `macos-latest` 和 `windows-latest` runner
+分别构建 Tauri bundle，并通过 `tauri-apps/tauri-action` 上传到 GitHub Release。
+
+当前 release workflow 不做代码签名、公证或 Windows 证书签名；这些需要单独配置证书和密钥。
 
 ## 新增 Provider 的方法
 

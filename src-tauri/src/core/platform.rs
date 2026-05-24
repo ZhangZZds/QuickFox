@@ -114,6 +114,62 @@ impl WindowsTerminalAdapter {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DevelopmentToolAdapter {
+    preferred_tools: Vec<String>,
+}
+
+impl DevelopmentToolAdapter {
+    pub fn new(preferred_tools: Vec<String>) -> Self {
+        Self { preferred_tools }
+    }
+
+    pub fn build_command(
+        &self,
+        path: &str,
+        available_tools: &[&str],
+    ) -> PlatformResult<ProcessCommand> {
+        let fallback_order = development_tool_fallbacks();
+        let program = self
+            .preferred_tools
+            .iter()
+            .map(String::as_str)
+            .chain(fallback_order)
+            .find(|candidate| available_tools.contains(candidate))
+            .ok_or(PlatformError::NoTerminalAvailable)?;
+
+        Ok(ProcessCommand {
+            program: program.to_owned(),
+            args: development_tool_args(program, path),
+        })
+    }
+}
+
+fn development_tool_fallbacks() -> [&'static str; 8] {
+    [
+        "code",
+        "cursor",
+        "code.cmd",
+        "cursor.cmd",
+        "code.exe",
+        "cursor.exe",
+        "open",
+        "xdg-open",
+    ]
+}
+
+fn development_tool_args(program: &str, path: &str) -> Vec<String> {
+    match program {
+        "open" => vec![
+            "-a".to_owned(),
+            "Visual Studio Code".to_owned(),
+            path.to_owned(),
+        ],
+        "xdg-open" => vec![path.to_owned()],
+        _ => vec!["--reuse-window".to_owned(), path.to_owned()],
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MacosTerminalAdapter;
 
@@ -419,6 +475,33 @@ mod tests {
                 "git status".to_owned()
             ]
         );
+    }
+
+    #[test]
+    fn development_tool_adapter_prefers_configured_tool_when_available() {
+        let adapter = DevelopmentToolAdapter::new(vec!["cursor".to_owned()]);
+        let command = adapter
+            .build_command("/tmp/project", &["code", "cursor"])
+            .unwrap();
+
+        assert_eq!(command.program, "cursor");
+        assert_eq!(
+            command.args,
+            vec!["--reuse-window".to_owned(), "/tmp/project".to_owned()]
+        );
+    }
+
+    #[test]
+    fn development_tool_adapter_falls_back_to_code_or_xdg_open() {
+        let adapter = DevelopmentToolAdapter::new(Vec::new());
+        let code = adapter.build_command("/tmp/project", &["code"]).unwrap();
+        let xdg = adapter
+            .build_command("/tmp/project", &["xdg-open"])
+            .unwrap();
+
+        assert_eq!(code.program, "code");
+        assert_eq!(xdg.program, "xdg-open");
+        assert_eq!(xdg.args, vec!["/tmp/project".to_owned()]);
     }
 
     #[test]

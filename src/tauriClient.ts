@@ -6,6 +6,7 @@ export type FrontendAction =
   | { type: "openContainingFolder"; path: string }
   | { type: "copyText"; text: string }
   | { type: "openUrl"; url: string }
+  | { type: "openWithApplication"; path: string; application: "developmentTool" }
   | { type: "executeCommand"; command: string; requiresConfirmation: boolean };
 
 export function search(query: string) {

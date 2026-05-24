@@ -1,11 +1,11 @@
 pub mod core;
 
-use crate::core::actions::Action;
+use crate::core::actions::{Action, OpenApplication};
 use crate::core::config::{ConfigStore, QuickFoxConfig};
 use crate::core::index::{IndexReport, IndexScanOptions, IndexScanner, SearchIndex};
 use crate::core::platform::{
-    CommandSafetyChecker, CommandSafetyDecision, LauncherWindowEffect, LauncherWindowState,
-    ProcessCommand,
+    CommandSafetyChecker, CommandSafetyDecision, DevelopmentToolAdapter, LauncherWindowEffect,
+    LauncherWindowState, ProcessCommand,
 };
 use crate::core::providers::{
     CalculatorProvider, CommandProvider, CommandProviderConfig, FileProvider, ProviderRegistry,
@@ -74,6 +74,9 @@ fn execute_action(app: tauri::AppHandle, action: Action) -> Result<&'static str,
             .opener()
             .reveal_item_in_dir(expand_user_path(&path))
             .map_err(|error| error.to_string())?,
+        Action::OpenWithApplication { path, application } => {
+            execute_open_with_application(&path, &application)?;
+        }
         Action::OpenUrl { url } => app
             .opener()
             .open_url(url, None::<&str>)
@@ -414,6 +417,40 @@ fn execute_command_in_terminal(command: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn execute_open_with_application(path: &str, application: &OpenApplication) -> Result<(), String> {
+    let process = build_open_with_application_command(path, application)?;
+    Command::new(&process.program)
+        .args(&process.args)
+        .spawn()
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn build_open_with_application_command(
+    path: &str,
+    application: &OpenApplication,
+) -> Result<ProcessCommand, String> {
+    match application {
+        OpenApplication::DevelopmentTool => {
+            let candidates = [
+                "code",
+                "cursor",
+                "code.cmd",
+                "cursor.cmd",
+                "code.exe",
+                "cursor.exe",
+                "open",
+                "xdg-open",
+            ];
+            let available = detect_available_programs(&candidates);
+            let available_refs: Vec<_> = available.iter().map(String::as_str).collect();
+            DevelopmentToolAdapter::new(Vec::new())
+                .build_command(&expand_user_path(path), &available_refs)
+                .map_err(|error| format!("{error:?}"))
+        }
+    }
+}
+
 fn build_terminal_command(command: &str) -> Result<ProcessCommand, String> {
     #[cfg(target_os = "windows")]
     {
@@ -450,6 +487,10 @@ fn build_terminal_command(command: &str) -> Result<ProcessCommand, String> {
 
 #[cfg(target_os = "linux")]
 fn detect_available_terminals(candidates: &[&str]) -> Vec<String> {
+    detect_available_programs(candidates)
+}
+
+fn detect_available_programs(candidates: &[&str]) -> Vec<String> {
     let Some(path) = std::env::var_os("PATH") else {
         return Vec::new();
     };
@@ -748,6 +789,14 @@ mod tests {
 
         #[cfg(target_os = "windows")]
         assert_eq!(process.program, "wt.exe");
+    }
+
+    #[test]
+    fn build_open_with_application_uses_development_tool_adapter() {
+        let process =
+            build_open_with_application_command("/tmp/project", &OpenApplication::DevelopmentTool);
+
+        assert!(process.is_ok() || process == Err("NoTerminalAvailable".to_owned()));
     }
 
     #[test]
