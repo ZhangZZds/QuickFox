@@ -594,7 +594,7 @@ mod tests {
         }]);
 
         let results = provider.search(&QueryRequest {
-            original: "g: tauri plugins".to_owned(),
+            original: "g tauri plugins".to_owned(),
             text: "tauri plugins".to_owned(),
             mode: SearchMode::WebSearch {
                 prefix: "g".to_owned(),
@@ -609,6 +609,30 @@ mod tests {
             results[0].main_action,
             Action::OpenUrl {
                 url: "https://www.google.com/search?q=tauri%20plugins".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn web_search_provider_supports_baidu_prefix() {
+        let provider = WebSearchProvider::new(vec![WebSearchEngine {
+            prefix: "bd".to_owned(),
+            name: "Baidu".to_owned(),
+            url_template: "https://www.baidu.com/s?wd={query}".to_owned(),
+        }]);
+
+        let results = provider.search(&QueryRequest {
+            original: "bd 1234".to_owned(),
+            text: "1234".to_owned(),
+            mode: SearchMode::WebSearch {
+                prefix: "bd".to_owned(),
+            },
+        });
+
+        assert_eq!(
+            results[0].main_action,
+            Action::OpenUrl {
+                url: "https://www.baidu.com/s?wd=1234".to_owned()
             }
         );
     }

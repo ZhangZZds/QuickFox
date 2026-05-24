@@ -40,10 +40,10 @@ impl QuickFoxConfig {
                         },
                     ),
                     (
-                        "gh".to_owned(),
+                        "bd".to_owned(),
                         WebSearchEngineConfig {
-                            name: "GitHub".to_owned(),
-                            url: "https://github.com/search?q={query}".to_owned(),
+                            name: "Baidu".to_owned(),
+                            url: "https://www.baidu.com/s?wd={query}".to_owned(),
                         },
                     ),
                 ]),
@@ -53,6 +53,8 @@ impl QuickFoxConfig {
                 enabled: false,
             },
             history: HistoryConfig {
+                input_history_enabled: true,
+                input_max_entries: 15,
                 file_history_enabled: true,
                 calculator_history_enabled: false,
                 web_search_history_enabled: false,
@@ -120,11 +122,28 @@ pub struct CommandConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryConfig {
+    #[serde(default = "default_true")]
+    pub input_history_enabled: bool,
+    #[serde(default = "default_history_entries")]
+    pub input_max_entries: usize,
+    #[serde(default = "default_true")]
     pub file_history_enabled: bool,
+    #[serde(default)]
     pub calculator_history_enabled: bool,
+    #[serde(default)]
     pub web_search_history_enabled: bool,
+    #[serde(default = "default_true")]
     pub command_history_enabled: bool,
+    #[serde(default = "default_history_entries")]
     pub command_max_entries: usize,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_history_entries() -> usize {
+    15
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -224,6 +243,8 @@ mod tests {
         assert!(!config.command.enabled);
         assert_eq!(config.command.prefix, ">");
         assert_eq!(config.history.command_max_entries, 15);
+        assert_eq!(config.history.input_max_entries, 15);
+        assert!(config.history.input_history_enabled);
         assert!(content.contains("regex_prefix = \"re:\""));
         assert!(content.contains("enabled = false"));
 
@@ -253,6 +274,8 @@ prefix = ">"
 enabled = false
 
 [history]
+input_history_enabled = true
+input_max_entries = 15
 file_history_enabled = true
 calculator_history_enabled = false
 web_search_history_enabled = false
@@ -284,12 +307,14 @@ limit = 20
         let store = ConfigStore::new(path.clone());
         let mut config = QuickFoxConfig::default_with_index_dirs(vec!["/Users/frank".to_owned()]);
         config.command.enabled = true;
+        config.history.input_max_entries = 30;
         config.history.command_max_entries = 30;
 
         store.save(&config).unwrap();
 
         let loaded = store.load().unwrap();
         assert!(loaded.command.enabled);
+        assert_eq!(loaded.history.input_max_entries, 30);
         assert_eq!(loaded.history.command_max_entries, 30);
 
         let _ = fs::remove_file(path);

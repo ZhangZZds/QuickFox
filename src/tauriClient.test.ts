@@ -1,10 +1,15 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   clearCommandHistory,
+  clearInputHistory,
   executeAction,
+  listenOpenSettings,
   loadConfig,
+  recentInputHistory,
+  recordInputHistory,
   refreshIndex,
   saveConfig,
   search,
@@ -13,12 +18,17 @@ import {
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(),
 }));
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: vi.fn(),
+}));
 
 const invokeMock = vi.mocked(invoke);
+const listenMock = vi.mocked(listen);
 
 describe("tauriClient", () => {
   beforeEach(() => {
     invokeMock.mockReset();
+    listenMock.mockReset();
   });
 
   it("calls the search command with the query text", async () => {
@@ -46,10 +56,28 @@ describe("tauriClient", () => {
     await loadConfig();
     await saveConfig(config);
     await clearCommandHistory();
+    await recordInputHistory("g 1234");
+    await recentInputHistory();
+    await clearInputHistory();
 
     expect(invokeMock).toHaveBeenNthCalledWith(1, "refresh_index");
     expect(invokeMock).toHaveBeenNthCalledWith(2, "load_config");
     expect(invokeMock).toHaveBeenNthCalledWith(3, "save_config", { config });
     expect(invokeMock).toHaveBeenNthCalledWith(4, "clear_command_history");
+    expect(invokeMock).toHaveBeenNthCalledWith(5, "record_input_history", {
+      input: "g 1234",
+    });
+    expect(invokeMock).toHaveBeenNthCalledWith(6, "recent_input_history");
+    expect(invokeMock).toHaveBeenNthCalledWith(7, "clear_input_history");
+  });
+
+  it("listens for the tray settings event", async () => {
+    const handler = vi.fn();
+    const unlisten = vi.fn();
+    listenMock.mockResolvedValueOnce(unlisten);
+
+    await listenOpenSettings(handler);
+
+    expect(listenMock).toHaveBeenCalledWith("quickfox://open-settings", handler);
   });
 });

@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 
 export type FrontendAction =
   | { type: "openPath"; path: string }
@@ -31,6 +32,22 @@ export function clearCommandHistory() {
   return invoke("clear_command_history");
 }
 
+export function recordInputHistory(input: string) {
+  return invoke("record_input_history", { input });
+}
+
+export function recentInputHistory() {
+  return invoke("recent_input_history");
+}
+
+export function clearInputHistory() {
+  return invoke("clear_input_history");
+}
+
+export function listenOpenSettings(handler: () => void) {
+  return listen("quickfox://open-settings", handler);
+}
+
 export type QuickFoxConfig = {
   index: {
     include_dirs: string[];
@@ -48,6 +65,8 @@ export type QuickFoxConfig = {
     enabled: boolean;
   };
   history: {
+    input_history_enabled: boolean;
+    input_max_entries: number;
     file_history_enabled: boolean;
     calculator_history_enabled: boolean;
     web_search_history_enabled: boolean;

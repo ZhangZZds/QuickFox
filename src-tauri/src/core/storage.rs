@@ -34,6 +34,9 @@ pub struct SqliteStorage {
 
 impl SqliteStorage {
     pub fn open(path: PathBuf) -> Result<Self, StorageError> {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         let connection = Connection::open(path)?;
         let storage = Self { connection };
         storage.migrate()?;
@@ -57,6 +60,11 @@ impl SqliteStorage {
 
             CREATE TABLE IF NOT EXISTS command_history (
                 command TEXT PRIMARY KEY NOT NULL,
+                last_used_at_ms INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS input_history (
+                input TEXT PRIMARY KEY NOT NULL,
                 last_used_at_ms INTEGER NOT NULL
             );
             "#,
@@ -141,6 +149,7 @@ impl SqliteStorage {
         enabled: bool,
         max_entries: usize,
     ) -> Result<(), StorageError> {
+        self.record_input(command, used_at_ms, enabled, max_entries)?;
         if !enabled || max_entries == 0 {
             return Ok(());
         }
@@ -187,6 +196,62 @@ impl SqliteStorage {
 
     pub fn clear_command_history(&self) -> Result<(), StorageError> {
         self.connection.execute("DELETE FROM command_history", [])?;
+        Ok(())
+    }
+
+    pub fn record_input(
+        &self,
+        input: &str,
+        used_at_ms: i64,
+        enabled: bool,
+        max_entries: usize,
+    ) -> Result<(), StorageError> {
+        if !enabled || max_entries == 0 || input.trim().is_empty() {
+            return Ok(());
+        }
+
+        self.connection.execute(
+            r#"
+            INSERT INTO input_history (input, last_used_at_ms)
+            VALUES (?1, ?2)
+            ON CONFLICT(input) DO UPDATE SET
+                last_used_at_ms = excluded.last_used_at_ms
+            "#,
+            params![input.trim(), used_at_ms],
+        )?;
+        self.connection.execute(
+            r#"
+            DELETE FROM input_history
+            WHERE input NOT IN (
+                SELECT input
+                FROM input_history
+                ORDER BY last_used_at_ms DESC
+                LIMIT ?1
+            )
+            "#,
+            params![max_entries as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn recent_inputs(&self) -> Result<Vec<String>, StorageError> {
+        let mut statement = self.connection.prepare(
+            r#"
+            SELECT input
+            FROM input_history
+            ORDER BY last_used_at_ms DESC
+            "#,
+        )?;
+        let rows = statement.query_map([], |row| row.get(0))?;
+        let mut inputs = Vec::new();
+        for row in rows {
+            inputs.push(row?);
+        }
+        Ok(inputs)
+    }
+
+    pub fn clear_input_history(&self) -> Result<(), StorageError> {
+        self.connection.execute("DELETE FROM input_history", [])?;
         Ok(())
     }
 }
@@ -268,6 +333,39 @@ mod tests {
         storage.record_command("git status", 200, true, 15).unwrap();
         storage.clear_command_history().unwrap();
         assert!(storage.recent_commands().unwrap().is_empty());
+
+        drop(storage);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn input_history_keeps_recent_confirmed_inputs_with_configured_limit() {
+        let path = temp_db_path("input-history");
+        let storage = SqliteStorage::open(path.clone()).unwrap();
+
+        storage.record_input("first", 100, true, 2).unwrap();
+        storage.record_input("second", 200, true, 2).unwrap();
+        storage.record_input("third", 300, true, 2).unwrap();
+
+        assert_eq!(storage.recent_inputs().unwrap(), vec!["third", "second"]);
+
+        drop(storage);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn input_history_can_be_disabled_and_cleared() {
+        let path = temp_db_path("input-history-privacy");
+        let storage = SqliteStorage::open(path.clone()).unwrap();
+
+        storage
+            .record_input("secret query", 100, false, 15)
+            .unwrap();
+        assert!(storage.recent_inputs().unwrap().is_empty());
+
+        storage.record_input("g 1234", 200, true, 15).unwrap();
+        storage.clear_input_history().unwrap();
+        assert!(storage.recent_inputs().unwrap().is_empty());
 
         drop(storage);
         let _ = fs::remove_file(path);

@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IndexedEntryKind {
+    Application,
     File,
     Directory,
 }
@@ -107,6 +108,14 @@ impl IndexScanner {
 
             let file_type = entry.file_type()?;
             if file_type.is_dir() {
+                if is_application_path(&path) {
+                    report.entries.push(IndexedEntry {
+                        path: path_to_string(&path),
+                        name,
+                        kind: IndexedEntryKind::Application,
+                    });
+                    continue;
+                }
                 report.entries.push(IndexedEntry {
                     path: path_to_string(&path),
                     name,
@@ -114,10 +123,15 @@ impl IndexScanner {
                 });
                 self.scan_dir(root, &path, exclude_dirs, exclude_patterns, report)?;
             } else if file_type.is_file() {
+                let kind = if is_application_path(&path) {
+                    IndexedEntryKind::Application
+                } else {
+                    IndexedEntryKind::File
+                };
                 report.entries.push(IndexedEntry {
                     path: path_to_string(&path),
                     name,
-                    kind: IndexedEntryKind::File,
+                    kind,
                 });
             }
         }
@@ -158,6 +172,17 @@ fn wildcard_matches(pattern: &str, text: &str) -> bool {
     pattern == text
 }
 
+fn is_application_path(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let lower = name.to_lowercase();
+    lower.ends_with(".app")
+        || lower.ends_with(".exe")
+        || lower.ends_with(".lnk")
+        || lower.ends_with(".desktop")
+}
+
 fn path_to_string(path: &Path) -> String {
     path.to_string_lossy().to_string()
 }
@@ -186,6 +211,32 @@ impl SearchIndex {
         Ok(report)
     }
 
+    pub fn refresh_incremental_with_scanner(
+        &mut self,
+        scanner: &IndexScanner,
+        options: IndexScanOptions,
+    ) -> Result<IndexReport, std::io::Error> {
+        let report = scanner.scan(options)?;
+        let mut previous_by_path: std::collections::HashMap<_, _> = self
+            .entries
+            .iter()
+            .cloned()
+            .map(|entry| (entry.path.clone(), entry))
+            .collect();
+
+        self.entries = report
+            .entries
+            .iter()
+            .map(|entry| {
+                previous_by_path
+                    .remove(&entry.path)
+                    .filter(|previous| previous == entry)
+                    .unwrap_or_else(|| entry.clone())
+            })
+            .collect();
+        Ok(report)
+    }
+
     pub fn search(&self, query: &QueryRequest) -> Vec<SearchResult> {
         match &query.mode {
             SearchMode::Normal => self.search_normal(&query.text),
@@ -204,7 +255,7 @@ impl SearchIndex {
             .iter()
             .filter(|entry| {
                 let haystack = format!("{} {}", entry.name, entry.path).to_lowercase();
-                haystack.contains(&query) || fuzzy_matches(&query, &haystack)
+                haystack.contains(&query) || fuzzy_matches_with_quality(&query, &haystack)
             })
             .map(entry_to_result)
             .collect()
@@ -235,6 +286,7 @@ impl SearchIndex {
 
 fn entry_to_result(entry: &IndexedEntry) -> SearchResult {
     let kind = match entry.kind {
+        IndexedEntryKind::Application => SearchResultKind::Application,
         IndexedEntryKind::File => SearchResultKind::File,
         IndexedEntryKind::Directory => SearchResultKind::Directory,
     };
@@ -256,17 +308,27 @@ fn entry_to_result(entry: &IndexedEntry) -> SearchResult {
     })
 }
 
-fn fuzzy_matches(query: &str, haystack: &str) -> bool {
+fn fuzzy_matches_with_quality(query: &str, haystack: &str) -> bool {
+    if query.len() < 2 {
+        return false;
+    }
+
     let mut chars = query.chars();
     let Some(mut current) = chars.next() else {
         return true;
     };
+    let mut first_match: Option<usize> = None;
 
-    for candidate in haystack.chars() {
+    for (index, candidate) in haystack.chars().enumerate() {
         if candidate == current {
+            first_match.get_or_insert(index);
             match chars.next() {
                 Some(next) => current = next,
-                None => return true,
+                None => {
+                    let span = index.saturating_sub(first_match.unwrap_or(index)) + 1;
+                    let max_span = query.chars().count().saturating_mul(4).max(16);
+                    return span <= max_span;
+                }
             }
         }
     }
@@ -344,6 +406,46 @@ mod tests {
     }
 
     #[test]
+    fn scanner_indexes_applications_without_app_bundle_internals() {
+        let root = temp_dir("scan-app-bundle");
+        let app_contents = root.join("PyCharm.app").join("Contents").join("Helpers");
+        fs::create_dir_all(&app_contents).unwrap();
+        fs::write(
+            app_contents.join("pydevd_cython_win32_312_64.cp312-win_amd64.pyd"),
+            "",
+        )
+        .unwrap();
+        fs::write(root.join("tool.exe"), "").unwrap();
+        fs::write(root.join("QuickFox.desktop"), "").unwrap();
+        fs::write(root.join("notes.md"), "").unwrap();
+
+        let report = IndexScanner
+            .scan(IndexScanOptions {
+                include_dirs: vec![root.clone()],
+                exclude_dirs: Vec::new(),
+                exclude_patterns: Vec::new(),
+            })
+            .unwrap();
+
+        assert!(report.entries.iter().any(|entry| {
+            entry.name == "PyCharm.app" && entry.kind == IndexedEntryKind::Application
+        }));
+        assert!(report
+            .entries
+            .iter()
+            .any(|entry| entry.name == "tool.exe" && entry.kind == IndexedEntryKind::Application));
+        assert!(report.entries.iter().any(|entry| {
+            entry.name == "QuickFox.desktop" && entry.kind == IndexedEntryKind::Application
+        }));
+        assert!(!report
+            .entries
+            .iter()
+            .any(|entry| entry.name.contains("pydevd_cython")));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn manual_refresh_replaces_entries_and_reports_failed_roots() {
         let root = temp_dir("refresh");
         fs::create_dir_all(&root).unwrap();
@@ -382,6 +484,51 @@ mod tests {
         assert_eq!(second_report.failures[0].root, missing.to_string_lossy());
         assert!(index.entries().iter().any(|entry| entry.name == "new.md"));
         assert!(!index.entries().iter().any(|entry| entry.name == "old.md"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn incremental_refresh_updates_changed_paths_without_dropping_unchanged_entries() {
+        let root = temp_dir("incremental-refresh");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("keep.md"), "").unwrap();
+        fs::write(root.join("old.md"), "").unwrap();
+
+        let mut index = SearchIndex::default();
+        let scanner = IndexScanner;
+        index
+            .refresh_with_scanner(
+                &scanner,
+                IndexScanOptions {
+                    include_dirs: vec![root.clone()],
+                    exclude_dirs: Vec::new(),
+                    exclude_patterns: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        fs::remove_file(root.join("old.md")).unwrap();
+        fs::write(root.join("new.md"), "").unwrap();
+        index
+            .refresh_incremental_with_scanner(
+                &scanner,
+                IndexScanOptions {
+                    include_dirs: vec![root.clone()],
+                    exclude_dirs: Vec::new(),
+                    exclude_patterns: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        let names: Vec<_> = index
+            .entries()
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert!(names.contains(&"keep.md"));
+        assert!(names.contains(&"new.md"));
+        assert!(!names.contains(&"old.md"));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -458,6 +605,20 @@ mod tests {
             crate::core::search::SearchResultKind::Feedback
         );
         assert!(results[0].title.contains("无效正则"));
+    }
+
+    #[test]
+    fn search_does_not_return_low_quality_fuzzy_noise_for_missing_query() {
+        let index = SearchIndex::from_entries(vec![IndexedEntry {
+            path: "/Users/frank/Applications/PyCharm.app/Contents/plugins/python-ce/helpers/pydev/_pydevd_bundle/pydevd_cython_win32_312_64.cp312-win_amd64.pyd".to_owned(),
+            name: "pydevd_cython_win32_312_64.cp312-win_amd64.pyd".to_owned(),
+            kind: IndexedEntryKind::File,
+        }]);
+        let parser = crate::core::search::QueryParser::new(Default::default());
+
+        let results = index.search(&parser.parse("Openspec_123"));
+
+        assert!(results.is_empty());
     }
 
     fn file_entry(path: &str) -> IndexedEntry {

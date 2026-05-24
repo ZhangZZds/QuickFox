@@ -3,6 +3,10 @@ import { type KeyboardEvent, useEffect, useState } from "react";
 import {
   executeAction,
   loadConfig,
+  listenOpenSettings,
+  recentInputHistory,
+  recordInputHistory,
+  refreshIndex,
   type QuickFoxConfig,
   saveConfig,
   search as searchResults,
@@ -35,7 +39,7 @@ type AppProps = {
   commandEnabled?: boolean;
   initialView?: "launcher" | "settings";
   onClose?: () => void;
-  onExecuteAction?: (action: LauncherAction) => void;
+  onExecuteAction?: (action: LauncherAction) => unknown;
 };
 
 const fallbackConfig: QuickFoxConfig = {
@@ -55,6 +59,8 @@ const fallbackConfig: QuickFoxConfig = {
     enabled: false,
   },
   history: {
+    input_history_enabled: true,
+    input_max_entries: 15,
     file_history_enabled: true,
     calculator_history_enabled: false,
     web_search_history_enabled: false,
@@ -106,6 +112,10 @@ export function App({
   const [results, setResults] = useState<LauncherResult[]>([]);
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [menuResultId, setMenuResultId] = useState<string | null>(null);
+  const [menuPosition, setMenuPosition] = useState<{ left: number; top: number } | null>(null);
+  const [inputHistory, setInputHistory] = useState<string[]>([]);
+  const [historyIndex, setHistoryIndex] = useState<number | null>(null);
+  const [refreshStatus, setRefreshStatus] = useState<string | null>(null);
   const effectiveCommandEnabled = commandEnabled ?? config.command.enabled;
 
   const isCommandQuery = query.trim().startsWith(">");
@@ -116,16 +126,27 @@ export function App({
 
   useEffect(() => {
     let cancelled = false;
-    void loadConfig()
-      .then((nextConfig) => {
+    void Promise.all([loadConfig(), recentInputHistory()])
+      .then(([nextConfig, nextHistory]) => {
         if (!cancelled) {
           setConfig(nextConfig as QuickFoxConfig);
+          setInputHistory(nextHistory as string[]);
         }
       })
       .catch(() => undefined);
 
     return () => {
       cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let dispose: (() => void) | undefined;
+    void listenOpenSettings(() => setView("settings")).then((unlisten) => {
+      dispose = unlisten;
+    });
+    return () => {
+      dispose?.();
     };
   }, []);
 
@@ -156,25 +177,34 @@ export function App({
   const updateQuery = (value: string) => {
     setQuery(value);
     setSelectedIndex(0);
+    setHistoryIndex(null);
     setMenuResultId(null);
+    setMenuPosition(null);
   };
 
-  const executeSelected = () => {
+  const executeSelected = async () => {
+    const executedInput = query.trim();
     if (isCommandMode && commandText) {
       if (!effectiveCommandEnabled) {
         return;
       }
 
-      onExecuteAction({
+      await onExecuteAction({
         type: "executeCommand",
         command: commandText,
         requiresConfirmation: true,
       });
+      if (executedInput) {
+        await recordInputHistory(executedInput);
+      }
       return;
     }
 
     if (selectedResult) {
-      onExecuteAction(selectedResult.primaryAction);
+      await onExecuteAction(selectedResult.primaryAction);
+      if (executedInput) {
+        await recordInputHistory(executedInput);
+      }
     }
   };
 
@@ -187,20 +217,40 @@ export function App({
 
     if (event.key === "ArrowDown") {
       event.preventDefault();
+      if (results.length === 0 && inputHistory.length > 0) {
+        const nextIndex =
+          historyIndex === null ? inputHistory.length - 1 : Math.max(historyIndex - 1, 0);
+        setHistoryIndex(nextIndex);
+        setQuery(inputHistory[nextIndex]);
+        return;
+      }
       setSelectedIndex((index) => Math.min(index + 1, Math.max(results.length - 1, 0)));
       return;
     }
 
     if (event.key === "ArrowUp") {
       event.preventDefault();
+      if (results.length === 0 && inputHistory.length > 0) {
+        const nextIndex =
+          historyIndex === null ? 0 : Math.min(historyIndex + 1, inputHistory.length - 1);
+        setHistoryIndex(nextIndex);
+        setQuery(inputHistory[nextIndex]);
+        return;
+      }
       setSelectedIndex((index) => Math.max(index - 1, 0));
       return;
     }
 
     if (event.key === "Enter") {
       event.preventDefault();
-      executeSelected();
+      void executeSelected();
     }
+  };
+
+  const refreshSearchIndex = async () => {
+    setRefreshStatus(null);
+    await refreshIndex();
+    setRefreshStatus("索引已刷新");
   };
 
   if (view === "settings") {
@@ -212,74 +262,96 @@ export function App({
               返回搜索
             </button>
           </header>
-          <form aria-label="基础设置" className="settings-form">
-            <label>
-              索引目录
-              <textarea
-                value={config.index.include_dirs.join("\n")}
-                onChange={(event) =>
-                  setConfig((current) => ({
-                    ...current,
-                    index: {
-                      ...current.index,
-                      include_dirs: event.target.value
-                        .split("\n")
-                        .map((item) => item.trim())
-                        .filter(Boolean),
-                    },
-                  }))
-                }
-              />
-            </label>
-            <label>
-              正则前缀
-              <input
-                value={config.query.regex_prefix}
-                onChange={(event) =>
-                  setConfig((current) => ({
-                    ...current,
-                    query: {
-                      ...current.query,
-                      regex_prefix: event.target.value,
-                    },
-                  }))
-                }
-              />
-            </label>
-            <label className="toggle-row">
-              <input
-                aria-label="命令执行"
-                type="checkbox"
-                checked={effectiveCommandEnabled}
-                onChange={(event) =>
-                  setConfig((current) => ({
-                    ...current,
-                    command: {
-                      ...current.command,
-                      enabled: event.target.checked,
-                    },
-                  }))
-                }
-              />
-              <span>命令执行</span>
-            </label>
-            <label>
-              命令历史条数
-              <input
-                type="number"
-                value={config.history.command_max_entries}
-                min={0}
-                onChange={(event) =>
-                  setConfig((current) => ({
-                    ...current,
-                    history: {
-                      ...current.history,
-                      command_max_entries: Number(event.target.value),
-                    },
-                  }))
-                }
-              />
-            </label>
+          <form aria-label="设置" className="settings-form">
+            <fieldset>
+              <legend>搜索与索引</legend>
+              <label>
+                索引目录
+                <textarea
+                  value={config.index.include_dirs.join("\n")}
+                  onChange={(event) =>
+                    setConfig((current) => ({
+                      ...current,
+                      index: {
+                        ...current.index,
+                        include_dirs: event.target.value
+                          .split("\n")
+                          .map((item) => item.trim())
+                          .filter(Boolean),
+                      },
+                    }))
+                  }
+                />
+              </label>
+              <label>
+                正则前缀
+                <input
+                  value={config.query.regex_prefix}
+                  onChange={(event) =>
+                    setConfig((current) => ({
+                      ...current,
+                      query: {
+                        ...current.query,
+                        regex_prefix: event.target.value,
+                      },
+                    }))
+                  }
+                />
+              </label>
+              <button type="button" onClick={() => void refreshSearchIndex()}>
+                刷新索引
+              </button>
+              {refreshStatus ? <span className="settings-status">{refreshStatus}</span> : null}
+            </fieldset>
+            <fieldset>
+              <legend>网页搜索</legend>
+              <span>g Google</span>
+              <span>bd Baidu</span>
+            </fieldset>
+            <fieldset>
+              <legend>历史</legend>
+              <label>
+                输入历史条数
+                <input
+                  type="number"
+                  value={config.history.input_max_entries}
+                  min={0}
+                  onChange={(event) =>
+                    setConfig((current) => ({
+                      ...current,
+                      history: {
+                        ...current.history,
+                        input_max_entries: Number(event.target.value),
+                      },
+                    }))
+                  }
+                />
+              </label>
+            </fieldset>
+            <fieldset>
+              <legend>命令执行</legend>
+              <label className="toggle-row">
+                <input
+                  aria-label="命令执行"
+                  type="checkbox"
+                  checked={effectiveCommandEnabled}
+                  onChange={(event) =>
+                    setConfig((current) => ({
+                      ...current,
+                      command: {
+                        ...current.command,
+                        enabled: event.target.checked,
+                      },
+                    }))
+                  }
+                />
+                <span>命令执行</span>
+              </label>
+            </fieldset>
+            <fieldset>
+              <legend>外观与窗口</legend>
+              <span>Compact</span>
+            </fieldset>
             <button
               type="button"
               className="primary-button"
@@ -306,9 +378,6 @@ export function App({
             onKeyDown={handleKeyDown}
             placeholder="Search files, folders, calculator, web prefixes..."
           />
-          <button type="button" className="toolbar-button" onClick={() => setView("settings")}>
-            打开设置
-          </button>
         </header>
         {isCommandMode ? (
           <section className="command-preview" aria-label="命令预览">
@@ -327,35 +396,49 @@ export function App({
             </button>
           </section>
         ) : (
-          <ul className="result-list" aria-label="搜索结果">
-            {results.length > 0
-              ? results.map((result, index) => (
-                  <li
-                    aria-selected={index === selectedIndex}
-                    className="result-item"
-                    key={result.id}
-                    onContextMenu={(event) => {
-                      event.preventDefault();
-                      setMenuResultId(result.id);
-                      setSelectedIndex(index);
-                    }}
-                    role="option"
-                  >
-                    <span className="result-title">{result.title}</span>
-                    <span className="result-detail">{result.detail ?? ""}</span>
-                  </li>
-                ))
-              : query.trim()
-                ? [
-                    <li className="empty-state" key="empty-state">
-                      未找到结果
-                    </li>,
-                  ]
-                : null}
-          </ul>
+          <>
+            {query.trim() ? (
+              <ul className="result-list" aria-label="搜索结果">
+                {results.length > 0
+                  ? results.map((result, index) => (
+                      <li
+                        aria-selected={index === selectedIndex}
+                        className="result-item"
+                        key={result.id}
+                        onContextMenu={(event) => {
+                          event.preventDefault();
+                          setMenuResultId(result.id);
+                          setMenuPosition({ left: event.clientX, top: event.clientY });
+                          setSelectedIndex(index);
+                        }}
+                        role="option"
+                      >
+                        <span className="result-title">{result.title}</span>
+                        <span className="result-detail">{result.detail ?? ""}</span>
+                      </li>
+                    ))
+                  : [
+                      <li className="empty-state" key="empty-state">
+                        未找到结果
+                      </li>,
+                    ]}
+              </ul>
+            ) : null}
+          </>
         )}
         {menuResult ? (
-          <div className="action-menu" role="menu">
+          <div
+            className="action-menu"
+            role="menu"
+            style={
+              menuPosition
+                ? {
+                    left: `${menuPosition.left}px`,
+                    top: `${menuPosition.top}px`,
+                  }
+                : undefined
+            }
+          >
             {menuResult.secondaryActions.map((item) => (
               <button
                 key={item.label}
@@ -363,6 +446,7 @@ export function App({
                 type="button"
                 onClick={() => {
                   setMenuResultId(null);
+                  setMenuPosition(null);
                   onExecuteAction(item.action);
                 }}
               >

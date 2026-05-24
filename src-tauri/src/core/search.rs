@@ -8,6 +8,7 @@ use crate::core::actions::Action;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum SearchResultKind {
+    Application,
     File,
     Directory,
     Calculator,
@@ -137,8 +138,20 @@ impl QueryParser {
         }
 
         for prefix in &self.config.web_search_prefixes {
-            let marker = format!("{prefix}:");
-            if let Some(query) = trimmed.strip_prefix(&marker) {
+            if let Some((candidate_prefix, query)) = trimmed.split_once(char::is_whitespace) {
+                if candidate_prefix == prefix && !query.trim().is_empty() {
+                    return QueryRequest {
+                        original: input.to_owned(),
+                        text: query.trim().to_owned(),
+                        mode: SearchMode::WebSearch {
+                            prefix: prefix.clone(),
+                        },
+                    };
+                }
+            }
+
+            let legacy_marker = format!("{prefix}:");
+            if let Some(query) = trimmed.strip_prefix(&legacy_marker) {
                 return QueryRequest {
                     original: input.to_owned(),
                     text: query.trim().to_owned(),
@@ -179,6 +192,8 @@ impl HistoryScores {
 
 #[derive(Debug, Clone)]
 pub struct Ranker {
+    application_type_weight: i64,
+    file_type_weight: i64,
     exact_match_weight: i64,
     fuzzy_match_weight: i64,
     history_weight: i64,
@@ -188,6 +203,8 @@ pub struct Ranker {
 impl Default for Ranker {
     fn default() -> Self {
         Self {
+            application_type_weight: 500,
+            file_type_weight: 250,
             exact_match_weight: 1_000,
             fuzzy_match_weight: 25,
             history_weight: 10,
@@ -230,6 +247,15 @@ impl Ranker {
             score += self.fuzzy_match_weight;
         }
 
+        score += match result.kind {
+            SearchResultKind::Application => self.application_type_weight,
+            SearchResultKind::File => self.file_type_weight,
+            SearchResultKind::Directory
+            | SearchResultKind::Calculator
+            | SearchResultKind::WebSearch
+            | SearchResultKind::Command
+            | SearchResultKind::Feedback => 0,
+        };
         score += history.get(&result.id) * self.history_weight;
         score -= path_depth(result) * self.path_depth_penalty;
         score
@@ -342,7 +368,7 @@ mod tests {
             ..QueryParserConfig::default()
         });
 
-        let request = parser.parse("gh: tauri plugins");
+        let request = parser.parse("gh tauri plugins");
 
         assert_eq!(request.text, "tauri plugins");
         assert_eq!(
@@ -351,6 +377,34 @@ mod tests {
                 prefix: "gh".to_owned()
             }
         );
+    }
+
+    #[test]
+    fn parser_recognizes_space_separated_web_search_prefixes() {
+        let parser = QueryParser::new(QueryParserConfig {
+            web_search_prefixes: vec!["g".to_owned(), "bd".to_owned()],
+            ..QueryParserConfig::default()
+        });
+
+        let google = parser.parse("g 1234");
+        let baidu = parser.parse("bd 1234");
+        let prefix_only = parser.parse("g ");
+
+        assert_eq!(google.text, "1234");
+        assert_eq!(
+            google.mode,
+            SearchMode::WebSearch {
+                prefix: "g".to_owned()
+            }
+        );
+        assert_eq!(baidu.text, "1234");
+        assert_eq!(
+            baidu.mode,
+            SearchMode::WebSearch {
+                prefix: "bd".to_owned()
+            }
+        );
+        assert_eq!(prefix_only.mode, SearchMode::Normal);
     }
 
     #[test]
@@ -401,11 +455,50 @@ mod tests {
         assert_eq!(ranked[0].id, "recent");
     }
 
+    #[test]
+    fn ranker_prefers_applications_then_files_then_directories_when_quality_is_similar() {
+        let results = vec![
+            directory_result("directory", "QuickFox", "/home/frank/QuickFox"),
+            file_result("file", "QuickFox", "/home/frank/QuickFox.txt"),
+            application_result("app", "QuickFox", "/Applications/QuickFox.app"),
+        ];
+
+        let ranked = Ranker::default().rank("QuickFox", results, &HistoryScores::default());
+
+        assert_eq!(ranked[0].id, "app");
+        assert_eq!(ranked[1].id, "file");
+        assert_eq!(ranked[2].id, "directory");
+    }
+
     fn file_result(id: &str, title: &str, path: &str) -> SearchResult {
         SearchResult::new(
             id,
             title,
             SearchResultKind::File,
+            Action::OpenPath {
+                path: path.to_owned(),
+            },
+        )
+        .with_detail(path)
+    }
+
+    fn directory_result(id: &str, title: &str, path: &str) -> SearchResult {
+        SearchResult::new(
+            id,
+            title,
+            SearchResultKind::Directory,
+            Action::OpenPath {
+                path: path.to_owned(),
+            },
+        )
+        .with_detail(path)
+    }
+
+    fn application_result(id: &str, title: &str, path: &str) -> SearchResult {
+        SearchResult::new(
+            id,
+            title,
+            SearchResultKind::Application,
             Action::OpenPath {
                 path: path.to_owned(),
             },

@@ -269,22 +269,50 @@ impl HotkeyState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LauncherWindowEffect {
+    ShowAndFocus,
+    Hide,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LauncherWindowState {
     visible: bool,
+    focused: bool,
 }
 
 impl LauncherWindowState {
     pub fn show(&mut self) {
         self.visible = true;
+        self.focused = true;
     }
 
     pub fn hide(&mut self) {
         self.visible = false;
+        self.focused = false;
     }
 
     pub fn is_visible(&self) -> bool {
         self.visible
+    }
+
+    pub fn is_focused(&self) -> bool {
+        self.focused
+    }
+
+    pub fn mark_backgrounded(&mut self) {
+        self.visible = true;
+        self.focused = false;
+    }
+
+    pub fn toggle_for_global_hotkey(&mut self) -> LauncherWindowEffect {
+        if self.visible && self.focused {
+            self.hide();
+            LauncherWindowEffect::Hide
+        } else {
+            self.show();
+            LauncherWindowEffect::ShowAndFocus
+        }
     }
 }
 
@@ -504,5 +532,31 @@ mod tests {
 
         window.hide();
         assert!(!window.is_visible());
+    }
+
+    #[test]
+    fn launcher_window_state_toggles_double_shift_visibility_and_focus() {
+        let mut window = LauncherWindowState::default();
+
+        assert_eq!(
+            window.toggle_for_global_hotkey(),
+            LauncherWindowEffect::ShowAndFocus
+        );
+        assert!(window.is_visible());
+        assert!(window.is_focused());
+
+        assert_eq!(
+            window.toggle_for_global_hotkey(),
+            LauncherWindowEffect::Hide
+        );
+        assert!(!window.is_visible());
+
+        window.mark_backgrounded();
+        assert_eq!(
+            window.toggle_for_global_hotkey(),
+            LauncherWindowEffect::ShowAndFocus
+        );
+        assert!(window.is_visible());
+        assert!(window.is_focused());
     }
 }
