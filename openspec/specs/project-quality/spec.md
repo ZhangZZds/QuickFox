@@ -1,8 +1,11 @@
 # project-quality Specification
 
 ## Purpose
+
 TBD - created by archiving change build-quickfox-launcher. Update Purpose after archive.
+
 ## Requirements
+
 ### Requirement: 中文维护文档
 
 系统 SHALL 提供中文维护文档，说明依赖安装、本地运行、测试、构建、架构和
@@ -74,4 +77,3 @@ TBD - created by archiving change build-quickfox-launcher. Update Purpose after 
 
 - **WHEN** 准备声明 OpenSpec 任务完成
 - **THEN** 运行相关测试、构建、lint 和 `openspec validate`
-

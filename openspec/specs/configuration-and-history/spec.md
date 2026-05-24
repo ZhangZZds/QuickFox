@@ -1,8 +1,11 @@
 # configuration-and-history Specification
 
 ## Purpose
+
 TBD - created by archiving change build-quickfox-launcher. Update Purpose after archive.
+
 ## Requirements
+
 ### Requirement: 创建默认 TOML 配置
 
 系统 SHALL 在首次启动且配置不存在时创建默认 TOML 配置文件。
@@ -77,4 +80,3 @@ TBD - created by archiving change build-quickfox-launcher. Update Purpose after 
 
 - **WHEN** 用户关闭命令历史
 - **THEN** 系统不再持久化后续执行的命令
-

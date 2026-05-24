@@ -1,8 +1,11 @@
 # query-providers Specification
 
 ## Purpose
+
 TBD - created by archiving change build-quickfox-launcher. Update Purpose after archive.
+
 ## Requirements
+
 ### Requirement: Provider 返回统一结果
 
 系统 SHALL 通过 Provider registry 调用内置 Provider，并将 Provider 输出统一
@@ -69,4 +72,3 @@ TBD - created by archiving change build-quickfox-launcher. Update Purpose after 
 
 - **WHEN** 命令执行已启用且用户输入 `> git status`
 - **THEN** 命令 Provider 返回需要确认的命令结果
-

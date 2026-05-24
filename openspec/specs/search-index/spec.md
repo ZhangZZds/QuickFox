@@ -1,8 +1,11 @@
 # search-index Specification
 
 ## Purpose
+
 TBD - created by archiving change build-quickfox-launcher. Update Purpose after archive.
+
 ## Requirements
+
 ### Requirement: 默认索引用户主目录
 
 系统 SHALL 默认索引当前用户的主目录或 profile 目录，并只索引文件名、目录
@@ -77,4 +80,3 @@ TBD - created by archiving change build-quickfox-launcher. Update Purpose after 
 
 - **WHEN** 两个结果匹配质量相近且其中一个最近被打开过
 - **THEN** 最近打开过的结果排序更靠前
-

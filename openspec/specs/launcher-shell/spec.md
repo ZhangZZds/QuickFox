@@ -1,8 +1,11 @@
 # launcher-shell Specification
 
 ## Purpose
+
 TBD - created by archiving change build-quickfox-launcher. Update Purpose after archive.
+
 ## Requirements
+
 ### Requirement: 全局快捷键唤起启动器
 
 系统 SHALL 注册 `Shift+Shift` 作为默认全局快捷键，并在用户连续按下两次
@@ -72,4 +75,3 @@ Shift 时显示 QuickFox 启动窗口。
 
 - **WHEN** 命令执行已启用且用户输入命令前缀和命令文本
 - **THEN** 结果区域显示待执行命令、目标终端和确认动作
-

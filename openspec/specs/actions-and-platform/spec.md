@@ -1,8 +1,11 @@
 # actions-and-platform Specification
 
 ## Purpose
+
 TBD - created by archiving change build-quickfox-launcher. Update Purpose after archive.
+
 ## Requirements
+
 ### Requirement: Action dispatcher 集中执行动作
 
 系统 SHALL 通过 Rust core 的 Action dispatcher 执行动作，不允许 Provider 或
@@ -73,4 +76,3 @@ TBD - created by archiving change build-quickfox-launcher. Update Purpose after 
 
 - **WHEN** 当前平台是 Linux 且没有自定义索引目录
 - **THEN** PathAdapter 返回用户 home 目录作为默认索引根目录
-
