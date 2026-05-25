@@ -39,8 +39,8 @@ npm run tauri build
 ```bash
 npm run check
 npm run tauri build
-git tag v1.0.0
-git push origin v1.0.0
+git tag v1.1.0
+git push origin v1.1.0
 ```
 
 `release.yml` 会使用 GitHub-hosted `macos-latest` 和 `windows-latest` runner
@@ -55,6 +55,21 @@ git push origin v1.0.0
 3. 在运行时 `ProviderRegistry` 注册
 4. 如有配置项，扩展 `QuickFoxConfig`
 5. 更新架构与开发文档
+
+网页搜索引擎不需要新增 Rust Provider。优先在设置页或 TOML 配置中添加前缀、名称和 URL 模板，模板必须包含 `{query}`。例如 DuckDuckGo：
+
+```toml
+[web_search.engines.ddg]
+name = "DuckDuckGo"
+url = "https://duckduckgo.com/?q={query}"
+```
+
+## 索引开发注意事项
+
+- 文件索引不应在启动路径同步扫描大目录；启动时先加载 SQLite 中最近完成的索引快照
+- 后台刷新完成后用新批次替换内存索引，旧 generation 的刷新结果不能覆盖新请求
+- 文件 Provider 必须在索引不可用时降级为反馈，不影响计算器、网页搜索和命令 Provider
+- 新增索引字段、状态或存储迁移时，需要同时补 Rust storage/index 测试和设置页状态测试
 
 ## 新增 Action 的方法
 

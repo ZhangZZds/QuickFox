@@ -45,12 +45,35 @@ impl ProviderRegistry {
 }
 
 pub struct FileProvider {
-    index: SearchIndex,
+    index: FileProviderIndex,
+    candidate_limit: usize,
+}
+
+enum FileProviderIndex {
+    Available(SearchIndex),
+    Unavailable(String),
 }
 
 impl FileProvider {
     pub fn new(index: SearchIndex) -> Self {
-        Self { index }
+        Self {
+            index: FileProviderIndex::Available(index),
+            candidate_limit: usize::MAX,
+        }
+    }
+
+    pub fn with_candidate_limit(index: SearchIndex, candidate_limit: usize) -> Self {
+        Self {
+            index: FileProviderIndex::Available(index),
+            candidate_limit,
+        }
+    }
+
+    pub fn unavailable(message: String) -> Self {
+        Self {
+            index: FileProviderIndex::Unavailable(message),
+            candidate_limit: 0,
+        }
     }
 }
 
@@ -60,8 +83,30 @@ impl Provider for FileProvider {
     }
 
     fn search(&self, query: &QueryRequest) -> Vec<SearchResult> {
-        self.index
-            .search(query)
+        let results = match &self.index {
+            FileProviderIndex::Available(index) => {
+                index.search_with_limit(query, self.candidate_limit)
+            }
+            FileProviderIndex::Unavailable(message) => {
+                if matches!(query.mode, SearchMode::Normal) && !query.text.trim().is_empty() {
+                    let mut result = SearchResult::new(
+                        "files:index-unavailable",
+                        message.clone(),
+                        SearchResultKind::Feedback,
+                        Action::CopyText {
+                            text: message.clone(),
+                        },
+                    )
+                    .with_detail("文件搜索暂不可用".to_owned())
+                    .with_score(100);
+                    result.provider = self.id().to_owned();
+                    return vec![result];
+                }
+                return Vec::new();
+            }
+        };
+
+        results
             .into_iter()
             .map(|mut result| {
                 result.provider = self.id().to_owned();
@@ -569,6 +614,18 @@ mod tests {
     }
 
     #[test]
+    fn file_provider_returns_feedback_when_index_is_unavailable() {
+        let provider = FileProvider::unavailable("文件索引正在建立".to_owned());
+
+        let results = provider.search(&QueryRequest::new("notes", SearchMode::Normal));
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].provider, "files");
+        assert_eq!(results[0].kind, SearchResultKind::Feedback);
+        assert!(results[0].title.contains("文件索引"));
+    }
+
+    #[test]
     fn calculator_provider_evaluates_enhanced_expressions() {
         let provider = CalculatorProvider;
 
@@ -652,6 +709,31 @@ mod tests {
             results[0].main_action,
             Action::OpenUrl {
                 url: "https://www.baidu.com/s?wd=1234".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn web_search_provider_supports_duckduckgo_prefix_and_encodes_query() {
+        let provider = WebSearchProvider::new(vec![WebSearchEngine {
+            prefix: "ddg".to_owned(),
+            name: "DuckDuckGo".to_owned(),
+            url_template: "https://duckduckgo.com/?q={query}".to_owned(),
+        }]);
+
+        let results = provider.search(&QueryRequest {
+            original: "ddg rust tauri".to_owned(),
+            text: "rust tauri".to_owned(),
+            mode: SearchMode::WebSearch {
+                prefix: "ddg".to_owned(),
+            },
+        });
+
+        assert_eq!(results[0].title, "DuckDuckGo: rust tauri");
+        assert_eq!(
+            results[0].main_action,
+            Action::OpenUrl {
+                url: "https://duckduckgo.com/?q=rust%20tauri".to_owned()
             }
         );
     }

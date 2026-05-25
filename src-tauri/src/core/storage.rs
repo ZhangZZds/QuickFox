@@ -1,5 +1,6 @@
 //! SQLite storage will live here.
 
+use crate::core::index::{IndexedEntry, IndexedEntryKind};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::PathBuf;
 
@@ -15,6 +16,12 @@ pub struct PathUsage {
     pub path: String,
     pub open_count: i64,
     pub last_opened_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexSnapshot {
+    pub completed_at_ms: i64,
+    pub entries: Vec<IndexedEntry>,
 }
 
 #[derive(Debug)]
@@ -67,6 +74,26 @@ impl SqliteStorage {
                 input TEXT PRIMARY KEY NOT NULL,
                 last_used_at_ms INTEGER NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS index_batches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                completed_at_ms INTEGER NOT NULL,
+                entry_count INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS index_entries (
+                batch_id INTEGER NOT NULL,
+                path TEXT NOT NULL,
+                name TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                search_text TEXT NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (batch_id, path),
+                FOREIGN KEY (batch_id) REFERENCES index_batches(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_index_entries_batch_id
+                ON index_entries(batch_id);
             "#,
         )?;
         Ok(())
@@ -105,6 +132,89 @@ impl SqliteStorage {
                 },
             )
             .optional()?)
+    }
+
+    pub fn save_completed_index_batch(
+        &self,
+        completed_at_ms: i64,
+        entries: &[IndexedEntry],
+    ) -> Result<(), StorageError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        transaction.execute(
+            r#"
+            INSERT INTO index_batches (completed_at_ms, entry_count)
+            VALUES (?1, ?2)
+            "#,
+            params![completed_at_ms, entries.len() as i64],
+        )?;
+        let batch_id = transaction.last_insert_rowid();
+
+        {
+            let mut statement = transaction.prepare(
+                r#"
+                INSERT INTO index_entries
+                    (batch_id, path, name, kind, search_text, updated_at_ms)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                "#,
+            )?;
+            for entry in entries {
+                statement.execute(params![
+                    batch_id,
+                    entry.path,
+                    entry.name,
+                    index_kind_to_storage(&entry.kind),
+                    searchable_text(entry),
+                    completed_at_ms,
+                ])?;
+            }
+        }
+
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn latest_index_snapshot(&self) -> Result<Option<IndexSnapshot>, StorageError> {
+        let Some((batch_id, completed_at_ms)) = self
+            .connection
+            .query_row(
+                r#"
+                SELECT id, completed_at_ms
+                FROM index_batches
+                ORDER BY completed_at_ms DESC, id DESC
+                LIMIT 1
+                "#,
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+
+        let mut statement = self.connection.prepare(
+            r#"
+            SELECT path, name, kind
+            FROM index_entries
+            WHERE batch_id = ?1
+            ORDER BY path ASC, name ASC
+            "#,
+        )?;
+        let rows = statement.query_map(params![batch_id], |row| {
+            Ok(IndexedEntry {
+                path: row.get(0)?,
+                name: row.get(1)?,
+                kind: index_kind_from_storage(row.get::<_, String>(2)?.as_str()),
+            })
+        })?;
+        let mut entries = Vec::new();
+        for row in rows {
+            entries.push(row?);
+        }
+
+        Ok(Some(IndexSnapshot {
+            completed_at_ms,
+            entries,
+        }))
     }
 
     pub fn record_path_usage(&self, path: &str, opened_at_ms: i64) -> Result<(), StorageError> {
@@ -256,9 +366,30 @@ impl SqliteStorage {
     }
 }
 
+fn searchable_text(entry: &IndexedEntry) -> String {
+    format!("{} {}", entry.name, entry.path).to_lowercase()
+}
+
+fn index_kind_to_storage(kind: &IndexedEntryKind) -> &'static str {
+    match kind {
+        IndexedEntryKind::Application => "application",
+        IndexedEntryKind::File => "file",
+        IndexedEntryKind::Directory => "directory",
+    }
+}
+
+fn index_kind_from_storage(kind: &str) -> IndexedEntryKind {
+    match kind {
+        "application" => IndexedEntryKind::Application,
+        "directory" => IndexedEntryKind::Directory,
+        _ => IndexedEntryKind::File,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::index::{IndexedEntry, IndexedEntryKind};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -279,6 +410,65 @@ mod tests {
         assert_eq!(loaded.root, "/home/frank");
         assert_eq!(loaded.refreshed_at_ms, 123);
         assert_eq!(loaded.entry_count, 42);
+
+        drop(storage);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn storage_returns_no_index_snapshot_before_first_completed_batch() {
+        let path = temp_db_path("index-snapshot-empty");
+        let storage = SqliteStorage::open(path.clone()).unwrap();
+
+        assert!(storage.latest_index_snapshot().unwrap().is_none());
+
+        drop(storage);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn storage_persists_and_loads_latest_completed_index_snapshot() {
+        let path = temp_db_path("index-snapshot");
+        let storage = SqliteStorage::open(path.clone()).unwrap();
+
+        storage
+            .save_completed_index_batch(
+                100,
+                &[
+                    IndexedEntry {
+                        path: "/home/frank/Documents".to_owned(),
+                        name: "Documents".to_owned(),
+                        kind: IndexedEntryKind::Directory,
+                    },
+                    IndexedEntry {
+                        path: "/home/frank/notes.md".to_owned(),
+                        name: "notes.md".to_owned(),
+                        kind: IndexedEntryKind::File,
+                    },
+                ],
+            )
+            .unwrap();
+        storage
+            .save_completed_index_batch(
+                200,
+                &[IndexedEntry {
+                    path: "/home/frank/Downloads".to_owned(),
+                    name: "Downloads".to_owned(),
+                    kind: IndexedEntryKind::Directory,
+                }],
+            )
+            .unwrap();
+
+        let snapshot = storage.latest_index_snapshot().unwrap().unwrap();
+        assert_eq!(snapshot.completed_at_ms, 200);
+        assert_eq!(
+            snapshot.entries,
+            vec![IndexedEntry {
+                path: "/home/frank/Downloads".to_owned(),
+                name: "Downloads".to_owned(),
+                kind: IndexedEntryKind::Directory,
+            }]
+        );
 
         drop(storage);
         let _ = fs::remove_file(path);

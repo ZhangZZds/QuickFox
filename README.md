@@ -91,8 +91,8 @@ npm run tauri build
 tag workflow 触发：
 
 ```bash
-git tag v1.0.0
-git push origin v1.0.0
+git tag v1.1.0
+git push origin v1.1.0
 ```
 
 GitHub Actions 会在 `macos-latest` 和 `windows-latest` 上运行 release workflow，

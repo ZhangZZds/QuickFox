@@ -33,6 +33,109 @@ pub struct IndexReport {
     pub failures: Vec<IndexFailure>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum IndexStatusKind {
+    Unbuilt,
+    Building,
+    Ready,
+    Refreshing,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IndexStatus {
+    pub kind: IndexStatusKind,
+    pub entry_count: usize,
+    pub message: Option<String>,
+    pub generation: u64,
+    pub completed_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct IndexLifecycle {
+    generation: u64,
+    status: IndexStatus,
+}
+
+impl Default for IndexLifecycle {
+    fn default() -> Self {
+        Self {
+            generation: 0,
+            status: IndexStatus {
+                kind: IndexStatusKind::Unbuilt,
+                entry_count: 0,
+                message: None,
+                generation: 0,
+                completed_at_ms: None,
+            },
+        }
+    }
+}
+
+impl IndexLifecycle {
+    pub fn from_ready(entry_count: usize, completed_at_ms: i64) -> Self {
+        Self {
+            generation: 0,
+            status: IndexStatus {
+                kind: IndexStatusKind::Ready,
+                entry_count,
+                message: None,
+                generation: 0,
+                completed_at_ms: Some(completed_at_ms),
+            },
+        }
+    }
+
+    pub fn status(&self) -> &IndexStatus {
+        &self.status
+    }
+
+    pub fn start_refresh(&mut self, has_existing_index: bool) -> u64 {
+        self.generation = self.generation.saturating_add(1);
+        self.status.kind = if has_existing_index {
+            IndexStatusKind::Refreshing
+        } else {
+            IndexStatusKind::Building
+        };
+        self.status.message = None;
+        self.status.generation = self.generation;
+        self.generation
+    }
+
+    pub fn complete_refresh(
+        &mut self,
+        generation: u64,
+        entry_count: usize,
+        completed_at_ms: i64,
+    ) -> bool {
+        if generation != self.generation {
+            return false;
+        }
+
+        self.status = IndexStatus {
+            kind: IndexStatusKind::Ready,
+            entry_count,
+            message: None,
+            generation,
+            completed_at_ms: Some(completed_at_ms),
+        };
+        true
+    }
+
+    pub fn fail_refresh(&mut self, generation: u64, message: String) -> bool {
+        if generation != self.generation {
+            return false;
+        }
+
+        self.status.kind = IndexStatusKind::Failed;
+        self.status.message = Some(message);
+        self.status.generation = generation;
+        true
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct IndexScanOptions {
     pub include_dirs: Vec<PathBuf>,
@@ -190,11 +293,16 @@ fn path_to_string(path: &Path) -> String {
 #[derive(Debug, Clone, Default)]
 pub struct SearchIndex {
     entries: Vec<IndexedEntry>,
+    search_texts: Vec<String>,
 }
 
 impl SearchIndex {
     pub fn from_entries(entries: Vec<IndexedEntry>) -> Self {
-        Self { entries }
+        let search_texts = entries.iter().map(searchable_text).collect();
+        Self {
+            entries,
+            search_texts,
+        }
     }
 
     pub fn entries(&self) -> &[IndexedEntry] {
@@ -207,7 +315,7 @@ impl SearchIndex {
         options: IndexScanOptions,
     ) -> Result<IndexReport, std::io::Error> {
         let report = scanner.scan(options)?;
-        self.entries = report.entries.clone();
+        self.replace_entries(report.entries.clone());
         Ok(report)
     }
 
@@ -224,7 +332,7 @@ impl SearchIndex {
             .map(|entry| (entry.path.clone(), entry))
             .collect();
 
-        self.entries = report
+        let entries = report
             .entries
             .iter()
             .map(|entry| {
@@ -234,34 +342,45 @@ impl SearchIndex {
                     .unwrap_or_else(|| entry.clone())
             })
             .collect();
+        self.replace_entries(entries);
         Ok(report)
     }
 
     pub fn search(&self, query: &QueryRequest) -> Vec<SearchResult> {
+        self.search_with_limit(query, usize::MAX)
+    }
+
+    pub fn search_with_limit(&self, query: &QueryRequest, limit: usize) -> Vec<SearchResult> {
         match &query.mode {
-            SearchMode::Normal => self.search_normal(&query.text),
-            SearchMode::Regex => self.search_regex(&query.text),
+            SearchMode::Normal => self.search_normal(&query.text, limit),
+            SearchMode::Regex => self.search_regex(&query.text, limit),
             SearchMode::WebSearch { .. } | SearchMode::Command => Vec::new(),
         }
     }
 
-    fn search_normal(&self, query: &str) -> Vec<SearchResult> {
+    fn replace_entries(&mut self, entries: Vec<IndexedEntry>) {
+        self.search_texts = entries.iter().map(searchable_text).collect();
+        self.entries = entries;
+    }
+
+    fn search_normal(&self, query: &str, limit: usize) -> Vec<SearchResult> {
         let query = query.trim().to_lowercase();
-        if query.is_empty() {
+        if query.is_empty() || limit == 0 {
             return Vec::new();
         }
 
         self.entries
             .iter()
-            .filter(|entry| {
-                let haystack = format!("{} {}", entry.name, entry.path).to_lowercase();
-                haystack.contains(&query) || fuzzy_matches_with_quality(&query, &haystack)
+            .zip(self.search_texts.iter())
+            .filter(|(_, haystack)| {
+                haystack.contains(&query) || fuzzy_matches_with_quality(&query, haystack)
             })
-            .map(entry_to_result)
+            .take(limit)
+            .map(|(entry, _)| entry_to_result(entry))
             .collect()
     }
 
-    fn search_regex(&self, pattern: &str) -> Vec<SearchResult> {
+    fn search_regex(&self, pattern: &str, limit: usize) -> Vec<SearchResult> {
         let regex = match Regex::new(pattern) {
             Ok(regex) => regex,
             Err(error) => {
@@ -279,9 +398,14 @@ impl SearchIndex {
         self.entries
             .iter()
             .filter(|entry| regex.is_match(&entry.name) || regex.is_match(&entry.path))
+            .take(limit)
             .map(entry_to_result)
             .collect()
     }
+}
+
+fn searchable_text(entry: &IndexedEntry) -> String {
+    format!("{} {}", entry.name, entry.path).to_lowercase()
 }
 
 fn entry_to_result(entry: &IndexedEntry) -> SearchResult {
@@ -619,6 +743,78 @@ mod tests {
         let results = index.search(&parser.parse("Openspec_123"));
 
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn search_uses_cached_case_insensitive_text_for_name_and_path_matches() {
+        let index =
+            SearchIndex::from_entries(vec![file_entry("/home/frank/Projects/QuickFox/README.md")]);
+        let parser = crate::core::search::QueryParser::new(Default::default());
+
+        let name_results = index.search(&parser.parse("readme"));
+        let path_results = index.search(&parser.parse("quickfox"));
+
+        assert_eq!(name_results[0].title, "README.md");
+        assert_eq!(path_results[0].title, "README.md");
+    }
+
+    #[test]
+    fn search_with_limit_bounds_constructed_results() {
+        let index = SearchIndex::from_entries(vec![
+            file_entry("/tmp/project-alpha.md"),
+            file_entry("/tmp/project-beta.md"),
+            file_entry("/tmp/project-gamma.md"),
+        ]);
+        let parser = crate::core::search::QueryParser::new(Default::default());
+
+        let results = index.search_with_limit(&parser.parse("project"), 2);
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].title, "project-alpha.md");
+        assert_eq!(results[1].title, "project-beta.md");
+    }
+
+    #[test]
+    fn index_lifecycle_tracks_unbuilt_building_ready_refreshing_and_failed_states() {
+        let mut lifecycle = IndexLifecycle::default();
+
+        assert_eq!(lifecycle.status().kind, IndexStatusKind::Unbuilt);
+
+        let first_generation = lifecycle.start_refresh(false);
+        assert_eq!(lifecycle.status().kind, IndexStatusKind::Building);
+
+        lifecycle.complete_refresh(first_generation, 42, 100);
+        assert_eq!(lifecycle.status().kind, IndexStatusKind::Ready);
+        assert_eq!(lifecycle.status().entry_count, 42);
+        assert_eq!(lifecycle.status().completed_at_ms, Some(100));
+
+        let second_generation = lifecycle.start_refresh(true);
+        assert_eq!(lifecycle.status().kind, IndexStatusKind::Refreshing);
+        assert_eq!(lifecycle.status().entry_count, 42);
+
+        lifecycle.fail_refresh(second_generation, "permission denied".to_owned());
+        assert_eq!(lifecycle.status().kind, IndexStatusKind::Failed);
+        assert_eq!(lifecycle.status().entry_count, 42);
+        assert_eq!(
+            lifecycle.status().message.as_deref(),
+            Some("permission denied")
+        );
+    }
+
+    #[test]
+    fn index_lifecycle_ignores_stale_refresh_completion() {
+        let mut lifecycle = IndexLifecycle::default();
+
+        let stale_generation = lifecycle.start_refresh(false);
+        let current_generation = lifecycle.start_refresh(false);
+        lifecycle.complete_refresh(stale_generation, 10, 100);
+
+        assert_eq!(lifecycle.status().kind, IndexStatusKind::Building);
+        assert_eq!(lifecycle.status().entry_count, 0);
+
+        lifecycle.complete_refresh(current_generation, 20, 200);
+        assert_eq!(lifecycle.status().kind, IndexStatusKind::Ready);
+        assert_eq!(lifecycle.status().entry_count, 20);
     }
 
     fn file_entry(path: &str) -> IndexedEntry {

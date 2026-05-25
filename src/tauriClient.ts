@@ -21,6 +21,10 @@ export function refreshIndex() {
   return invoke("refresh_index");
 }
 
+export function indexStatus() {
+  return invoke("index_status");
+}
+
 export function loadConfig() {
   return invoke("load_config");
 }
@@ -77,4 +81,12 @@ export type QuickFoxConfig = {
   results: {
     limit: number;
   };
+};
+
+export type IndexStatus = {
+  kind: "unbuilt" | "building" | "ready" | "refreshing" | "failed";
+  entryCount: number;
+  message?: string | null;
+  generation: number;
+  completedAtMs?: number | null;
 };

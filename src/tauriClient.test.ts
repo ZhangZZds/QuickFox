@@ -6,6 +6,7 @@ import {
   clearCommandHistory,
   clearInputHistory,
   executeAction,
+  indexStatus,
   listenOpenSettings,
   loadConfig,
   recentInputHistory,
@@ -53,6 +54,7 @@ describe("tauriClient", () => {
     invokeMock.mockResolvedValue(undefined);
 
     await refreshIndex();
+    await indexStatus();
     await loadConfig();
     await saveConfig(config);
     await clearCommandHistory();
@@ -61,14 +63,15 @@ describe("tauriClient", () => {
     await clearInputHistory();
 
     expect(invokeMock).toHaveBeenNthCalledWith(1, "refresh_index");
-    expect(invokeMock).toHaveBeenNthCalledWith(2, "load_config");
-    expect(invokeMock).toHaveBeenNthCalledWith(3, "save_config", { config });
-    expect(invokeMock).toHaveBeenNthCalledWith(4, "clear_command_history");
-    expect(invokeMock).toHaveBeenNthCalledWith(5, "record_input_history", {
+    expect(invokeMock).toHaveBeenNthCalledWith(2, "index_status");
+    expect(invokeMock).toHaveBeenNthCalledWith(3, "load_config");
+    expect(invokeMock).toHaveBeenNthCalledWith(4, "save_config", { config });
+    expect(invokeMock).toHaveBeenNthCalledWith(5, "clear_command_history");
+    expect(invokeMock).toHaveBeenNthCalledWith(6, "record_input_history", {
       input: "g 1234",
     });
-    expect(invokeMock).toHaveBeenNthCalledWith(6, "recent_input_history");
-    expect(invokeMock).toHaveBeenNthCalledWith(7, "clear_input_history");
+    expect(invokeMock).toHaveBeenNthCalledWith(7, "recent_input_history");
+    expect(invokeMock).toHaveBeenNthCalledWith(8, "clear_input_history");
   });
 
   it("listens for the tray settings event", async () => {

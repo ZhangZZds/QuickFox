@@ -2,7 +2,9 @@ pub mod core;
 
 use crate::core::actions::{Action, OpenApplication};
 use crate::core::config::{ConfigStore, QuickFoxConfig};
-use crate::core::index::{IndexReport, IndexScanOptions, IndexScanner, SearchIndex};
+use crate::core::index::{
+    IndexLifecycle, IndexReport, IndexScanOptions, IndexScanner, IndexStatus, SearchIndex,
+};
 use crate::core::platform::{
     CommandSafetyChecker, CommandSafetyDecision, DevelopmentToolAdapter, LauncherWindowEffect,
     LauncherWindowState, ProcessCommand,
@@ -33,6 +35,7 @@ struct QuickFoxRuntime {
     config: QuickFoxConfig,
     index: SearchIndex,
     last_report: IndexReport,
+    index_lifecycle: IndexLifecycle,
 }
 
 struct QuickFoxAppState {
@@ -46,12 +49,26 @@ fn search(state: tauri::State<QuickFoxAppState>, query: String) -> Vec<SearchRes
         .runtime
         .lock()
         .expect("quickfox runtime lock poisoned");
-    perform_search(&runtime.config, &runtime.index, &query)
+    perform_search_with_index_status(
+        &runtime.config,
+        &runtime.index,
+        &runtime.index_status(),
+        &query,
+    )
 }
 
 #[tauri::command]
 fn health_check() -> &'static str {
     "ok"
+}
+
+#[tauri::command]
+fn index_status(state: tauri::State<QuickFoxAppState>) -> IndexStatus {
+    state
+        .runtime
+        .lock()
+        .expect("quickfox runtime lock poisoned")
+        .index_status()
 }
 
 #[tauri::command]
@@ -95,12 +112,11 @@ fn execute_action(app: tauri::AppHandle, action: Action) -> Result<&'static str,
 }
 
 #[tauri::command]
-fn refresh_index(state: tauri::State<QuickFoxAppState>) -> Result<IndexReport, String> {
-    let mut runtime = state
-        .runtime
-        .lock()
-        .expect("quickfox runtime lock poisoned");
-    refresh_runtime_index(&mut runtime)
+fn refresh_index(
+    app: tauri::AppHandle,
+    state: tauri::State<QuickFoxAppState>,
+) -> Result<IndexStatus, String> {
+    start_background_index_refresh(app, &state)
 }
 
 #[tauri::command]
@@ -115,6 +131,7 @@ fn load_config(state: tauri::State<QuickFoxAppState>) -> QuickFoxConfig {
 
 #[tauri::command]
 fn save_config(
+    app: tauri::AppHandle,
     state: tauri::State<QuickFoxAppState>,
     config: QuickFoxConfig,
 ) -> Result<&'static str, String> {
@@ -131,7 +148,8 @@ fn save_config(
         store.save(&config).map_err(|error| format!("{error:?}"))?;
     }
     runtime.config = config;
-    let _ = refresh_runtime_index(&mut runtime)?;
+    drop(runtime);
+    let _ = start_background_index_refresh(app, &state)?;
 
     Ok("saved")
 }
@@ -350,9 +368,22 @@ fn build_query_parser_config(config: &QuickFoxConfig) -> QueryParserConfig {
     }
 }
 
-fn build_provider_registry(config: &QuickFoxConfig, index: SearchIndex) -> ProviderRegistry {
+fn build_provider_registry(
+    config: &QuickFoxConfig,
+    index: SearchIndex,
+    index_status: &IndexStatus,
+) -> ProviderRegistry {
     let mut registry = ProviderRegistry::default();
-    registry.register(FileProvider::new(index));
+    if file_index_is_available(&index, index_status) {
+        registry.register(FileProvider::with_candidate_limit(
+            index,
+            config.results.limit.max(1).saturating_mul(4),
+        ));
+    } else {
+        registry.register(FileProvider::unavailable(index_unavailable_message(
+            index_status,
+        )));
+    }
     registry.register(CalculatorProvider);
     registry.register(WebSearchProvider::new(
         config
@@ -372,39 +403,181 @@ fn build_provider_registry(config: &QuickFoxConfig, index: SearchIndex) -> Provi
     registry
 }
 
+#[cfg(test)]
 fn perform_search(config: &QuickFoxConfig, index: &SearchIndex, query: &str) -> Vec<SearchResult> {
+    let status = if index.entries().is_empty() {
+        IndexLifecycle::default().status().clone()
+    } else {
+        IndexLifecycle::from_ready(index.entries().len(), current_time_ms())
+            .status()
+            .clone()
+    };
+    perform_search_with_index_status(config, index, &status, query)
+}
+
+fn perform_search_with_index_status(
+    config: &QuickFoxConfig,
+    index: &SearchIndex,
+    index_status: &IndexStatus,
+    query: &str,
+) -> Vec<SearchResult> {
     let parser = QueryParser::new(build_query_parser_config(config));
     let request = parser.parse(query);
     if request.text.is_empty() {
         return Vec::new();
     }
 
-    let registry = build_provider_registry(config, index.clone());
+    let registry = build_provider_registry(config, index.clone(), index_status);
     let results = registry.search(&request);
     let mut ranked = Ranker::default().rank(&request.text, results, &HistoryScores::default());
     ranked.truncate(config.results.limit.max(1));
     ranked
 }
 
-fn refresh_runtime_index(runtime: &mut QuickFoxRuntime) -> Result<IndexReport, String> {
-    let report = runtime
-        .index
-        .refresh_incremental_with_scanner(&IndexScanner, build_scan_options(&runtime.config))
+fn file_index_is_available(index: &SearchIndex, status: &IndexStatus) -> bool {
+    !index.entries().is_empty()
+        || matches!(
+            status.kind,
+            crate::core::index::IndexStatusKind::Ready
+                | crate::core::index::IndexStatusKind::Refreshing
+        )
+}
+
+fn index_unavailable_message(status: &IndexStatus) -> String {
+    match status.kind {
+        crate::core::index::IndexStatusKind::Building => "文件索引正在建立".to_owned(),
+        crate::core::index::IndexStatusKind::Failed => status
+            .message
+            .clone()
+            .unwrap_or_else(|| "文件索引构建失败".to_owned()),
+        _ => "文件索引尚未建立".to_owned(),
+    }
+}
+
+fn start_background_index_refresh<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: &QuickFoxAppState,
+) -> Result<IndexStatus, String> {
+    let (config, generation) = {
+        let mut runtime = state
+            .runtime
+            .lock()
+            .expect("quickfox runtime lock poisoned");
+        let has_existing_index = !runtime.index.entries().is_empty();
+        let generation = runtime.index_lifecycle.start_refresh(has_existing_index);
+        (runtime.config.clone(), generation)
+    };
+    let status = {
+        state
+            .runtime
+            .lock()
+            .expect("quickfox runtime lock poisoned")
+            .index_status()
+    };
+
+    thread::Builder::new()
+        .name("quickfox-index-refresh".to_owned())
+        .spawn(move || {
+            let completed_at_ms = current_time_ms();
+            let scan_result = IndexScanner.scan(build_scan_options(&config));
+            let app_for_update = app.clone();
+            let update_result = match scan_result {
+                Ok(report) => {
+                    if let Some(storage) = storage_store() {
+                        let _ =
+                            storage.save_completed_index_batch(completed_at_ms, &report.entries);
+                    }
+                    let app_for_state = app_for_update.clone();
+                    app_for_update.run_on_main_thread(move || {
+                        let state = app_for_state.state::<QuickFoxAppState>();
+                        apply_completed_index_refresh(&state, generation, report, completed_at_ms);
+                    })
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    let app_for_state = app_for_update.clone();
+                    app_for_update.run_on_main_thread(move || {
+                        let state = app_for_state.state::<QuickFoxAppState>();
+                        apply_failed_index_refresh(&state, generation, message);
+                    })
+                }
+            };
+            if let Err(error) = update_result {
+                eprintln!("QuickFox index refresh dispatch failed: {error}");
+            }
+        })
         .map_err(|error| error.to_string())?;
-    runtime.last_report = report.clone();
-    Ok(report)
+
+    Ok(status)
+}
+
+fn apply_completed_index_refresh(
+    state: &QuickFoxAppState,
+    generation: u64,
+    report: IndexReport,
+    completed_at_ms: i64,
+) -> bool {
+    let mut runtime = state
+        .runtime
+        .lock()
+        .expect("quickfox runtime lock poisoned");
+    if !runtime
+        .index_lifecycle
+        .complete_refresh(generation, report.entries.len(), completed_at_ms)
+    {
+        return false;
+    }
+    runtime.index = SearchIndex::from_entries(report.entries.clone());
+    runtime.last_report = report;
+    true
+}
+
+fn apply_failed_index_refresh(state: &QuickFoxAppState, generation: u64, message: String) -> bool {
+    let mut runtime = state
+        .runtime
+        .lock()
+        .expect("quickfox runtime lock poisoned");
+    runtime.index_lifecycle.fail_refresh(generation, message)
 }
 
 fn build_runtime() -> QuickFoxRuntime {
     let config = load_startup_config();
-    let report = IndexScanner
-        .scan(build_scan_options(&config))
-        .unwrap_or_default();
+    build_runtime_from_snapshot(config, load_latest_index_snapshot())
+}
 
+fn load_latest_index_snapshot() -> Option<crate::core::storage::IndexSnapshot> {
+    storage_store().and_then(|storage| storage.latest_index_snapshot().ok().flatten())
+}
+
+fn build_runtime_from_snapshot(
+    config: QuickFoxConfig,
+    snapshot: Option<crate::core::storage::IndexSnapshot>,
+) -> QuickFoxRuntime {
+    let entries = snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.entries.clone())
+        .unwrap_or_default();
+    let index_lifecycle = snapshot
+        .as_ref()
+        .map(|snapshot| {
+            IndexLifecycle::from_ready(snapshot.entries.len(), snapshot.completed_at_ms)
+        })
+        .unwrap_or_default();
+    let report = IndexReport {
+        entries: entries.clone(),
+        failures: Vec::new(),
+    };
     QuickFoxRuntime {
         config,
-        index: SearchIndex::from_entries(report.entries.clone()),
+        index: SearchIndex::from_entries(entries),
+        index_lifecycle,
         last_report: report,
+    }
+}
+
+impl QuickFoxRuntime {
+    fn index_status(&self) -> IndexStatus {
+        self.index_lifecycle.status().clone()
     }
 }
 
@@ -670,11 +843,13 @@ pub fn run() {
                 .build(app)?;
 
             start_global_double_shift_listener(app.handle().clone());
+            let _ = start_background_index_refresh(app.handle().clone(), &app.state());
 
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             health_check,
+            index_status,
             toggle_launcher_window,
             search,
             execute_action,
@@ -719,6 +894,57 @@ mod tests {
     }
 
     #[test]
+    fn runtime_reports_current_index_status() {
+        let runtime = QuickFoxRuntime {
+            config: QuickFoxConfig::default_with_index_dirs(vec!["/tmp".to_owned()]),
+            index: SearchIndex::default(),
+            last_report: IndexReport::default(),
+            index_lifecycle: IndexLifecycle::default(),
+        };
+
+        assert_eq!(
+            runtime.index_status().kind,
+            crate::core::index::IndexStatusKind::Unbuilt
+        );
+    }
+
+    #[test]
+    fn runtime_builds_from_persisted_snapshot_when_available() {
+        let runtime = build_runtime_from_snapshot(
+            QuickFoxConfig::default_with_index_dirs(vec!["/tmp".to_owned()]),
+            Some(crate::core::storage::IndexSnapshot {
+                completed_at_ms: 123,
+                entries: vec![crate::core::index::IndexedEntry {
+                    path: "/tmp/notes.md".to_owned(),
+                    name: "notes.md".to_owned(),
+                    kind: crate::core::index::IndexedEntryKind::File,
+                }],
+            }),
+        );
+
+        assert_eq!(
+            runtime.index_status().kind,
+            crate::core::index::IndexStatusKind::Ready
+        );
+        assert_eq!(runtime.index_status().entry_count, 1);
+        assert_eq!(runtime.index.entries()[0].name, "notes.md");
+    }
+
+    #[test]
+    fn runtime_starts_unbuilt_when_no_persisted_snapshot_exists() {
+        let runtime = build_runtime_from_snapshot(
+            QuickFoxConfig::default_with_index_dirs(vec!["/tmp".to_owned()]),
+            None,
+        );
+
+        assert_eq!(
+            runtime.index_status().kind,
+            crate::core::index::IndexStatusKind::Unbuilt
+        );
+        assert!(runtime.index.entries().is_empty());
+    }
+
+    #[test]
     fn perform_search_returns_empty_results_for_empty_query() {
         let config = QuickFoxConfig::default_with_index_dirs(vec!["/tmp".to_owned()]);
         let index = SearchIndex::from_entries(vec![]);
@@ -747,6 +973,37 @@ mod tests {
         assert!(command_results
             .iter()
             .any(|result| result.title == "git status"));
+    }
+
+    #[test]
+    fn perform_search_keeps_non_file_providers_available_without_file_index() {
+        let mut config = QuickFoxConfig::default_with_index_dirs(vec!["/tmp".to_owned()]);
+        config.command.enabled = true;
+        let index = SearchIndex::default();
+        let unavailable_status = crate::core::index::IndexStatus {
+            kind: crate::core::index::IndexStatusKind::Building,
+            entry_count: 0,
+            message: None,
+            generation: 1,
+            completed_at_ms: None,
+        };
+
+        let calculator_results =
+            perform_search_with_index_status(&config, &index, &unavailable_status, "2^10");
+        let web_results =
+            perform_search_with_index_status(&config, &index, &unavailable_status, "ddg rust");
+        let command_results =
+            perform_search_with_index_status(&config, &index, &unavailable_status, "> git status");
+
+        assert!(calculator_results
+            .iter()
+            .any(|result| result.kind == crate::core::search::SearchResultKind::Calculator));
+        assert!(web_results
+            .iter()
+            .any(|result| result.kind == crate::core::search::SearchResultKind::WebSearch));
+        assert!(command_results
+            .iter()
+            .any(|result| result.kind == crate::core::search::SearchResultKind::Command));
     }
 
     #[test]

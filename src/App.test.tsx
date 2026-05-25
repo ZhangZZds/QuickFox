@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
 import {
   executeAction,
+  indexStatus,
   listenOpenSettings,
   loadConfig,
   recentInputHistory,
@@ -15,6 +16,7 @@ import {
 
 vi.mock("./tauriClient", () => ({
   executeAction: vi.fn(),
+  indexStatus: vi.fn(),
   listenOpenSettings: vi.fn(),
   loadConfig: vi.fn(),
   recentInputHistory: vi.fn(),
@@ -103,6 +105,7 @@ describe("App", () => {
   beforeEach(() => {
     vi.mocked(search).mockReset();
     vi.mocked(executeAction).mockReset();
+    vi.mocked(indexStatus).mockReset();
     vi.mocked(listenOpenSettings).mockReset();
     vi.mocked(loadConfig).mockReset();
     vi.mocked(recentInputHistory).mockReset();
@@ -112,6 +115,13 @@ describe("App", () => {
     vi.mocked(search).mockResolvedValue([]);
     vi.mocked(listenOpenSettings).mockResolvedValue(() => undefined);
     vi.mocked(loadConfig).mockResolvedValue(appConfig);
+    vi.mocked(indexStatus).mockResolvedValue({
+      kind: "ready",
+      entryCount: 12,
+      message: null,
+      generation: 1,
+      completedAtMs: 100,
+    });
     vi.mocked(recentInputHistory).mockResolvedValue([]);
     vi.mocked(refreshIndex).mockResolvedValue({ entries: [], failures: [] });
     vi.mocked(recordInputHistory).mockResolvedValue("recorded");
@@ -157,6 +167,24 @@ describe("App", () => {
     });
 
     expect(await screen.findByText("未找到结果")).toBeInTheDocument();
+  });
+
+  it("shows index-building feedback without hiding other search behavior", async () => {
+    vi.mocked(indexStatus).mockResolvedValueOnce({
+      kind: "building",
+      entryCount: 0,
+      message: null,
+      generation: 2,
+      completedAtMs: null,
+    });
+    vi.mocked(search).mockResolvedValueOnce([]);
+
+    render(<App />);
+    fireEvent.change(screen.getByLabelText("搜索文件、目录、计算器、网页搜索或命令"), {
+      target: { value: "notes" },
+    });
+
+    expect(await screen.findByText("文件索引正在建立")).toBeInTheDocument();
   });
 
   it("moves selection with arrow keys and executes the selected primary action with Enter", async () => {
@@ -332,6 +360,8 @@ describe("App", () => {
     render(<App initialView="settings" />);
 
     expect(screen.getByRole("form", { name: "设置" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "索引" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "网页搜索" })).toBeInTheDocument();
     expect(screen.getByRole("group", { name: "搜索与索引" })).toBeInTheDocument();
     expect(screen.getByRole("group", { name: "网页搜索" })).toBeInTheDocument();
     expect(screen.getByRole("group", { name: "历史" })).toBeInTheDocument();
@@ -341,6 +371,76 @@ describe("App", () => {
     expect(screen.getByLabelText("正则前缀")).toHaveValue("re:");
     expect(screen.getByLabelText("命令执行")).not.toBeChecked();
     expect(screen.getByLabelText("输入历史条数")).toHaveValue(15);
+  });
+
+  it("adds a DuckDuckGo web search engine from the settings wizard", async () => {
+    render(<App initialView="settings" />);
+    await screen.findByDisplayValue("/tmp");
+
+    fireEvent.click(screen.getByRole("button", { name: "新增搜索引擎" }));
+    fireEvent.change(screen.getByLabelText("搜索前缀"), { target: { value: "ddg" } });
+    fireEvent.change(screen.getByLabelText("搜索名称"), { target: { value: "DuckDuckGo" } });
+    fireEvent.change(screen.getByLabelText("URL 模板"), {
+      target: { value: "https://duckduckgo.com/?q={query}" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "添加引擎" }));
+    fireEvent.click(screen.getByRole("button", { name: "保存设置" }));
+
+    await waitFor(() =>
+      expect(saveConfig).toHaveBeenCalledWith({
+        ...appConfig,
+        web_search: {
+          engines: {
+            ...appConfig.web_search.engines,
+            ddg: {
+              name: "DuckDuckGo",
+              url: "https://duckduckgo.com/?q={query}",
+            },
+          },
+        },
+      }),
+    );
+  });
+
+  it("validates web search URL templates in the settings wizard", () => {
+    render(<App initialView="settings" />);
+
+    fireEvent.click(screen.getByRole("button", { name: "新增搜索引擎" }));
+    fireEvent.change(screen.getByLabelText("搜索前缀"), { target: { value: "bad" } });
+    fireEvent.change(screen.getByLabelText("搜索名称"), { target: { value: "Broken" } });
+    fireEvent.change(screen.getByLabelText("URL 模板"), {
+      target: { value: "https://example.com/search" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "添加引擎" }));
+
+    expect(screen.getByText("URL 模板必须包含 {query}")).toBeInTheDocument();
+  });
+
+  it("saves index include and exclude rules from settings", async () => {
+    render(<App initialView="settings" />);
+    await screen.findByDisplayValue("/tmp");
+
+    fireEvent.change(screen.getByLabelText("索引目录"), {
+      target: { value: "/tmp\n/Users/frank/Documents" },
+    });
+    fireEvent.change(screen.getByLabelText("排除目录"), {
+      target: { value: "/tmp/cache" },
+    });
+    fireEvent.change(screen.getByLabelText("排除模式"), {
+      target: { value: "*.log\nnode_modules" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "保存设置" }));
+
+    await waitFor(() =>
+      expect(saveConfig).toHaveBeenCalledWith({
+        ...appConfig,
+        index: {
+          include_dirs: ["/tmp", "/Users/frank/Documents"],
+          exclude_dirs: ["/tmp/cache"],
+          exclude_patterns: ["*.log", "node_modules"],
+        },
+      }),
+    );
   });
 
   it("refreshes the index from the settings search group", async () => {

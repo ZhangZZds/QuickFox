@@ -194,12 +194,13 @@ input {
 }
 
 .settings-panel {
-  padding: 16px;
+  padding: 14px;
 }
 
 .settings-form {
   display: grid;
-  gap: 14px;
+  grid-template-columns: 150px minmax(0, 1fr);
+  gap: 12px 14px;
 }
 
 .settings-form fieldset {
@@ -209,6 +210,7 @@ input {
   padding: 12px;
   border: 1px solid #d8d4ca;
   border-radius: 6px;
+  background: #ffffff;
 }
 
 .settings-form legend {
@@ -216,8 +218,80 @@ input {
   font-weight: 700;
 }
 
+.settings-tabs {
+  grid-row: 1 / span 6;
+  display: grid;
+  align-content: start;
+  gap: 4px;
+  padding: 4px;
+  border-right: 1px solid #e1ddd5;
+}
+
+.settings-tabs button {
+  min-height: 36px;
+  border: 0;
+  border-radius: 6px;
+  padding: 0 10px;
+  color: #4c5750;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.settings-tabs button[aria-selected="true"] {
+  color: #17201a;
+  background: #e8f1ed;
+  font-weight: 700;
+}
+
+.settings-section-muted {
+  display: none !important;
+}
+
+.settings-status-row,
+.engine-row,
+.dialog-actions {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.settings-status-row {
+  min-height: 34px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: #f4f7f5;
+  color: #4c5750;
+}
+
+.engine-list {
+  display: grid;
+  gap: 6px;
+}
+
+.engine-row {
+  grid-template-columns: 56px 120px minmax(0, 1fr) auto;
+  min-height: 38px;
+  padding: 6px 8px;
+  border: 1px solid #e3e0d8;
+  border-radius: 6px;
+}
+
+.engine-row span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .settings-status {
   color: #3f6b55;
+  font-size: 13px;
+}
+
+.settings-error {
+  color: #9f2f35;
   font-size: 13px;
 }
 
@@ -252,6 +326,21 @@ input {
   width: auto;
 }
 
+.settings-dialog {
+  grid-column: 2;
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid #b9c8c0;
+  border-radius: 6px;
+  background: #f7faf8;
+}
+
+.dialog-actions {
+  grid-template-columns: auto auto minmax(0, 1fr);
+  justify-content: start;
+}
+
 @media (max-width: 520px) {
   .launcher-shell {
     padding: 8vh 12px 12px;
@@ -281,6 +370,26 @@ input {
   }
 
   .command-preview {
+    grid-template-columns: 1fr;
+  }
+
+  .settings-form {
+    grid-template-columns: 1fr;
+  }
+
+  .settings-tabs,
+  .settings-dialog {
+    grid-column: 1;
+  }
+
+  .settings-tabs {
+    grid-row: auto;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    border-right: 0;
+    border-bottom: 1px solid #e1ddd5;
+  }
+
+  .engine-row {
     grid-template-columns: 1fr;
   }
 }

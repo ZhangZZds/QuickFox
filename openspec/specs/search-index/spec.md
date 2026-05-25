@@ -37,12 +37,12 @@ TBD - created by archiving change build-quickfox-launcher. Update Purpose after 
 
 ### Requirement: 手动刷新索引
 
-系统 SHALL 提供手动刷新索引能力，并在部分目录失败时继续处理其他可用目录。
+系统 SHALL 提供手动刷新索引能力，在后台执行刷新，并在部分目录失败时继续处理其他可用目录。
 
 #### Scenario: 手动刷新更新结果
 
 - **WHEN** 用户触发手动刷新索引
-- **THEN** 系统重新扫描配置范围并更新后续搜索结果
+- **THEN** 系统在后台重新扫描配置范围，并在刷新完成后更新后续搜索结果
 
 #### Scenario: 部分目录失败不阻塞索引
 
@@ -80,3 +80,59 @@ TBD - created by archiving change build-quickfox-launcher. Update Purpose after 
 
 - **WHEN** 两个结果匹配质量相近且其中一个最近被打开过
 - **THEN** 最近打开过的结果排序更靠前
+
+### Requirement: 后台构建索引
+
+系统 SHALL 在后台构建或刷新文件索引，不阻塞 QuickFox 启动、托盘菜单、窗口显示或非文件 Provider 查询。
+
+#### Scenario: 首次启动索引后台运行
+
+- **WHEN** 用户首次启动 QuickFox 且磁盘文件很多
+- **THEN** QuickFox 显示启动窗口和托盘能力，文件索引在后台继续构建
+
+#### Scenario: 非文件 Provider 在索引中可用
+
+- **WHEN** 文件索引仍在后台构建
+- **THEN** 计算器、网页搜索和命令模式仍可返回结果或预览
+
+### Requirement: 持久化索引快照
+
+系统 SHALL 将成功构建的文件索引快照持久化到本地存储，并在下次启动时先加载最近完成的可用快照。
+
+#### Scenario: 启动加载旧索引
+
+- **WHEN** QuickFox 启动且存在最近完成的索引快照
+- **THEN** 文件 Provider 使用该快照提供搜索结果，同时后台刷新索引
+
+#### Scenario: 无快照时文件搜索不可用
+
+- **WHEN** QuickFox 启动且没有任何完成的索引快照
+- **THEN** 文件 Provider 不阻塞查询，并向前端暴露文件搜索暂不可用的状态
+
+### Requirement: 索引状态可观察
+
+系统 SHALL 暴露索引状态，至少区分未建立、构建中、可用、使用旧索引刷新中和失败。
+
+#### Scenario: 设置页显示构建中
+
+- **WHEN** 后台索引正在构建
+- **THEN** 设置页显示构建中状态和已知条目数量或进度摘要
+
+#### Scenario: 索引失败可恢复
+
+- **WHEN** 后台索引因权限或 IO 错误失败
+- **THEN** 系统保留应用可用性，显示失败原因摘要，并允许用户重新触发索引
+
+### Requirement: 大索引搜索性能
+
+系统 SHALL 对文件搜索使用预计算的匹配字段和结果上限，避免每次查询对全量条目重复拼接路径文本或重复大小写转换。
+
+#### Scenario: 查询复用预计算字段
+
+- **WHEN** 用户输入普通文件查询
+- **THEN** 文件 Provider 使用索引中的预计算搜索文本进行匹配
+
+#### Scenario: 结果构造受限制
+
+- **WHEN** 大量文件匹配同一查询
+- **THEN** 系统只构造和排序受配置上限约束的候选结果，避免无界结果分配

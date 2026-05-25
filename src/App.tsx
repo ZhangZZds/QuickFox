@@ -2,11 +2,13 @@ import { type KeyboardEvent, useEffect, useState } from "react";
 
 import {
   executeAction,
+  indexStatus,
   loadConfig,
   listenOpenSettings,
   recentInputHistory,
   recordInputHistory,
   refreshIndex,
+  type IndexStatus,
   type QuickFoxConfig,
   saveConfig,
   search as searchResults,
@@ -55,6 +57,7 @@ const fallbackConfig: QuickFoxConfig = {
   web_search: {
     engines: {
       g: { name: "Google", url: "https://www.google.com/search?q={query}" },
+      ddg: { name: "DuckDuckGo", url: "https://duckduckgo.com/?q={query}" },
       bd: { name: "Baidu", url: "https://www.baidu.com/s?wd={query}" },
     },
   },
@@ -146,6 +149,19 @@ export function App({
   const [historyIndex, setHistoryIndex] = useState<number | null>(null);
   const [historyMode, setHistoryMode] = useState(false);
   const [refreshStatus, setRefreshStatus] = useState<string | null>(null);
+  const [currentIndexStatus, setCurrentIndexStatus] = useState<IndexStatus>({
+    kind: "unbuilt",
+    entryCount: 0,
+    message: null,
+    generation: 0,
+    completedAtMs: null,
+  });
+  const [settingsSection, setSettingsSection] = useState<
+    "index" | "web" | "history" | "command" | "appearance"
+  >("index");
+  const [engineWizardOpen, setEngineWizardOpen] = useState(false);
+  const [engineDraft, setEngineDraft] = useState({ prefix: "", name: "", url: "" });
+  const [engineError, setEngineError] = useState<string | null>(null);
   const effectiveCommandEnabled = commandEnabled ?? config.command.enabled;
 
   const isCommandQuery = query.trim().startsWith(">");
@@ -156,11 +172,12 @@ export function App({
 
   useEffect(() => {
     let cancelled = false;
-    void Promise.all([loadConfig(), recentInputHistory()])
-      .then(([nextConfig, nextHistory]) => {
+    void Promise.all([loadConfig(), recentInputHistory(), indexStatus()])
+      .then(([nextConfig, nextHistory, nextIndexStatus]) => {
         if (!cancelled) {
           setConfig(nextConfig as QuickFoxConfig);
           setInputHistory(nextHistory as string[]);
+          setCurrentIndexStatus(nextIndexStatus as IndexStatus);
         }
       })
       .catch(() => undefined);
@@ -309,8 +326,54 @@ export function App({
 
   const refreshSearchIndex = async () => {
     setRefreshStatus(null);
-    await refreshIndex();
+    const nextStatus = (await refreshIndex()) as IndexStatus;
+    setCurrentIndexStatus(nextStatus);
     setRefreshStatus("索引已刷新");
+  };
+
+  const addEngineFromWizard = () => {
+    const prefix = engineDraft.prefix.trim();
+    const name = engineDraft.name.trim();
+    const url = engineDraft.url.trim();
+    if (!url.includes("{query}")) {
+      setEngineError("URL 模板必须包含 {query}");
+      return;
+    }
+    if (!prefix || !name) {
+      setEngineError("前缀和名称不能为空");
+      return;
+    }
+
+    setConfig((current) => ({
+      ...current,
+      web_search: {
+        engines: {
+          ...current.web_search.engines,
+          [prefix]: { name, url },
+        },
+      },
+    }));
+    setEngineWizardOpen(false);
+    setEngineDraft({ prefix: "", name: "", url: "" });
+    setEngineError(null);
+  };
+
+  const removeEngine = (prefix: string) => {
+    setConfig((current) => {
+      const engines = { ...current.web_search.engines };
+      delete engines[prefix];
+      return {
+        ...current,
+        web_search: { engines },
+      };
+    });
+  };
+
+  const saveSettings = async () => {
+    await saveConfig(config);
+    const nextStatus = (await indexStatus()) as IndexStatus;
+    setCurrentIndexStatus(nextStatus);
+    setView("launcher");
   };
 
   if (view === "settings") {
@@ -323,8 +386,31 @@ export function App({
             </button>
           </header>
           <form aria-label="设置" className="settings-form">
-            <fieldset>
+            <nav aria-label="设置分区" className="settings-tabs" role="tablist">
+              {[
+                ["index", "索引"],
+                ["web", "网页搜索"],
+                ["history", "历史"],
+                ["command", "命令安全"],
+                ["appearance", "外观"],
+              ].map(([id, label]) => (
+                <button
+                  aria-selected={settingsSection === id}
+                  key={id}
+                  onClick={() => setSettingsSection(id as typeof settingsSection)}
+                  role="tab"
+                  type="button"
+                >
+                  {label}
+                </button>
+              ))}
+            </nav>
+            <fieldset className={settingsSection === "index" ? "" : "settings-section-muted"}>
               <legend>搜索与索引</legend>
+              <div className="settings-status-row">
+                <span>{indexStatusLabel(currentIndexStatus)}</span>
+                <span>{currentIndexStatus.entryCount} 项</span>
+              </div>
               <label>
                 索引目录
                 <textarea
@@ -338,6 +424,36 @@ export function App({
                           .split("\n")
                           .map((item) => item.trim())
                           .filter(Boolean),
+                      },
+                    }))
+                  }
+                />
+              </label>
+              <label>
+                排除目录
+                <textarea
+                  value={config.index.exclude_dirs.join("\n")}
+                  onChange={(event) =>
+                    setConfig((current) => ({
+                      ...current,
+                      index: {
+                        ...current.index,
+                        exclude_dirs: linesFromTextarea(event.target.value),
+                      },
+                    }))
+                  }
+                />
+              </label>
+              <label>
+                排除模式
+                <textarea
+                  value={config.index.exclude_patterns.join("\n")}
+                  onChange={(event) =>
+                    setConfig((current) => ({
+                      ...current,
+                      index: {
+                        ...current.index,
+                        exclude_patterns: linesFromTextarea(event.target.value),
                       },
                     }))
                   }
@@ -363,12 +479,25 @@ export function App({
               </button>
               {refreshStatus ? <span className="settings-status">{refreshStatus}</span> : null}
             </fieldset>
-            <fieldset>
+            <fieldset className={settingsSection === "web" ? "" : "settings-section-muted"}>
               <legend>网页搜索</legend>
-              <span>g Google</span>
-              <span>bd Baidu</span>
+              <div className="engine-list">
+                {Object.entries(config.web_search.engines).map(([prefix, engine]) => (
+                  <div className="engine-row" key={prefix}>
+                    <span>{prefix}</span>
+                    <span>{engine.name}</span>
+                    <span>{engine.url}</span>
+                    <button type="button" onClick={() => removeEngine(prefix)}>
+                      删除
+                    </button>
+                  </div>
+                ))}
+              </div>
+              <button type="button" onClick={() => setEngineWizardOpen(true)}>
+                新增搜索引擎
+              </button>
             </fieldset>
-            <fieldset>
+            <fieldset className={settingsSection === "history" ? "" : "settings-section-muted"}>
               <legend>历史</legend>
               <label>
                 输入历史条数
@@ -388,7 +517,7 @@ export function App({
                 />
               </label>
             </fieldset>
-            <fieldset>
+            <fieldset className={settingsSection === "command" ? "" : "settings-section-muted"}>
               <legend>命令执行</legend>
               <label className="toggle-row">
                 <input
@@ -408,15 +537,51 @@ export function App({
                 <span>命令执行</span>
               </label>
             </fieldset>
-            <fieldset>
+            <fieldset className={settingsSection === "appearance" ? "" : "settings-section-muted"}>
               <legend>外观与窗口</legend>
               <span>Compact</span>
             </fieldset>
-            <button
-              type="button"
-              className="primary-button"
-              onClick={() => void saveConfig(config).then(() => setView("launcher"))}
-            >
+            {engineWizardOpen ? (
+              <section aria-label="新增搜索引擎" className="settings-dialog" role="dialog">
+                <label>
+                  搜索前缀
+                  <input
+                    value={engineDraft.prefix}
+                    onChange={(event) =>
+                      setEngineDraft((current) => ({ ...current, prefix: event.target.value }))
+                    }
+                  />
+                </label>
+                <label>
+                  搜索名称
+                  <input
+                    value={engineDraft.name}
+                    onChange={(event) =>
+                      setEngineDraft((current) => ({ ...current, name: event.target.value }))
+                    }
+                  />
+                </label>
+                <label>
+                  URL 模板
+                  <input
+                    value={engineDraft.url}
+                    onChange={(event) =>
+                      setEngineDraft((current) => ({ ...current, url: event.target.value }))
+                    }
+                  />
+                </label>
+                {engineError ? <span className="settings-error">{engineError}</span> : null}
+                <div className="dialog-actions">
+                  <button type="button" onClick={addEngineFromWizard}>
+                    添加引擎
+                  </button>
+                  <button type="button" onClick={() => setEngineWizardOpen(false)}>
+                    取消
+                  </button>
+                </div>
+              </section>
+            ) : null}
+            <button type="button" className="primary-button" onClick={() => void saveSettings()}>
               保存设置
             </button>
           </form>
@@ -493,7 +658,7 @@ export function App({
                     ))
                   : [
                       <li className="empty-state" key="empty-state">
-                        未找到结果
+                        {fileSearchStatusText(currentIndexStatus) ?? "未找到结果"}
                       </li>,
                     ]}
               </ul>
@@ -532,4 +697,42 @@ export function App({
       </section>
     </main>
   );
+}
+
+function linesFromTextarea(value: string) {
+  return value
+    .split("\n")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function indexStatusLabel(status: IndexStatus) {
+  switch (status.kind) {
+    case "building":
+      return "文件索引正在建立";
+    case "refreshing":
+      return "文件索引正在更新";
+    case "ready":
+      return "文件索引可用";
+    case "failed":
+      return status.message ?? "文件索引构建失败";
+    case "unbuilt":
+      return "文件索引尚未建立";
+  }
+}
+
+function fileSearchStatusText(status: IndexStatus) {
+  if (status.kind === "building") {
+    return "文件索引正在建立";
+  }
+  if (status.kind === "refreshing") {
+    return "文件索引正在更新";
+  }
+  if (status.kind === "failed") {
+    return status.message ?? "文件索引构建失败";
+  }
+  if (status.kind === "unbuilt") {
+    return "文件索引尚未建立";
+  }
+  return null;
 }

@@ -40,6 +40,13 @@ impl QuickFoxConfig {
                         },
                     ),
                     (
+                        "ddg".to_owned(),
+                        WebSearchEngineConfig {
+                            name: "DuckDuckGo".to_owned(),
+                            url: "https://duckduckgo.com/?q={query}".to_owned(),
+                        },
+                    ),
+                    (
                         "bd".to_owned(),
                         WebSearchEngineConfig {
                             name: "Baidu".to_owned(),
@@ -247,6 +254,10 @@ mod tests {
         assert!(config.history.input_history_enabled);
         assert!(content.contains("regex_prefix = \"re:\""));
         assert!(content.contains("enabled = false"));
+        assert_eq!(
+            config.web_search.engines.get("ddg").unwrap().url,
+            "https://duckduckgo.com/?q={query}"
+        );
 
         let _ = fs::remove_file(path);
     }
