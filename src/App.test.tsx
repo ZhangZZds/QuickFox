@@ -3,7 +3,10 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { App } from "./App";
 import {
+  appPaths,
   executeAction,
+  globalHotkeyStatus,
+  listenGlobalHotkeyStatus,
   indexStatus,
   listenOpenSettings,
   loadConfig,
@@ -15,7 +18,10 @@ import {
 } from "./tauriClient";
 
 vi.mock("./tauriClient", () => ({
+  appPaths: vi.fn(),
   executeAction: vi.fn(),
+  globalHotkeyStatus: vi.fn(),
+  listenGlobalHotkeyStatus: vi.fn(),
   indexStatus: vi.fn(),
   listenOpenSettings: vi.fn(),
   loadConfig: vi.fn(),
@@ -68,6 +74,84 @@ const webResults = [
   },
 ];
 
+const longPathResults = [
+  {
+    id: "path:/Users/frankzhang/workspace/QuickFox/src/components/DeeplyNestedFeature/VeryLongMatchingFileName.fixture.tsx",
+    title: "VeryLongMatchingFileName.fixture.tsx",
+    detail:
+      "/Users/frankzhang/workspace/QuickFox/src/components/DeeplyNestedFeature/VeryLongMatchingFileName.fixture.tsx",
+    kind: "file",
+    provider: "files",
+    score: 1000,
+    mainAction: {
+      type: "openPath",
+      path: "/Users/frankzhang/workspace/QuickFox/src/components/DeeplyNestedFeature/VeryLongMatchingFileName.fixture.tsx",
+    },
+    secondaryActions: [],
+  },
+  {
+    id: "path:C:\\Users\\frank\\Documents\\QuickFox\\fixtures\\reports\\VeryLongMatchingFileName.fixture.tsx",
+    title: "VeryLongMatchingFileName.fixture.tsx",
+    detail:
+      "C:\\Users\\frank\\Documents\\QuickFox\\fixtures\\reports\\VeryLongMatchingFileName.fixture.tsx",
+    kind: "file",
+    provider: "files",
+    score: 900,
+    mainAction: {
+      type: "openPath",
+      path: "C:\\Users\\frank\\Documents\\QuickFox\\fixtures\\reports\\VeryLongMatchingFileName.fixture.tsx",
+    },
+    secondaryActions: [],
+  },
+];
+
+const typedResults = [
+  {
+    id: "path:/Applications/Codex.app",
+    title: "Codex.app",
+    detail: "/Applications/Codex.app",
+    kind: "application",
+    provider: "files",
+    score: 1100,
+    mainAction: { type: "openPath", path: "/Applications/Codex.app" },
+    secondaryActions: [
+      { type: "openPath", path: "/Applications/Codex.app" },
+      { type: "copyText", text: "/Applications/Codex.app" },
+    ],
+  },
+  {
+    id: "path:/tmp/report.md",
+    title: "report.md",
+    detail: "/tmp/report.md",
+    kind: "file",
+    provider: "files",
+    score: 1000,
+    mainAction: { type: "openPath", path: "/tmp/report.md" },
+    secondaryActions: [
+      { type: "openContainingFolder", path: "/tmp/report.md" },
+      { type: "copyText", text: "/tmp/report.md" },
+      {
+        type: "openWithApplication",
+        path: "/tmp/report.md",
+        application: "systemChooser",
+      },
+    ],
+  },
+  {
+    id: "path:/tmp/Documents",
+    title: "Documents",
+    detail: "/tmp/Documents",
+    kind: "directory",
+    provider: "files",
+    score: 900,
+    mainAction: { type: "openPath", path: "/tmp/Documents" },
+    secondaryActions: [
+      { type: "openPath", path: "/tmp/Documents" },
+      { type: "copyText", text: "/tmp/Documents" },
+    ],
+  },
+];
+
 const appConfig = {
   index: {
     include_dirs: ["/tmp"],
@@ -103,8 +187,11 @@ const appConfig = {
 
 describe("App", () => {
   beforeEach(() => {
+    vi.mocked(appPaths).mockReset();
     vi.mocked(search).mockReset();
     vi.mocked(executeAction).mockReset();
+    vi.mocked(globalHotkeyStatus).mockReset();
+    vi.mocked(listenGlobalHotkeyStatus).mockReset();
     vi.mocked(indexStatus).mockReset();
     vi.mocked(listenOpenSettings).mockReset();
     vi.mocked(loadConfig).mockReset();
@@ -113,6 +200,16 @@ describe("App", () => {
     vi.mocked(refreshIndex).mockReset();
     vi.mocked(saveConfig).mockReset();
     vi.mocked(search).mockResolvedValue([]);
+    vi.mocked(appPaths).mockResolvedValue({
+      configFilePath: "/Users/frank/Library/Application Support/QuickFox/config.json",
+      indexSnapshotPath: "/Users/frank/Library/Application Support/QuickFox/index.snapshot.json",
+    });
+    vi.mocked(globalHotkeyStatus).mockResolvedValue({
+      enabled: true,
+      message: "Shift+Shift 全局唤醒可用",
+      permissionSettingsUrl: null,
+    });
+    vi.mocked(listenGlobalHotkeyStatus).mockResolvedValue(() => undefined);
     vi.mocked(listenOpenSettings).mockResolvedValue(() => undefined);
     vi.mocked(loadConfig).mockResolvedValue(appConfig);
     vi.mocked(indexStatus).mockResolvedValue({
@@ -206,6 +303,116 @@ describe("App", () => {
     });
   });
 
+  it("scrolls the selected search result into view when moving with arrow keys", async () => {
+    const scrollIntoView = vi.fn();
+    Element.prototype.scrollIntoView = scrollIntoView;
+    vi.mocked(search).mockResolvedValueOnce(fileResults);
+    render(<App />);
+    const input = screen.getByLabelText("搜索文件、目录、计算器、网页搜索或命令");
+
+    fireEvent.change(input, { target: { value: "do" } });
+    await screen.findByText("Documents");
+    scrollIntoView.mockClear();
+
+    fireEvent.keyDown(input, { key: "ArrowDown" });
+
+    expect(scrollIntoView).toHaveBeenCalledWith({ block: "nearest" });
+  });
+
+  it("selects a search result when hovering it", async () => {
+    vi.mocked(search).mockResolvedValueOnce(fileResults);
+    render(<App />);
+    const input = screen.getByLabelText("搜索文件、目录、计算器、网页搜索或命令");
+
+    fireEvent.change(input, { target: { value: "doc" } });
+    const documents = await screen.findByRole("option", { name: /Documents/ });
+    const downloads = screen.getByRole("option", { name: /Downloads/ });
+    expect(documents).toHaveAttribute("aria-selected", "true");
+
+    fireEvent.mouseEnter(downloads);
+
+    expect(documents).toHaveAttribute("aria-selected", "false");
+    expect(downloads).toHaveAttribute("aria-selected", "true");
+    expect(downloads).toHaveClass("result-item--selected");
+  });
+
+  it("summarizes long POSIX and Windows paths while exposing full paths as tooltips", async () => {
+    vi.mocked(search).mockResolvedValueOnce(longPathResults);
+    render(<App />);
+
+    fireEvent.change(screen.getByLabelText("搜索文件、目录、计算器、网页搜索或命令"), {
+      target: { value: "fixture" },
+    });
+
+    expect(await screen.findAllByText("VeryLongMatchingFileName.fixture.tsx")).toHaveLength(2);
+    const posixPath = screen.getByLabelText(
+      "完整路径 /Users/frankzhang/workspace/QuickFox/src/components/DeeplyNestedFeature/VeryLongMatchingFileName.fixture.tsx",
+    );
+    expect(posixPath).toHaveTextContent(
+      "/Users/frankzhang/.../DeeplyNestedFeature/VeryLongMatchingFileName.fixture.tsx",
+    );
+    expect(posixPath).toHaveAttribute(
+      "title",
+      "/Users/frankzhang/workspace/QuickFox/src/components/DeeplyNestedFeature/VeryLongMatchingFileName.fixture.tsx",
+    );
+
+    const windowsPath = screen.getByLabelText(
+      "完整路径 C:\\Users\\frank\\Documents\\QuickFox\\fixtures\\reports\\VeryLongMatchingFileName.fixture.tsx",
+    );
+    expect(windowsPath).toHaveTextContent(
+      "C:\\Users\\...\\reports\\VeryLongMatchingFileName.fixture.tsx",
+    );
+    expect(windowsPath).toHaveAttribute(
+      "title",
+      "C:\\Users\\frank\\Documents\\QuickFox\\fixtures\\reports\\VeryLongMatchingFileName.fixture.tsx",
+    );
+  });
+
+  it("keeps result titles identifiable and selected rows semantically styled", async () => {
+    vi.mocked(search).mockResolvedValueOnce(longPathResults);
+    render(<App />);
+    const input = screen.getByLabelText("搜索文件、目录、计算器、网页搜索或命令");
+
+    fireEvent.change(input, { target: { value: "fixture" } });
+    const firstResult = await screen.findByRole("option", {
+      name: /VeryLongMatchingFileName\.fixture\.tsx.*DeeplyNestedFeature/,
+    });
+    expect(firstResult).toHaveClass("result-item--selected");
+    expect(firstResult).toHaveAttribute("aria-selected", "true");
+    expect(screen.getAllByTitle("VeryLongMatchingFileName.fixture.tsx")[0]).toHaveTextContent(
+      "VeryLongMatchingFileName.fixture.tsx",
+    );
+
+    fireEvent.keyDown(input, { key: "ArrowDown" });
+
+    const secondResult = screen.getByRole("option", {
+      name: /VeryLongMatchingFileName\.fixture\.tsx.*reports/,
+    });
+    expect(firstResult).not.toHaveClass("result-item--selected");
+    expect(secondResult).toHaveClass("result-item--selected");
+    expect(secondResult).toHaveAttribute("aria-selected", "true");
+  });
+
+  it("shows long result titles with a middle summary that keeps the ending visible", async () => {
+    vi.mocked(search).mockResolvedValueOnce([
+      {
+        ...longPathResults[0],
+        title: "PROJECT_SUMMARY_WITH_A_VERY_LONG_PREFIX_THAT_WOULD_HIDE_THE_EXTENSION.md",
+      },
+    ]);
+    render(<App />);
+
+    fireEvent.change(screen.getByLabelText("搜索文件、目录、计算器、网页搜索或命令"), {
+      target: { value: "summary" },
+    });
+
+    const title = await screen.findByTitle(
+      "PROJECT_SUMMARY_WITH_A_VERY_LONG_PREFIX_THAT_WOULD_HIDE_THE_EXTENSION.md",
+    );
+    expect(title).toHaveTextContent("PROJECT_SUMMARY...THE_EXTENSION.md");
+    expect(title.querySelector(".result-title-tail")).toHaveTextContent("THE_EXTENSION.md");
+  });
+
   it("closes the launcher with Esc without executing an action", () => {
     const onClose = vi.fn();
     const onExecuteAction = vi.fn();
@@ -240,13 +447,16 @@ describe("App", () => {
     const onExecuteAction = vi.fn();
     vi.mocked(search).mockResolvedValueOnce([
       {
-        ...fileResults[0],
+        ...longPathResults[0],
+        title: "report.md",
+        detail: "/tmp/report.md",
         secondaryActions: [
-          ...fileResults[0].secondaryActions,
+          { type: "openContainingFolder", path: "/tmp/report.md" },
+          { type: "copyText", text: "/tmp/report.md" },
           {
             type: "openWithApplication",
-            path: "/tmp/Documents",
-            application: "developmentTool",
+            path: "/tmp/report.md",
+            application: "systemChooser",
           },
         ],
       },
@@ -256,14 +466,57 @@ describe("App", () => {
       target: { value: "doc" },
     });
 
-    fireEvent.contextMenu(await screen.findByRole("option", { name: /Documents/ }));
-    fireEvent.click(screen.getByRole("menuitem", { name: "用开发工具打开" }));
+    fireEvent.contextMenu(await screen.findByRole("option", { name: /report\.md/ }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "选择打开方式" }));
 
     expect(onExecuteAction).toHaveBeenCalledWith({
       type: "openWithApplication",
-      path: "/tmp/Documents",
-      application: "developmentTool",
+      path: "/tmp/report.md",
+      application: "systemChooser",
     });
+  });
+
+  it("renders type badges for applications files and directories", async () => {
+    vi.mocked(search).mockResolvedValueOnce(typedResults);
+    render(<App />);
+
+    fireEvent.change(screen.getByLabelText("搜索文件、目录、计算器、网页搜索或命令"), {
+      target: { value: "typed" },
+    });
+
+    expect(await screen.findByLabelText("应用")).toBeInTheDocument();
+    expect(screen.getByLabelText("文件")).toBeInTheDocument();
+    expect(screen.getByLabelText("目录")).toBeInTheDocument();
+  });
+
+  it("shows context actions by result type", async () => {
+    vi.mocked(search).mockResolvedValueOnce(typedResults);
+    render(<App />);
+
+    fireEvent.change(screen.getByLabelText("搜索文件、目录、计算器、网页搜索或命令"), {
+      target: { value: "typed" },
+    });
+
+    fireEvent.contextMenu(await screen.findByRole("option", { name: /Codex\.app/ }));
+    expect(screen.getByRole("menuitem", { name: "打开应用" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "复制路径" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "选择打开方式" })).not.toBeInTheDocument();
+    fireEvent.keyDown(screen.getByLabelText("搜索文件、目录、计算器、网页搜索或命令"), {
+      key: "Escape",
+    });
+
+    fireEvent.contextMenu(screen.getByRole("option", { name: /report\.md/ }));
+    expect(screen.getByRole("menuitem", { name: "打开所在目录" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "复制路径" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "选择打开方式" })).toBeInTheDocument();
+    fireEvent.keyDown(screen.getByLabelText("搜索文件、目录、计算器、网页搜索或命令"), {
+      key: "Escape",
+    });
+
+    fireEvent.contextMenu(screen.getByRole("option", { name: /Documents/ }));
+    expect(screen.getByRole("menuitem", { name: "打开文件夹" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "复制路径" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "选择打开方式" })).not.toBeInTheDocument();
   });
 
   it("positions the action menu near the context-clicked result", async () => {
@@ -354,6 +607,93 @@ describe("App", () => {
         enabled: true,
       },
     });
+  });
+
+  it("loads app paths through the Tauri client contract for settings", async () => {
+    render(<App initialView="settings" />);
+
+    await waitFor(() => expect(appPaths).toHaveBeenCalledOnce());
+    expect(await screen.findByText("配置文件位置")).toBeInTheDocument();
+    expect(
+      screen.getByText("/Users/frank/Library/Application Support/QuickFox/config.json"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("索引快照位置")).toBeInTheDocument();
+    expect(
+      screen.getByText("/Users/frank/Library/Application Support/QuickFox/index.snapshot.json"),
+    ).toBeInTheDocument();
+  });
+
+  it("keeps a single save button in the left settings action area across tabs", async () => {
+    render(<App initialView="settings" />);
+    await screen.findByDisplayValue("/tmp");
+
+    const actionArea = screen.getByRole("region", { name: "设置操作" });
+    expect(screen.getAllByRole("button", { name: "保存设置" })).toHaveLength(1);
+    expect(actionArea).toContainElement(screen.getByRole("button", { name: "保存设置" }));
+
+    fireEvent.click(screen.getByRole("tab", { name: "网页搜索" }));
+    expect(screen.getAllByRole("button", { name: "保存设置" })).toHaveLength(1);
+    expect(actionArea).toContainElement(screen.getByRole("button", { name: "保存设置" }));
+
+    fireEvent.click(screen.getByRole("tab", { name: "命令安全" }));
+    expect(screen.getAllByRole("button", { name: "保存设置" })).toHaveLength(1);
+    expect(actionArea).toContainElement(screen.getByRole("button", { name: "保存设置" }));
+  });
+
+  it("keeps settings sections inside a dedicated scrollable content region", async () => {
+    render(<App initialView="settings" />);
+    await screen.findByDisplayValue("/tmp");
+
+    const contentRegion = screen.getByRole("region", { name: "设置内容" });
+    expect(contentRegion).toHaveClass("settings-content");
+    expect(contentRegion).toContainElement(screen.getByRole("group", { name: "搜索与索引" }));
+
+    fireEvent.click(screen.getByRole("tab", { name: "外观" }));
+
+    expect(contentRegion).toContainElement(screen.getByRole("group", { name: "外观与窗口" }));
+  });
+
+  it("shows global Shift+Shift hotkey status in appearance settings", async () => {
+    vi.mocked(globalHotkeyStatus).mockResolvedValueOnce({
+      enabled: false,
+      message: "需要授予输入监控权限后才能使用 Shift+Shift 全局唤醒",
+      permissionSettingsUrl:
+        "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent",
+    });
+
+    const onExecuteAction = vi.fn();
+    render(<App initialView="settings" onExecuteAction={onExecuteAction} />);
+    await screen.findByDisplayValue("/tmp");
+    fireEvent.click(screen.getByRole("tab", { name: "外观" }));
+
+    expect(screen.getByText("全局唤醒")).toBeInTheDocument();
+    expect(screen.getByText(/输入监控权限/)).toBeInTheDocument();
+    expect(screen.getByText(/授权后需要重启 QuickFox/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "打开权限设置" }));
+
+    expect(onExecuteAction).toHaveBeenCalledWith({
+      type: "openUrl",
+      url: "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent",
+    });
+  });
+
+  it("shows complete index status details in settings", async () => {
+    vi.mocked(indexStatus).mockResolvedValueOnce({
+      kind: "ready",
+      entryCount: 240,
+      message: "索引完成",
+      generation: 7,
+      completedAtMs: 1710000000000,
+    });
+
+    render(<App initialView="settings" />);
+
+    expect(await screen.findByText("文件索引可用")).toBeInTheDocument();
+    expect(screen.getByText("240 项")).toBeInTheDocument();
+    expect(screen.getByText("第 7 代")).toBeInTheDocument();
+    expect(screen.getByText(/最近完成:/)).toBeInTheDocument();
+    expect(screen.getByText("索引完成")).toBeInTheDocument();
   });
 
   it("renders the basic settings view", () => {
@@ -462,6 +802,45 @@ describe("App", () => {
 
     expect(screen.getByRole("list", { name: "输入历史" })).toBeInTheDocument();
     expect(screen.getByRole("option", { name: "g 1234" })).toHaveAttribute("aria-selected", "true");
+  });
+
+  it("keeps history rows in a single-column layout", async () => {
+    vi.mocked(recentInputHistory).mockResolvedValueOnce([
+      "very long remembered input that should use the whole history row",
+    ]);
+    render(<App />);
+    const input = screen.getByLabelText("搜索文件、目录、计算器、网页搜索或命令");
+
+    await waitFor(() => expect(recentInputHistory).toHaveBeenCalledOnce());
+    fireEvent.keyDown(input, { key: "Shift" });
+
+    expect(
+      screen.getByRole("option", {
+        name: "very long remembered input that should use the whole history row",
+      }),
+    ).toHaveClass("history-item");
+    expect(
+      screen.getByRole("option", {
+        name: "very long remembered input that should use the whole history row",
+      }),
+    ).not.toHaveClass("result-item");
+  });
+
+  it("selects an input history row when hovering it", async () => {
+    vi.mocked(recentInputHistory).mockResolvedValueOnce(["g 1234", "notes"]);
+    render(<App />);
+    const input = screen.getByLabelText("搜索文件、目录、计算器、网页搜索或命令");
+
+    await waitFor(() => expect(recentInputHistory).toHaveBeenCalledOnce());
+    fireEvent.keyDown(input, { key: "Shift" });
+    const first = screen.getByRole("option", { name: "g 1234" });
+    const second = screen.getByRole("option", { name: "notes" });
+    expect(first).toHaveAttribute("aria-selected", "true");
+
+    fireEvent.mouseEnter(second);
+
+    expect(first).toHaveAttribute("aria-selected", "false");
+    expect(second).toHaveAttribute("aria-selected", "true");
   });
 
   it("keeps arrow keys on search results until Shift history mode is active", async () => {

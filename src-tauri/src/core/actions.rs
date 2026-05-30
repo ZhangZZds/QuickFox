@@ -32,6 +32,7 @@ pub enum Action {
 #[serde(rename_all = "camelCase")]
 pub enum OpenApplication {
     DevelopmentTool,
+    SystemChooser,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -250,5 +251,19 @@ mod tests {
         assert_eq!(value["type"], "openWithApplication");
         assert_eq!(value["path"], "/tmp/readme.md");
         assert_eq!(value["application"], "developmentTool");
+    }
+
+    #[test]
+    fn open_with_application_serializes_system_chooser_action() {
+        let action = Action::OpenWithApplication {
+            path: "/tmp/readme.md".to_owned(),
+            application: OpenApplication::SystemChooser,
+        };
+
+        let value = serde_json::to_value(action).unwrap();
+
+        assert_eq!(value["type"], "openWithApplication");
+        assert_eq!(value["path"], "/tmp/readme.md");
+        assert_eq!(value["application"], "systemChooser");
     }
 }

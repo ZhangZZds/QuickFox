@@ -371,12 +371,9 @@ impl SearchIndex {
 
         self.entries
             .iter()
-            .zip(self.search_texts.iter())
-            .filter(|(_, haystack)| {
-                haystack.contains(&query) || fuzzy_matches_with_quality(&query, haystack)
-            })
+            .filter(|entry| entry_matches_normal_query(entry, &query))
             .take(limit)
-            .map(|(entry, _)| entry_to_result(entry))
+            .map(entry_to_result)
             .collect()
     }
 
@@ -408,6 +405,35 @@ fn searchable_text(entry: &IndexedEntry) -> String {
     format!("{} {}", entry.name, entry.path).to_lowercase()
 }
 
+fn entry_matches_normal_query(entry: &IndexedEntry, query: &str) -> bool {
+    let name = entry.name.to_lowercase();
+    if name.contains(query) || fuzzy_matches_with_quality(query, &name) {
+        return true;
+    }
+
+    let path = entry.path.to_lowercase();
+    if query.contains(['/', '\\']) {
+        return path.contains(query);
+    }
+
+    path_segments(&entry.path).any(|segment| {
+        let segment = segment.to_lowercase();
+        segment.starts_with(query)
+            || segment
+                .chars()
+                .next()
+                .zip(query.chars().next())
+                .is_some_and(|(segment_first, query_first)| {
+                    segment_first == query_first && fuzzy_segment_matches(query, &segment)
+                })
+    })
+}
+
+fn path_segments(path: &str) -> impl Iterator<Item = &str> {
+    path.split(['/', '\\'])
+        .filter(|segment| !segment.is_empty())
+}
+
 fn entry_to_result(entry: &IndexedEntry) -> SearchResult {
     let kind = match entry.kind {
         IndexedEntryKind::Application => SearchResultKind::Application,
@@ -415,7 +441,7 @@ fn entry_to_result(entry: &IndexedEntry) -> SearchResult {
         IndexedEntryKind::Directory => SearchResultKind::Directory,
     };
 
-    SearchResult::new(
+    let mut result = SearchResult::new(
         format!("path:{}", entry.path),
         entry.name.clone(),
         kind,
@@ -423,11 +449,27 @@ fn entry_to_result(entry: &IndexedEntry) -> SearchResult {
             path: entry.path.clone(),
         },
     )
-    .with_detail(entry.path.clone())
-    .with_secondary_action(Action::OpenContainingFolder {
-        path: entry.path.clone(),
-    })
-    .with_secondary_action(Action::CopyText {
+    .with_detail(entry.path.clone());
+
+    match entry.kind {
+        IndexedEntryKind::Application => {
+            result = result.with_secondary_action(Action::OpenPath {
+                path: entry.path.clone(),
+            });
+        }
+        IndexedEntryKind::File => {
+            result = result.with_secondary_action(Action::OpenContainingFolder {
+                path: entry.path.clone(),
+            });
+        }
+        IndexedEntryKind::Directory => {
+            result = result.with_secondary_action(Action::OpenPath {
+                path: entry.path.clone(),
+            });
+        }
+    }
+
+    result.with_secondary_action(Action::CopyText {
         text: entry.path.clone(),
     })
 }
@@ -437,20 +479,27 @@ fn fuzzy_matches_with_quality(query: &str, haystack: &str) -> bool {
         return false;
     }
 
+    haystack
+        .split(|candidate: char| !candidate.is_alphanumeric())
+        .filter(|segment| !segment.is_empty())
+        .any(|segment| fuzzy_segment_matches(query, segment))
+}
+
+fn fuzzy_segment_matches(query: &str, segment: &str) -> bool {
     let mut chars = query.chars();
     let Some(mut current) = chars.next() else {
         return true;
     };
     let mut first_match: Option<usize> = None;
 
-    for (index, candidate) in haystack.chars().enumerate() {
+    for (index, candidate) in segment.chars().enumerate() {
         if candidate == current {
             first_match.get_or_insert(index);
             match chars.next() {
                 Some(next) => current = next,
                 None => {
                     let span = index.saturating_sub(first_match.unwrap_or(index)) + 1;
-                    let max_span = query.chars().count().saturating_mul(4).max(16);
+                    let max_span = query.chars().count().saturating_mul(2).max(8);
                     return span <= max_span;
                 }
             }
@@ -743,6 +792,70 @@ mod tests {
         let results = index.search(&parser.parse("Openspec_123"));
 
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn search_does_not_return_codex_fuzzy_noise() {
+        let index = SearchIndex::from_entries(vec![
+            IndexedEntry {
+                path: "/Users/frankzhang/Desktop/Codex.app".to_owned(),
+                name: "Codex.app".to_owned(),
+                kind: IndexedEntryKind::Application,
+            },
+            IndexedEntry {
+                path: "/Users/frankzhang/Documents/Codex".to_owned(),
+                name: "Codex".to_owned(),
+                kind: IndexedEntryKind::Directory,
+            },
+            file_entry("/Users/frankzhang/workspace/QuickFox/index.html"),
+            file_entry("/Users/frankzhang/Library/Metadata/CoreSpotlight/index.spotlightV3/0.ivf-vector-indexes"),
+            file_entry("/Users/frankzhang/Library/Mobile Documents/com~apple~CloudDocs/cpl/cloudsync.noindex"),
+        ]);
+        let parser = crate::core::search::QueryParser::new(Default::default());
+
+        let titles: Vec<_> = index
+            .search(&parser.parse("Codex"))
+            .into_iter()
+            .map(|result| result.title)
+            .collect();
+
+        assert_eq!(titles, vec!["Codex.app", "Codex"]);
+    }
+
+    #[test]
+    fn search_does_not_return_children_only_matching_parent_mid_word() {
+        let index = SearchIndex::from_entries(vec![
+            file_entry("/Users/frankzhang/workspace/QuickFox/src/setupTests.ts"),
+            file_entry("/Users/frankzhang/Pictures/Photos Library.photoslibrary/resources/cpl/cloudsync.noindex/outgoingRecordComputeStates/filecache"),
+            file_entry("/Users/frankzhang/Pictures/Photos Library.photoslibrary/resources/cpl/cloudsync.noindex/outgoingRecordComputeStates/outgoingRecordCompute"),
+        ]);
+        let parser = crate::core::search::QueryParser::new(Default::default());
+
+        let titles: Vec<_> = index
+            .search(&parser.parse("Test"))
+            .into_iter()
+            .map(|result| result.title)
+            .collect();
+
+        assert_eq!(titles, vec!["setupTests.ts"]);
+    }
+
+    #[test]
+    fn search_matches_full_path_queries_exactly() {
+        let index = SearchIndex::from_entries(vec![
+            file_entry("/Users/frankzhang/workspace/codeforge/README.md"),
+            file_entry("/Users/frankzhang/workspace/QuickFox/README.md"),
+        ]);
+        let parser = crate::core::search::QueryParser::new(Default::default());
+
+        let results =
+            index.search(&parser.parse("/Users/frankzhang/workspace/codeforge/README.md"));
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].detail.as_deref(),
+            Some("/Users/frankzhang/workspace/codeforge/README.md")
+        );
     }
 
     #[test]

@@ -110,16 +110,11 @@ impl Provider for FileProvider {
             .into_iter()
             .map(|mut result| {
                 result.provider = self.id().to_owned();
-                if matches!(
-                    result.kind,
-                    SearchResultKind::Application
-                        | SearchResultKind::File
-                        | SearchResultKind::Directory
-                ) {
+                if matches!(result.kind, SearchResultKind::File) {
                     if let Action::OpenPath { path } = result.main_action.clone() {
                         result = result.with_secondary_action(Action::OpenWithApplication {
                             path,
-                            application: OpenApplication::DevelopmentTool,
+                            application: OpenApplication::SystemChooser,
                         });
                     }
                 }
@@ -540,7 +535,7 @@ mod tests {
     }
 
     #[test]
-    fn file_provider_returns_file_and_directory_results_with_open_actions() {
+    fn file_provider_returns_file_directory_and_application_actions_by_type() {
         let index = SearchIndex::from_entries(vec![
             indexed_entry(
                 "/home/frank/Documents",
@@ -552,48 +547,75 @@ mod tests {
                 "readme.md",
                 IndexedEntryKind::File,
             ),
+            indexed_entry(
+                "/Applications/Codex.app",
+                "Codex.app",
+                IndexedEntryKind::Application,
+            ),
         ]);
         let provider = FileProvider::new(index);
 
-        let results = provider.search(&QueryRequest::new("doc", SearchMode::Normal));
+        let doc_results = provider.search(&QueryRequest::new("doc", SearchMode::Normal));
+        let app_results = provider.search(&QueryRequest::new("codex", SearchMode::Normal));
+        let results: Vec<_> = doc_results.into_iter().chain(app_results).collect();
 
-        assert_eq!(results.len(), 2);
+        assert_eq!(results.len(), 3);
         assert!(results.iter().all(|result| result.provider == "files"));
-        assert!(results.iter().any(|result| {
-            result.title == "readme.md"
-                && result.kind == SearchResultKind::File
-                && result.main_action
-                    == Action::OpenPath {
-                        path: "/home/frank/Documents/readme.md".to_owned(),
-                    }
-        }));
-        assert!(results.iter().any(|result| {
-            result.title == "Documents"
-                && result.kind == SearchResultKind::Directory
-                && result.main_action
-                    == Action::OpenPath {
-                        path: "/home/frank/Documents".to_owned(),
-                    }
-        }));
-        assert!(results
+
+        let file = results
             .iter()
-            .all(|result| result.secondary_actions.len() == 3));
-        assert!(results.iter().any(|result| {
-            result
-                .secondary_actions
-                .contains(&Action::OpenContainingFolder {
-                    path: result.detail.clone().unwrap_or_default(),
-                })
-                && result.secondary_actions.contains(&Action::CopyText {
-                    text: result.detail.clone().unwrap_or_default(),
-                })
-                && result
-                    .secondary_actions
-                    .contains(&Action::OpenWithApplication {
-                        path: result.detail.clone().unwrap_or_default(),
-                        application: OpenApplication::DevelopmentTool,
-                    })
-        }));
+            .find(|result| result.title == "readme.md")
+            .unwrap();
+        assert_eq!(file.kind, SearchResultKind::File);
+        assert_eq!(
+            file.secondary_actions,
+            vec![
+                Action::OpenContainingFolder {
+                    path: "/home/frank/Documents/readme.md".to_owned(),
+                },
+                Action::CopyText {
+                    text: "/home/frank/Documents/readme.md".to_owned(),
+                },
+                Action::OpenWithApplication {
+                    path: "/home/frank/Documents/readme.md".to_owned(),
+                    application: OpenApplication::SystemChooser,
+                },
+            ]
+        );
+
+        let directory = results
+            .iter()
+            .find(|result| result.title == "Documents")
+            .unwrap();
+        assert_eq!(directory.kind, SearchResultKind::Directory);
+        assert_eq!(
+            directory.secondary_actions,
+            vec![
+                Action::OpenPath {
+                    path: "/home/frank/Documents".to_owned(),
+                },
+                Action::CopyText {
+                    text: "/home/frank/Documents".to_owned(),
+                },
+            ]
+        );
+
+        let application = results
+            .iter()
+            .find(|result| result.title == "Codex.app")
+            .unwrap();
+        assert_eq!(application.kind, SearchResultKind::Application);
+        assert_eq!(
+            application.secondary_actions,
+            vec![
+                Action::OpenPath {
+                    path: "/Applications/Codex.app".to_owned(),
+                },
+                Action::CopyText {
+                    text: "/Applications/Codex.app".to_owned(),
+                },
+            ]
+        );
     }
 
     #[test]

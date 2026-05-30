@@ -1,13 +1,18 @@
-import { type KeyboardEvent, useEffect, useState } from "react";
+import { type KeyboardEvent, useEffect, useRef, useState } from "react";
 
 import {
+  appPaths,
   executeAction,
+  globalHotkeyStatus,
+  listenGlobalHotkeyStatus,
   indexStatus,
   loadConfig,
   listenOpenSettings,
   recentInputHistory,
   recordInputHistory,
   refreshIndex,
+  type AppPaths,
+  type GlobalHotkeyStatus,
   type IndexStatus,
   type QuickFoxConfig,
   saveConfig,
@@ -19,13 +24,18 @@ type LauncherAction =
   | { type: "openContainingFolder"; path: string }
   | { type: "copyText"; text: string }
   | { type: "openUrl"; url: string }
-  | { type: "openWithApplication"; path: string; application: "developmentTool" }
+  | {
+      type: "openWithApplication";
+      path: string;
+      application: "developmentTool" | "systemChooser";
+    }
   | { type: "executeCommand"; command: string; requiresConfirmation: boolean };
 
 type LauncherResult = {
   id: string;
   title: string;
   detail?: string | null;
+  kind: BackendSearchResult["kind"];
   primaryAction: LauncherAction;
   secondaryActions: Array<{ label: string; action: LauncherAction }>;
 };
@@ -34,6 +44,7 @@ type BackendSearchResult = {
   id: string;
   title: string;
   detail?: string | null;
+  kind: "application" | "file" | "directory" | "calculator" | "webSearch" | "command" | "feedback";
   mainAction: LauncherAction;
   secondaryActions: LauncherAction[];
 };
@@ -79,9 +90,15 @@ const fallbackConfig: QuickFoxConfig = {
   },
 };
 
-function labelForAction(action: LauncherAction) {
+function labelForAction(action: LauncherAction, resultKind?: BackendSearchResult["kind"]) {
   switch (action.type) {
     case "openPath":
+      if (resultKind === "application") {
+        return "打开应用";
+      }
+      if (resultKind === "directory") {
+        return "打开文件夹";
+      }
       return "打开";
     case "openContainingFolder":
       return "打开所在目录";
@@ -90,7 +107,7 @@ function labelForAction(action: LauncherAction) {
     case "openUrl":
       return "打开链接";
     case "openWithApplication":
-      return "用开发工具打开";
+      return "选择打开方式";
     case "executeCommand":
       return "确认执行";
   }
@@ -124,9 +141,10 @@ function toLauncherResults(results: BackendSearchResult[]): LauncherResult[] {
     id: result.id,
     title: result.title,
     detail: result.detail,
+    kind: result.kind,
     primaryAction: result.mainAction,
     secondaryActions: result.secondaryActions.map((action) => ({
-      label: labelForAction(action),
+      label: labelForAction(action, result.kind),
       action,
     })),
   }));
@@ -156,13 +174,25 @@ export function App({
     generation: 0,
     completedAtMs: null,
   });
+  const [currentAppPaths, setCurrentAppPaths] = useState<AppPaths>({
+    configFilePath: null,
+    indexSnapshotPath: null,
+  });
+  const [currentHotkeyStatus, setCurrentHotkeyStatus] = useState<GlobalHotkeyStatus>({
+    enabled: false,
+    message: "Shift+Shift 全局唤醒监听启动中",
+  });
   const [settingsSection, setSettingsSection] = useState<
     "index" | "web" | "history" | "command" | "appearance"
   >("index");
   const [engineWizardOpen, setEngineWizardOpen] = useState(false);
   const [engineDraft, setEngineDraft] = useState({ prefix: "", name: "", url: "" });
   const [engineError, setEngineError] = useState<string | null>(null);
+  const resultRefs = useRef<Array<HTMLLIElement | null>>([]);
+  const historyRefs = useRef<Array<HTMLLIElement | null>>([]);
+  const settingsContentRef = useRef<HTMLDivElement | null>(null);
   const effectiveCommandEnabled = commandEnabled ?? config.command.enabled;
+  const hotkeyPermissionSettingsUrl = currentHotkeyStatus.permissionSettingsUrl;
 
   const isCommandQuery = query.trim().startsWith(">");
   const isCommandMode = isCommandQuery;
@@ -172,12 +202,28 @@ export function App({
 
   useEffect(() => {
     let cancelled = false;
-    void Promise.all([loadConfig(), recentInputHistory(), indexStatus()])
-      .then(([nextConfig, nextHistory, nextIndexStatus]) => {
+    void Promise.all([loadConfig(), recentInputHistory(), indexStatus(), globalHotkeyStatus()])
+      .then(([nextConfig, nextHistory, nextIndexStatus, nextHotkeyStatus]) => {
         if (!cancelled) {
           setConfig(nextConfig as QuickFoxConfig);
           setInputHistory(nextHistory as string[]);
           setCurrentIndexStatus(nextIndexStatus as IndexStatus);
+          setCurrentHotkeyStatus(nextHotkeyStatus as GlobalHotkeyStatus);
+        }
+      })
+      .catch(() => undefined);
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    void appPaths()
+      .then((paths) => {
+        if (!cancelled) {
+          setCurrentAppPaths(paths as AppPaths);
         }
       })
       .catch(() => undefined);
@@ -192,6 +238,17 @@ export function App({
     void listenOpenSettings(() => setView("settings")).then((unlisten) => {
       dispose = unlisten;
     });
+    return () => {
+      dispose?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    let dispose: (() => void) | undefined;
+    void listenGlobalHotkeyStatus(setCurrentHotkeyStatus).then((unlisten) => {
+      dispose = unlisten;
+    });
+
     return () => {
       dispose?.();
     };
@@ -220,6 +277,25 @@ export function App({
       cancelled = true;
     };
   }, [isCommandQuery, query]);
+
+  useEffect(() => {
+    if (!historyMode && results.length > 0) {
+      scrollElementIntoView(resultRefs.current[selectedIndex]);
+    }
+  }, [historyMode, results.length, selectedIndex]);
+
+  useEffect(() => {
+    if (historyMode && historyIndex !== null) {
+      scrollElementIntoView(historyRefs.current[historyIndex]);
+    }
+  }, [historyIndex, historyMode]);
+
+  useEffect(() => {
+    const element = settingsContentRef.current;
+    if (typeof element?.scrollTo === "function") {
+      element.scrollTo({ top: 0 });
+    }
+  }, [settingsSection]);
 
   const updateQuery = (value: string) => {
     setQuery(value);
@@ -376,6 +452,17 @@ export function App({
     setView("launcher");
   };
 
+  const openHotkeyPermissionSettings = () => {
+    if (!hotkeyPermissionSettingsUrl) {
+      return;
+    }
+
+    void onExecuteAction({
+      type: "openUrl",
+      url: hotkeyPermissionSettingsUrl,
+    });
+  };
+
   if (view === "settings") {
     return (
       <main className="launcher-shell" aria-label="QuickFox launcher">
@@ -386,204 +473,260 @@ export function App({
             </button>
           </header>
           <form aria-label="设置" className="settings-form">
-            <nav aria-label="设置分区" className="settings-tabs" role="tablist">
-              {[
-                ["index", "索引"],
-                ["web", "网页搜索"],
-                ["history", "历史"],
-                ["command", "命令安全"],
-                ["appearance", "外观"],
-              ].map(([id, label]) => (
+            <div className="settings-sidebar">
+              <nav aria-label="设置分区" className="settings-tabs" role="tablist">
+                {[
+                  ["index", "索引"],
+                  ["web", "网页搜索"],
+                  ["history", "历史"],
+                  ["command", "命令安全"],
+                  ["appearance", "外观"],
+                ].map(([id, label]) => (
+                  <button
+                    aria-selected={settingsSection === id}
+                    key={id}
+                    onClick={() => setSettingsSection(id as typeof settingsSection)}
+                    role="tab"
+                    type="button"
+                  >
+                    {label}
+                  </button>
+                ))}
+              </nav>
+              <section aria-label="设置操作" className="settings-actions">
                 <button
-                  aria-selected={settingsSection === id}
-                  key={id}
-                  onClick={() => setSettingsSection(id as typeof settingsSection)}
-                  role="tab"
                   type="button"
+                  className="primary-button"
+                  onClick={() => void saveSettings()}
                 >
-                  {label}
+                  保存设置
                 </button>
-              ))}
-            </nav>
-            <fieldset className={settingsSection === "index" ? "" : "settings-section-muted"}>
-              <legend>搜索与索引</legend>
-              <div className="settings-status-row">
-                <span>{indexStatusLabel(currentIndexStatus)}</span>
-                <span>{currentIndexStatus.entryCount} 项</span>
-              </div>
-              <label>
-                索引目录
-                <textarea
-                  value={config.index.include_dirs.join("\n")}
-                  onChange={(event) =>
-                    setConfig((current) => ({
-                      ...current,
-                      index: {
-                        ...current.index,
-                        include_dirs: event.target.value
-                          .split("\n")
-                          .map((item) => item.trim())
-                          .filter(Boolean),
-                      },
-                    }))
+              </section>
+            </div>
+            <div
+              className="settings-content"
+              role="region"
+              aria-label="设置内容"
+              ref={settingsContentRef}
+            >
+              <fieldset
+                className={
+                  settingsSection === "index"
+                    ? "settings-section settings-section--index"
+                    : "settings-section settings-section--index settings-section-muted"
+                }
+              >
+                <legend>搜索与索引</legend>
+                <IndexStatusDetails status={currentIndexStatus} appPaths={currentAppPaths} />
+                <label className="settings-field settings-field--wide">
+                  索引目录
+                  <textarea
+                    value={config.index.include_dirs.join("\n")}
+                    onChange={(event) =>
+                      setConfig((current) => ({
+                        ...current,
+                        index: {
+                          ...current.index,
+                          include_dirs: event.target.value
+                            .split("\n")
+                            .map((item) => item.trim())
+                            .filter(Boolean),
+                        },
+                      }))
+                    }
+                  />
+                </label>
+                <label className="settings-field">
+                  排除目录
+                  <textarea
+                    value={config.index.exclude_dirs.join("\n")}
+                    onChange={(event) =>
+                      setConfig((current) => ({
+                        ...current,
+                        index: {
+                          ...current.index,
+                          exclude_dirs: linesFromTextarea(event.target.value),
+                        },
+                      }))
+                    }
+                  />
+                </label>
+                <label className="settings-field">
+                  排除模式
+                  <textarea
+                    value={config.index.exclude_patterns.join("\n")}
+                    onChange={(event) =>
+                      setConfig((current) => ({
+                        ...current,
+                        index: {
+                          ...current.index,
+                          exclude_patterns: linesFromTextarea(event.target.value),
+                        },
+                      }))
+                    }
+                  />
+                </label>
+                <label className="settings-field">
+                  正则前缀
+                  <input
+                    value={config.query.regex_prefix}
+                    onChange={(event) =>
+                      setConfig((current) => ({
+                        ...current,
+                        query: {
+                          ...current.query,
+                          regex_prefix: event.target.value,
+                        },
+                      }))
+                    }
+                  />
+                </label>
+                <div className="settings-field settings-field--action">
+                  <button type="button" onClick={() => void refreshSearchIndex()}>
+                    刷新索引
+                  </button>
+                  {refreshStatus ? <span className="settings-status">{refreshStatus}</span> : null}
+                </div>
+              </fieldset>
+              <fieldset
+                className={
+                  settingsSection === "web" ? "settings-section" : "settings-section-muted"
+                }
+              >
+                <legend>网页搜索</legend>
+                <div className="engine-list">
+                  {Object.entries(config.web_search.engines).map(([prefix, engine]) => (
+                    <div className="engine-row" key={prefix}>
+                      <span>{prefix}</span>
+                      <span>{engine.name}</span>
+                      <span>{engine.url}</span>
+                      <button type="button" onClick={() => removeEngine(prefix)}>
+                        删除
+                      </button>
+                    </div>
+                  ))}
+                </div>
+                <button type="button" onClick={() => setEngineWizardOpen(true)}>
+                  新增搜索引擎
+                </button>
+              </fieldset>
+              <fieldset
+                className={
+                  settingsSection === "history" ? "settings-section" : "settings-section-muted"
+                }
+              >
+                <legend>历史</legend>
+                <label>
+                  输入历史条数
+                  <input
+                    type="number"
+                    value={config.history.input_max_entries}
+                    min={0}
+                    onChange={(event) =>
+                      setConfig((current) => ({
+                        ...current,
+                        history: {
+                          ...current.history,
+                          input_max_entries: Number(event.target.value),
+                        },
+                      }))
+                    }
+                  />
+                </label>
+              </fieldset>
+              <fieldset
+                className={
+                  settingsSection === "command" ? "settings-section" : "settings-section-muted"
+                }
+              >
+                <legend>命令执行</legend>
+                <label className="toggle-row">
+                  <input
+                    aria-label="命令执行"
+                    type="checkbox"
+                    checked={effectiveCommandEnabled}
+                    onChange={(event) =>
+                      setConfig((current) => ({
+                        ...current,
+                        command: {
+                          ...current.command,
+                          enabled: event.target.checked,
+                        },
+                      }))
+                    }
+                  />
+                  <span>命令执行</span>
+                </label>
+              </fieldset>
+              <fieldset
+                className={
+                  settingsSection === "appearance" ? "settings-section" : "settings-section-muted"
+                }
+              >
+                <legend>外观与窗口</legend>
+                <span>Compact</span>
+                <div
+                  className={
+                    hotkeyPermissionSettingsUrl
+                      ? "settings-meta-row settings-meta-row--action"
+                      : "settings-meta-row"
                   }
-                />
-              </label>
-              <label>
-                排除目录
-                <textarea
-                  value={config.index.exclude_dirs.join("\n")}
-                  onChange={(event) =>
-                    setConfig((current) => ({
-                      ...current,
-                      index: {
-                        ...current.index,
-                        exclude_dirs: linesFromTextarea(event.target.value),
-                      },
-                    }))
-                  }
-                />
-              </label>
-              <label>
-                排除模式
-                <textarea
-                  value={config.index.exclude_patterns.join("\n")}
-                  onChange={(event) =>
-                    setConfig((current) => ({
-                      ...current,
-                      index: {
-                        ...current.index,
-                        exclude_patterns: linesFromTextarea(event.target.value),
-                      },
-                    }))
-                  }
-                />
-              </label>
-              <label>
-                正则前缀
-                <input
-                  value={config.query.regex_prefix}
-                  onChange={(event) =>
-                    setConfig((current) => ({
-                      ...current,
-                      query: {
-                        ...current.query,
-                        regex_prefix: event.target.value,
-                      },
-                    }))
-                  }
-                />
-              </label>
-              <button type="button" onClick={() => void refreshSearchIndex()}>
-                刷新索引
-              </button>
-              {refreshStatus ? <span className="settings-status">{refreshStatus}</span> : null}
-            </fieldset>
-            <fieldset className={settingsSection === "web" ? "" : "settings-section-muted"}>
-              <legend>网页搜索</legend>
-              <div className="engine-list">
-                {Object.entries(config.web_search.engines).map(([prefix, engine]) => (
-                  <div className="engine-row" key={prefix}>
-                    <span>{prefix}</span>
-                    <span>{engine.name}</span>
-                    <span>{engine.url}</span>
-                    <button type="button" onClick={() => removeEngine(prefix)}>
-                      删除
+                >
+                  <span>全局唤醒</span>
+                  <span>
+                    {currentHotkeyStatus.message}
+                    {hotkeyPermissionSettingsUrl ? (
+                      <small>授权后需要重启 QuickFox，Shift+Shift 监听才会重新启动。</small>
+                    ) : null}
+                  </span>
+                  {hotkeyPermissionSettingsUrl ? (
+                    <button type="button" onClick={openHotkeyPermissionSettings}>
+                      打开权限设置
+                    </button>
+                  ) : null}
+                </div>
+              </fieldset>
+              {engineWizardOpen ? (
+                <section aria-label="新增搜索引擎" className="settings-dialog" role="dialog">
+                  <label>
+                    搜索前缀
+                    <input
+                      value={engineDraft.prefix}
+                      onChange={(event) =>
+                        setEngineDraft((current) => ({ ...current, prefix: event.target.value }))
+                      }
+                    />
+                  </label>
+                  <label>
+                    搜索名称
+                    <input
+                      value={engineDraft.name}
+                      onChange={(event) =>
+                        setEngineDraft((current) => ({ ...current, name: event.target.value }))
+                      }
+                    />
+                  </label>
+                  <label>
+                    URL 模板
+                    <input
+                      value={engineDraft.url}
+                      onChange={(event) =>
+                        setEngineDraft((current) => ({ ...current, url: event.target.value }))
+                      }
+                    />
+                  </label>
+                  {engineError ? <span className="settings-error">{engineError}</span> : null}
+                  <div className="dialog-actions">
+                    <button type="button" onClick={addEngineFromWizard}>
+                      添加引擎
+                    </button>
+                    <button type="button" onClick={() => setEngineWizardOpen(false)}>
+                      取消
                     </button>
                   </div>
-                ))}
-              </div>
-              <button type="button" onClick={() => setEngineWizardOpen(true)}>
-                新增搜索引擎
-              </button>
-            </fieldset>
-            <fieldset className={settingsSection === "history" ? "" : "settings-section-muted"}>
-              <legend>历史</legend>
-              <label>
-                输入历史条数
-                <input
-                  type="number"
-                  value={config.history.input_max_entries}
-                  min={0}
-                  onChange={(event) =>
-                    setConfig((current) => ({
-                      ...current,
-                      history: {
-                        ...current.history,
-                        input_max_entries: Number(event.target.value),
-                      },
-                    }))
-                  }
-                />
-              </label>
-            </fieldset>
-            <fieldset className={settingsSection === "command" ? "" : "settings-section-muted"}>
-              <legend>命令执行</legend>
-              <label className="toggle-row">
-                <input
-                  aria-label="命令执行"
-                  type="checkbox"
-                  checked={effectiveCommandEnabled}
-                  onChange={(event) =>
-                    setConfig((current) => ({
-                      ...current,
-                      command: {
-                        ...current.command,
-                        enabled: event.target.checked,
-                      },
-                    }))
-                  }
-                />
-                <span>命令执行</span>
-              </label>
-            </fieldset>
-            <fieldset className={settingsSection === "appearance" ? "" : "settings-section-muted"}>
-              <legend>外观与窗口</legend>
-              <span>Compact</span>
-            </fieldset>
-            {engineWizardOpen ? (
-              <section aria-label="新增搜索引擎" className="settings-dialog" role="dialog">
-                <label>
-                  搜索前缀
-                  <input
-                    value={engineDraft.prefix}
-                    onChange={(event) =>
-                      setEngineDraft((current) => ({ ...current, prefix: event.target.value }))
-                    }
-                  />
-                </label>
-                <label>
-                  搜索名称
-                  <input
-                    value={engineDraft.name}
-                    onChange={(event) =>
-                      setEngineDraft((current) => ({ ...current, name: event.target.value }))
-                    }
-                  />
-                </label>
-                <label>
-                  URL 模板
-                  <input
-                    value={engineDraft.url}
-                    onChange={(event) =>
-                      setEngineDraft((current) => ({ ...current, url: event.target.value }))
-                    }
-                  />
-                </label>
-                {engineError ? <span className="settings-error">{engineError}</span> : null}
-                <div className="dialog-actions">
-                  <button type="button" onClick={addEngineFromWizard}>
-                    添加引擎
-                  </button>
-                  <button type="button" onClick={() => setEngineWizardOpen(false)}>
-                    取消
-                  </button>
-                </div>
-              </section>
-            ) : null}
-            <button type="button" className="primary-button" onClick={() => void saveSettings()}>
-              保存设置
-            </button>
+                </section>
+              ) : null}
+            </div>
           </form>
         </section>
       </main>
@@ -629,6 +772,10 @@ export function App({
                     aria-selected={index === (historyIndex ?? 0)}
                     className="history-item"
                     key={`${item}:${index}`}
+                    onMouseEnter={() => setHistoryIndex(index)}
+                    ref={(element) => {
+                      historyRefs.current[index] = element;
+                    }}
                     role="option"
                   >
                     {item}
@@ -642,7 +789,11 @@ export function App({
                   ? results.map((result, index) => (
                       <li
                         aria-selected={index === selectedIndex}
-                        className="result-item"
+                        className={
+                          index === selectedIndex
+                            ? "result-item result-item--selected"
+                            : "result-item"
+                        }
                         key={result.id}
                         onContextMenu={(event) => {
                           event.preventDefault();
@@ -650,10 +801,25 @@ export function App({
                           setMenuPosition({ left: event.clientX, top: event.clientY });
                           setSelectedIndex(index);
                         }}
+                        onMouseEnter={() => setSelectedIndex(index)}
+                        ref={(element) => {
+                          resultRefs.current[index] = element;
+                        }}
                         role="option"
                       >
-                        <span className="result-title">{result.title}</span>
-                        <span className="result-detail">{result.detail ?? ""}</span>
+                        <span className="result-title-cell">
+                          <ResultKindBadge kind={result.kind} />
+                          <span className="result-title" title={result.title}>
+                            <ResultTitle title={result.title} />
+                          </span>
+                        </span>
+                        <span
+                          aria-label={result.detail ? `完整路径 ${result.detail}` : undefined}
+                          className="result-detail"
+                          title={result.detail ?? undefined}
+                        >
+                          {summarizePath(result.detail)}
+                        </span>
                       </li>
                     ))
                   : [
@@ -704,6 +870,125 @@ function linesFromTextarea(value: string) {
     .split("\n")
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+function summarizePath(path?: string | null) {
+  if (!path) {
+    return "";
+  }
+
+  const separator = path.includes("\\") ? "\\" : "/";
+  const parts = path.split(/[\\/]+/).filter(Boolean);
+  if (parts.length <= 4) {
+    return path;
+  }
+
+  const isAbsolutePosix = path.startsWith("/");
+  const isUnc = path.startsWith("\\\\");
+  const prefixCount = isUnc ? 2 : 2;
+  const suffixCount = 2;
+  const prefix = parts.slice(0, prefixCount).join(separator);
+  const suffix = parts.slice(-suffixCount).join(separator);
+  const leading = isAbsolutePosix ? separator : isUnc ? `${separator}${separator}` : "";
+
+  return `${leading}${prefix}${separator}...${separator}${suffix}`;
+}
+
+function scrollElementIntoView(element: HTMLElement | null | undefined) {
+  if (typeof element?.scrollIntoView === "function") {
+    element.scrollIntoView({ block: "nearest" });
+  }
+}
+
+function ResultTitle({ title }: { title: string }) {
+  const summary = summarizeTitle(title);
+  if (!summary) {
+    return title;
+  }
+
+  return (
+    <>
+      <span className="result-title-head">{summary.head}</span>
+      <span className="result-title-ellipsis">...</span>
+      <span className="result-title-tail">{summary.tail}</span>
+    </>
+  );
+}
+
+function ResultKindBadge({ kind }: { kind: BackendSearchResult["kind"] }) {
+  const labels: Partial<Record<BackendSearchResult["kind"], string>> = {
+    application: "应用",
+    file: "文件",
+    directory: "目录",
+  };
+  const label = labels[kind];
+  if (!label) {
+    return null;
+  }
+
+  return (
+    <span aria-label={label} className={`result-kind result-kind--${kind}`}>
+      {label.slice(0, 1)}
+    </span>
+  );
+}
+
+function summarizeTitle(title: string): { head: string; tail: string } | null {
+  if (title.length <= 48) {
+    return null;
+  }
+
+  const underscoreParts = title.split("_");
+  const tail = underscoreParts.length >= 3 ? underscoreParts.slice(-2).join("_") : title.slice(-18);
+  const head =
+    underscoreParts.length >= 3 ? underscoreParts.slice(0, 2).join("_") : title.slice(0, 15);
+
+  return { head, tail: tail.replace(/^_+/, "") };
+}
+
+function IndexStatusDetails({ status, appPaths }: { status: IndexStatus; appPaths: AppPaths }) {
+  return (
+    <div className="settings-status-grid">
+      <div className="settings-status-row">
+        <span>{indexStatusLabel(status)}</span>
+        <span>{status.entryCount} 项</span>
+      </div>
+      <div className="settings-meta-row">
+        <span>索引代次</span>
+        <span>第 {status.generation} 代</span>
+      </div>
+      <div className="settings-meta-row">
+        <span>最近完成</span>
+        <span>
+          {status.completedAtMs
+            ? `最近完成: ${formatCompletedAt(status.completedAtMs)}`
+            : "尚未完成"}
+        </span>
+      </div>
+      {status.message ? (
+        <div className="settings-meta-row">
+          <span>状态摘要</span>
+          <span>{status.message}</span>
+        </div>
+      ) : null}
+      <div className="settings-meta-row">
+        <span>配置文件位置</span>
+        <span title={appPaths.configFilePath ?? undefined}>
+          {appPaths.configFilePath ?? "未找到"}
+        </span>
+      </div>
+      <div className="settings-meta-row">
+        <span>索引快照位置</span>
+        <span title={appPaths.indexSnapshotPath ?? undefined}>
+          {appPaths.indexSnapshotPath ?? "尚未创建"}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function formatCompletedAt(timestampMs: number) {
+  return new Date(timestampMs).toLocaleString();
 }
 
 function indexStatusLabel(status: IndexStatus) {

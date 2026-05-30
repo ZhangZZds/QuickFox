@@ -16,6 +16,7 @@ use crate::core::providers::{
 use crate::core::search::{HistoryScores, QueryParser, QueryParserConfig, Ranker, SearchResult};
 use crate::core::storage::SqliteStorage;
 use keytap::{EventKind, Key, Tap};
+use serde::Serialize;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Mutex;
@@ -41,6 +42,22 @@ struct QuickFoxRuntime {
 struct QuickFoxAppState {
     runtime: Mutex<QuickFoxRuntime>,
     window_state: Mutex<LauncherWindowState>,
+    global_hotkey_status: Mutex<GlobalHotkeyStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AppPaths {
+    config_file_path: String,
+    index_snapshot_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GlobalHotkeyStatus {
+    enabled: bool,
+    message: String,
+    permission_settings_url: Option<String>,
 }
 
 #[tauri::command]
@@ -69,6 +86,25 @@ fn index_status(state: tauri::State<QuickFoxAppState>) -> IndexStatus {
         .lock()
         .expect("quickfox runtime lock poisoned")
         .index_status()
+}
+
+#[tauri::command]
+fn app_paths() -> Result<AppPaths, String> {
+    let config_path =
+        config_file_path().ok_or_else(|| "config file path is unavailable".to_owned())?;
+    let index_path =
+        storage_file_path().ok_or_else(|| "index snapshot path is unavailable".to_owned())?;
+
+    Ok(build_app_paths(config_path, index_path))
+}
+
+#[tauri::command]
+fn global_hotkey_status(state: tauri::State<QuickFoxAppState>) -> GlobalHotkeyStatus {
+    state
+        .global_hotkey_status
+        .lock()
+        .expect("quickfox global hotkey status lock poisoned")
+        .clone()
 }
 
 #[tauri::command]
@@ -341,12 +377,12 @@ fn implicit_exclude_patterns() -> Vec<String> {
     vec![".*".to_owned()]
 }
 
-fn implicit_exclude_dirs(config: &QuickFoxConfig) -> Vec<PathBuf> {
+fn implicit_exclude_dirs(_config: &QuickFoxConfig) -> Vec<PathBuf> {
     #[cfg(target_os = "macos")]
     {
         if let Some(home) = home_dir() {
             let home_text = home.to_string_lossy().to_string();
-            if config
+            if _config
                 .index
                 .include_dirs
                 .iter()
@@ -621,7 +657,42 @@ fn build_open_with_application_command(
                 .build_command(&expand_user_path(path), &available_refs)
                 .map_err(|error| format!("{error:?}"))
         }
+        OpenApplication::SystemChooser => build_system_open_with_command(&expand_user_path(path)),
     }
+}
+
+fn build_system_open_with_command(path: &str) -> Result<ProcessCommand, String> {
+    #[cfg(target_os = "windows")]
+    {
+        return Ok(ProcessCommand {
+            program: "rundll32.exe".to_owned(),
+            args: vec!["shell32.dll,OpenAs_RunDLL".to_owned(), path.to_owned()],
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let escaped_path = path.replace('\\', "\\\\").replace('"', "\\\"");
+        let script = format!(
+            "set chosenApp to choose application with prompt \"选择打开方式\"\n\
+             tell application chosenApp to open POSIX file \"{escaped_path}\""
+        );
+        return Ok(ProcessCommand {
+            program: "osascript".to_owned(),
+            args: vec!["-e".to_owned(), script],
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        return Ok(ProcessCommand {
+            program: "xdg-open".to_owned(),
+            args: vec![path.to_owned()],
+        });
+    }
+
+    #[allow(unreachable_code)]
+    Err("system open with is unavailable".to_owned())
 }
 
 fn build_terminal_command(command: &str) -> Result<ProcessCommand, String> {
@@ -698,8 +769,105 @@ fn home_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-fn show_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
-    apply_launcher_window_effect(app, LauncherWindowEffect::ShowAndFocus);
+fn build_app_paths(config_file_path: PathBuf, index_snapshot_path: PathBuf) -> AppPaths {
+    AppPaths {
+        config_file_path: config_file_path.to_string_lossy().to_string(),
+        index_snapshot_path: index_snapshot_path.to_string_lossy().to_string(),
+    }
+}
+
+fn pending_global_hotkey_status() -> GlobalHotkeyStatus {
+    GlobalHotkeyStatus {
+        enabled: false,
+        message: "Shift+Shift 全局唤醒监听启动中".to_owned(),
+        permission_settings_url: None,
+    }
+}
+
+fn enabled_global_hotkey_status() -> GlobalHotkeyStatus {
+    GlobalHotkeyStatus {
+        enabled: true,
+        message: "Shift+Shift 全局唤醒可用".to_owned(),
+        permission_settings_url: None,
+    }
+}
+
+fn failed_global_hotkey_status(error: &keytap::Error) -> GlobalHotkeyStatus {
+    let (message, permission_settings_url) = match error {
+        keytap::Error::PermissionDenied => (
+            global_hotkey_permission_denied_message(),
+            global_hotkey_permission_settings_url(),
+        ),
+        keytap::Error::NoDevices => (
+            "未找到可监听的键盘设备，Shift+Shift 全局唤醒不可用".to_owned(),
+            None,
+        ),
+        _ => (format!("Shift+Shift 全局唤醒监听启动失败: {error}"), None),
+    };
+
+    GlobalHotkeyStatus {
+        enabled: false,
+        message,
+        permission_settings_url,
+    }
+}
+
+fn global_hotkey_permission_denied_message() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        "需要授予输入监控权限后才能使用 Shift+Shift 全局唤醒".to_owned()
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        "需要授予键盘设备读取权限后才能使用 Shift+Shift 全局唤醒".to_owned()
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        "需要授予系统键盘监听权限后才能使用 Shift+Shift 全局唤醒".to_owned()
+    }
+}
+
+fn global_hotkey_permission_settings_url() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        Some(
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent"
+                .to_owned(),
+        )
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+fn set_global_hotkey_status<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    status: GlobalHotkeyStatus,
+) {
+    let app_state = app.state::<QuickFoxAppState>();
+    {
+        let mut current_status = app_state
+            .global_hotkey_status
+            .lock()
+            .expect("quickfox global hotkey status lock poisoned");
+        *current_status = status.clone();
+    }
+    let _ = app.emit_to("main", "quickfox://global-hotkey-status", status);
+}
+
+fn show_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>, state: &QuickFoxAppState) {
+    let effect = {
+        let mut window_state = state
+            .window_state
+            .lock()
+            .expect("quickfox window state lock poisoned");
+        sync_launcher_window_state_for_tray_show(&mut window_state)
+    };
+    apply_launcher_window_effect(app, effect);
 }
 
 fn apply_launcher_window_effect<R: tauri::Runtime>(
@@ -755,10 +923,13 @@ fn start_global_double_shift_listener(app: tauri::AppHandle) {
             let tap = match Tap::builder().macos_no_repeat_detection().build() {
                 Ok(tap) => tap,
                 Err(error) => {
+                    let status = failed_global_hotkey_status(&error);
+                    set_global_hotkey_status(&app, status);
                     eprintln!("QuickFox global hotkey listener disabled: {error}");
                     return;
                 }
             };
+            set_global_hotkey_status(&app, enabled_global_hotkey_status());
             let mut hotkey_state = crate::core::platform::HotkeyState::default();
 
             for event in tap.iter() {
@@ -796,6 +967,13 @@ fn next_launcher_window_effect(
     state.toggle_for_global_hotkey()
 }
 
+fn sync_launcher_window_state_for_tray_show(
+    state: &mut LauncherWindowState,
+) -> LauncherWindowEffect {
+    state.show();
+    LauncherWindowEffect::ShowAndFocus
+}
+
 fn validate_command_action(command: &str, requires_confirmation: bool) -> Result<(), String> {
     if !requires_confirmation {
         return Err("command requires confirmation".to_owned());
@@ -816,6 +994,7 @@ pub fn run() {
         .manage(QuickFoxAppState {
             runtime: Mutex::new(build_runtime()),
             window_state: Mutex::new(LauncherWindowState::default()),
+            global_hotkey_status: Mutex::new(pending_global_hotkey_status()),
         })
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
@@ -832,9 +1011,13 @@ pub fn run() {
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id().as_ref() {
-                    "show" => show_main_window(app),
+                    "show" => {
+                        let state = app.state::<QuickFoxAppState>();
+                        show_main_window(app, &state);
+                    }
                     "settings" => {
-                        show_main_window(app);
+                        let state = app.state::<QuickFoxAppState>();
+                        show_main_window(app, &state);
                         let _ = app.emit_to("main", "quickfox://open-settings", ());
                     }
                     "quit" => app.exit(0),
@@ -854,6 +1037,8 @@ pub fn run() {
             search,
             execute_action,
             refresh_index,
+            app_paths,
+            global_hotkey_status,
             load_config,
             save_config,
             clear_command_history,
@@ -891,6 +1076,23 @@ mod tests {
 
         assert_eq!(config.query.regex_prefix, "re:");
         assert!(!config.command.enabled);
+    }
+
+    #[test]
+    fn app_paths_returns_config_and_index_snapshot_paths_for_settings() {
+        let paths = build_app_paths(
+            PathBuf::from("/Users/frank/Library/Application Support/QuickFox/config.toml"),
+            PathBuf::from("/Users/frank/Library/Application Support/QuickFox/quickfox.sqlite"),
+        );
+
+        assert_eq!(
+            paths.config_file_path,
+            "/Users/frank/Library/Application Support/QuickFox/config.toml"
+        );
+        assert_eq!(
+            paths.index_snapshot_path,
+            "/Users/frank/Library/Application Support/QuickFox/quickfox.sqlite"
+        );
     }
 
     #[test]
@@ -1039,6 +1241,7 @@ mod tests {
 
     #[test]
     fn build_terminal_command_returns_platform_specific_terminal_process() {
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         let process = build_terminal_command("git status").unwrap();
 
         #[cfg(target_os = "macos")]
@@ -1057,6 +1260,38 @@ mod tests {
     }
 
     #[test]
+    fn build_open_with_application_uses_system_open_with_command() {
+        let process =
+            build_open_with_application_command("/tmp/readme.md", &OpenApplication::SystemChooser)
+                .unwrap();
+
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(process.program, "osascript");
+            assert!(process.args[1].contains("choose application"));
+            assert!(process.args[1].contains("/tmp/readme.md"));
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            assert_eq!(process.program, "rundll32.exe");
+            assert_eq!(
+                process.args,
+                vec![
+                    "shell32.dll,OpenAs_RunDLL".to_owned(),
+                    "/tmp/readme.md".to_owned(),
+                ]
+            );
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(process.program, "xdg-open");
+            assert_eq!(process.args, vec!["/tmp/readme.md".to_owned()]);
+        }
+    }
+
+    #[test]
     fn launcher_window_effect_shows_background_window_and_hides_focused_window() {
         let mut state = LauncherWindowState::default();
 
@@ -1072,6 +1307,46 @@ mod tests {
             next_launcher_window_effect(true, true, &mut state),
             LauncherWindowEffect::Hide
         );
+    }
+
+    #[test]
+    fn tray_show_marks_window_visible_and_focused_for_next_hotkey_toggle() {
+        let mut state = LauncherWindowState::default();
+
+        assert_eq!(
+            sync_launcher_window_state_for_tray_show(&mut state),
+            LauncherWindowEffect::ShowAndFocus
+        );
+        assert!(state.is_visible());
+        assert!(state.is_focused());
+        assert_eq!(state.toggle_for_global_hotkey(), LauncherWindowEffect::Hide);
+    }
+
+    #[test]
+    fn global_hotkey_permission_failure_returns_actionable_status() {
+        let status = failed_global_hotkey_status(&keytap::Error::PermissionDenied);
+
+        assert!(!status.enabled);
+        assert!(status.message.contains("Shift+Shift"));
+        #[cfg(target_os = "macos")]
+        {
+            assert!(status.message.contains("输入监控权限"));
+            assert_eq!(
+                status.permission_settings_url.as_deref(),
+                Some("x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent")
+            );
+        }
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(status.permission_settings_url, None);
+    }
+
+    #[test]
+    fn global_hotkey_enabled_status_describes_shift_shift() {
+        let status = enabled_global_hotkey_status();
+
+        assert!(status.enabled);
+        assert_eq!(status.message, "Shift+Shift 全局唤醒可用");
+        assert_eq!(status.permission_settings_url, None);
     }
 
     #[test]

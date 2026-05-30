@@ -6,7 +6,9 @@ import {
   clearCommandHistory,
   clearInputHistory,
   executeAction,
+  globalHotkeyStatus,
   indexStatus,
+  listenGlobalHotkeyStatus,
   listenOpenSettings,
   loadConfig,
   recentInputHistory,
@@ -55,6 +57,7 @@ describe("tauriClient", () => {
 
     await refreshIndex();
     await indexStatus();
+    await globalHotkeyStatus();
     await loadConfig();
     await saveConfig(config);
     await clearCommandHistory();
@@ -64,14 +67,15 @@ describe("tauriClient", () => {
 
     expect(invokeMock).toHaveBeenNthCalledWith(1, "refresh_index");
     expect(invokeMock).toHaveBeenNthCalledWith(2, "index_status");
-    expect(invokeMock).toHaveBeenNthCalledWith(3, "load_config");
-    expect(invokeMock).toHaveBeenNthCalledWith(4, "save_config", { config });
-    expect(invokeMock).toHaveBeenNthCalledWith(5, "clear_command_history");
-    expect(invokeMock).toHaveBeenNthCalledWith(6, "record_input_history", {
+    expect(invokeMock).toHaveBeenNthCalledWith(3, "global_hotkey_status");
+    expect(invokeMock).toHaveBeenNthCalledWith(4, "load_config");
+    expect(invokeMock).toHaveBeenNthCalledWith(5, "save_config", { config });
+    expect(invokeMock).toHaveBeenNthCalledWith(6, "clear_command_history");
+    expect(invokeMock).toHaveBeenNthCalledWith(7, "record_input_history", {
       input: "g 1234",
     });
-    expect(invokeMock).toHaveBeenNthCalledWith(7, "recent_input_history");
-    expect(invokeMock).toHaveBeenNthCalledWith(8, "clear_input_history");
+    expect(invokeMock).toHaveBeenNthCalledWith(8, "recent_input_history");
+    expect(invokeMock).toHaveBeenNthCalledWith(9, "clear_input_history");
   });
 
   it("listens for the tray settings event", async () => {
@@ -82,5 +86,18 @@ describe("tauriClient", () => {
     await listenOpenSettings(handler);
 
     expect(listenMock).toHaveBeenCalledWith("quickfox://open-settings", handler);
+  });
+
+  it("listens for global hotkey status events", async () => {
+    const handler = vi.fn();
+    const unlisten = vi.fn();
+    listenMock.mockResolvedValueOnce(unlisten);
+
+    await listenGlobalHotkeyStatus(handler);
+
+    expect(listenMock).toHaveBeenCalledWith(
+      "quickfox://global-hotkey-status",
+      expect.any(Function),
+    );
   });
 });

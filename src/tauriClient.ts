@@ -6,7 +6,11 @@ export type FrontendAction =
   | { type: "openContainingFolder"; path: string }
   | { type: "copyText"; text: string }
   | { type: "openUrl"; url: string }
-  | { type: "openWithApplication"; path: string; application: "developmentTool" }
+  | {
+      type: "openWithApplication";
+      path: string;
+      application: "developmentTool" | "systemChooser";
+    }
   | { type: "executeCommand"; command: string; requiresConfirmation: boolean };
 
 export function search(query: string) {
@@ -23,6 +27,14 @@ export function refreshIndex() {
 
 export function indexStatus() {
   return invoke("index_status");
+}
+
+export function appPaths() {
+  return invoke("app_paths");
+}
+
+export function globalHotkeyStatus() {
+  return invoke("global_hotkey_status");
 }
 
 export function loadConfig() {
@@ -51,6 +63,12 @@ export function clearInputHistory() {
 
 export function listenOpenSettings(handler: () => void) {
   return listen("quickfox://open-settings", handler);
+}
+
+export function listenGlobalHotkeyStatus(handler: (status: GlobalHotkeyStatus) => void) {
+  return listen<GlobalHotkeyStatus>("quickfox://global-hotkey-status", (event) =>
+    handler(event.payload),
+  );
 }
 
 export type QuickFoxConfig = {
@@ -89,4 +107,15 @@ export type IndexStatus = {
   message?: string | null;
   generation: number;
   completedAtMs?: number | null;
+};
+
+export type AppPaths = {
+  configFilePath?: string | null;
+  indexSnapshotPath?: string | null;
+};
+
+export type GlobalHotkeyStatus = {
+  enabled: boolean;
+  message: string;
+  permissionSettingsUrl?: string | null;
 };
