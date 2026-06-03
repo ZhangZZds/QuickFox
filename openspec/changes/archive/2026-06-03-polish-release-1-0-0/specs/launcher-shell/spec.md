@@ -1,6 +1,6 @@
 ## MODIFIED Requirements
 
-### Requirement: Launcher Keyboard Navigation
+### Requirement: 键盘优先结果导航
 
 The launcher SHALL separate result navigation from input history browsing.
 
@@ -33,6 +33,8 @@ The launcher SHALL separate result navigation from input history browsing.
 - **AND** the user presses Escape
 - **THEN** QuickFox SHALL hide the history list
 - **AND** keep the launcher open
+
+## ADDED Requirements
 
 ### Requirement: Launcher Icon
 

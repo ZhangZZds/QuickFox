@@ -1,6 +1,6 @@
 ## MODIFIED Requirements
 
-### Requirement: Web Search Prefixes
+### Requirement: 网页搜索 Provider
 
 Configured web search prefixes SHALL be executable from the launcher.
 

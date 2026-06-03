@@ -96,3 +96,19 @@ TBD - created by archiving change build-quickfox-launcher. Update Purpose after 
 
 - **WHEN** 维护者执行 Linux 手工验收
 - **THEN** 文档要求验证托盘、窗口唤醒、终端 fallback 和后台索引状态
+
+### Requirement: 发布打包
+
+QuickFox SHALL 为 1.0.0 及后续版本提供由 tag 触发的 GitHub Release workflow。
+
+#### Scenario: Tag 创建 macOS 和 Windows 发布资产
+
+- **WHEN** 推送 `v1.0.0` tag
+- **THEN** GitHub Actions 构建 macOS 和 Windows Tauri bundle
+- **AND** 将生成的安装器产物上传到 GitHub Release
+
+#### Scenario: 普通 CI 只做验证
+
+- **WHEN** 分支 push 或 pull request 触发普通 CI
+- **THEN** CI 运行检查和测试
+- **AND** 不发布 release 资产

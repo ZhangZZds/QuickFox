@@ -59,5 +59,5 @@
 - [x] 8.2 运行 `npm run rust:test`
 - [x] 8.3 运行 `npm run check`
 - [x] 8.4 运行 `openspec validate fix-launcher-manual-qa-bugs --strict`
-- [ ] 8.5 在 macOS 执行手工验收并记录结果
+- [x] 8.5 在 macOS 执行手工验收并记录结果
 - [x] 8.6 更新 Windows/Linux 手工验收清单，标出需要真实机器确认的行为

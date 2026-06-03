@@ -9,7 +9,8 @@ TBD - created by archiving change build-quickfox-launcher. Update Purpose after 
 ### Requirement: 默认索引用户主目录
 
 系统 SHALL 默认索引当前用户的主目录或 profile 目录，并只索引文件名、目录
-名和完整路径。
+名和完整路径；系统 MUST 默认排除应用包内部、构建产物、缓存目录和系统隐藏
+噪音目录。
 
 #### Scenario: 首次启动创建默认索引范围
 
@@ -20,6 +21,21 @@ TBD - created by archiving change build-quickfox-launcher. Update Purpose after 
 
 - **WHEN** 系统刷新索引
 - **THEN** 系统记录文件名、目录名和完整路径，但不读取文件内容
+
+#### Scenario: macOS 应用包内部不进入普通索引
+
+- **WHEN** 系统扫描 macOS `.app` 应用包
+- **THEN** 系统将 `.app` 作为应用结果索引，并跳过 `.app/Contents` 内部文件
+
+#### Scenario: Windows 应用入口作为应用结果
+
+- **WHEN** 系统扫描 Windows `.exe` 或开始菜单 `.lnk` 入口
+- **THEN** 系统将其作为应用结果索引
+
+#### Scenario: Linux desktop 文件作为应用结果
+
+- **WHEN** 系统扫描 Linux `.desktop` 文件
+- **THEN** 系统将其作为应用结果索引
 
 ### Requirement: 可配置索引包含和排除规则
 
@@ -37,12 +53,18 @@ TBD - created by archiving change build-quickfox-launcher. Update Purpose after 
 
 ### Requirement: 手动刷新索引
 
-系统 SHALL 提供手动刷新索引能力，在后台执行刷新，并在部分目录失败时继续处理其他可用目录。
+系统 SHALL 提供手动刷新和增量刷新索引能力，并在部分目录失败时继续处理
+其他可用目录。
 
 #### Scenario: 手动刷新更新结果
 
 - **WHEN** 用户触发手动刷新索引
-- **THEN** 系统在后台重新扫描配置范围，并在刷新完成后更新后续搜索结果
+- **THEN** 系统重新扫描配置范围并更新后续搜索结果
+
+#### Scenario: 增量刷新更新变化路径
+
+- **WHEN** 用户触发增量刷新索引且文件系统中存在新增、删除或修改的路径
+- **THEN** 系统更新受影响路径的索引状态并保留未变化路径的历史信号
 
 #### Scenario: 部分目录失败不阻塞索引
 
@@ -51,12 +73,18 @@ TBD - created by archiving change build-quickfox-launcher. Update Purpose after 
 
 ### Requirement: 默认模糊搜索
 
-系统 SHALL 对普通查询使用模糊搜索，并返回文件/目录名称和路径匹配的结果。
+系统 SHALL 对普通查询使用有最低相关性阈值的模糊搜索，并返回文件、目录或
+应用名称和路径匹配的结果。
 
 #### Scenario: 普通输入匹配路径结果
 
 - **WHEN** 用户输入不带特殊前缀的查询文本
-- **THEN** 系统返回名称或路径与查询模糊匹配的文件/目录结果
+- **THEN** 系统返回名称或路径与查询模糊匹配且达到最低相关性阈值的结果
+
+#### Scenario: 不存在查询不返回明显无关结果
+
+- **WHEN** 用户输入 `Openspec_123` 且索引中没有相关文件、目录或应用
+- **THEN** 系统不返回 PyCharm 内部资源或其他明显无关路径
 
 ### Requirement: 显式正则搜索
 
@@ -74,11 +102,17 @@ TBD - created by archiving change build-quickfox-launcher. Update Purpose after 
 
 ### Requirement: 搜索排序受历史影响
 
-系统 SHALL 在排序时结合匹配质量、路径信号和文件/目录使用历史。
+系统 SHALL 在排序时结合结果类型优先级、匹配质量、路径信号和文件/目录/
+应用使用历史。
+
+#### Scenario: 应用结果优先于文件和目录
+
+- **WHEN** 应用、文件和目录结果的匹配质量相近
+- **THEN** 系统按应用程序、文件、目录的顺序排序
 
 #### Scenario: 最近打开结果排序提升
 
-- **WHEN** 两个结果匹配质量相近且其中一个最近被打开过
+- **WHEN** 两个同类型结果匹配质量相近且其中一个最近被打开过
 - **THEN** 最近打开过的结果排序更靠前
 
 ### Requirement: 后台构建索引
@@ -136,3 +170,36 @@ TBD - created by archiving change build-quickfox-launcher. Update Purpose after 
 
 - **WHEN** 大量文件匹配同一查询
 - **THEN** 系统只构造和排序受配置上限约束的候选结果，避免无界结果分配
+
+### Requirement: 设置页显示索引存储位置
+
+系统 SHALL 在设置页显示文件索引快照的本地存储路径，并展示完整索引状态信息。
+
+#### Scenario: 索引快照路径可见
+
+- **WHEN** 用户打开设置页索引分区
+- **THEN** 系统显示当前索引快照文件位置
+
+#### Scenario: 索引状态信息完整
+
+- **WHEN** 用户打开设置页索引分区
+- **THEN** 系统显示索引状态、条目数量、最近完成时间或失败摘要中的可用信息
+
+### Requirement: 普通搜索避免路径父级噪音
+
+系统 SHALL 避免普通搜索仅因父级路径中间字符片段命中而返回无关子文件。
+
+#### Scenario: 父级路径中间片段不带出无关文件
+
+- **WHEN** 用户搜索 `Test` 且某个文件名不包含 `test`，仅父级路径 `ComputeStates` 中间包含 `test`
+- **THEN** 系统不返回该文件
+
+#### Scenario: 路径段前缀和紧凑缩写仍可命中
+
+- **WHEN** 用户搜索路径段前缀或紧凑缩写，例如 `quickfox` 或 `qfx`
+- **THEN** 系统仍可返回该路径段下的相关结果
+
+#### Scenario: 完整路径精确查询命中
+
+- **WHEN** 用户输入一个完整文件路径
+- **THEN** 系统返回该路径对应的结果
