@@ -45,6 +45,12 @@ struct QuickFoxAppState {
     global_hotkey_status: Mutex<GlobalHotkeyStatus>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrayWindowTarget {
+    Launcher,
+    Settings,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AppPaths {
@@ -113,6 +119,22 @@ fn toggle_launcher_window(
     state: tauri::State<QuickFoxAppState>,
 ) -> Result<&'static str, String> {
     toggle_launcher_window_for_app(&app, &state)?;
+    Ok("completed")
+}
+
+#[tauri::command]
+fn open_settings_window(app: tauri::AppHandle) -> Result<&'static str, String> {
+    show_settings_window(&app);
+    Ok("completed")
+}
+
+#[tauri::command]
+fn return_to_launcher_window(
+    app: tauri::AppHandle,
+    state: tauri::State<QuickFoxAppState>,
+) -> Result<&'static str, String> {
+    show_main_window(&app, &state);
+    hide_settings_window(&app);
     Ok("completed")
 }
 
@@ -526,7 +548,14 @@ fn start_background_index_refresh<R: tauri::Runtime>(
                     let app_for_state = app_for_update.clone();
                     app_for_update.run_on_main_thread(move || {
                         let state = app_for_state.state::<QuickFoxAppState>();
-                        apply_completed_index_refresh(&state, generation, report, completed_at_ms);
+                        if let Some(status) = apply_completed_index_refresh(
+                            &state,
+                            generation,
+                            report,
+                            completed_at_ms,
+                        ) {
+                            let _ = app_for_state.emit("quickfox://index-status", status);
+                        }
                     })
                 }
                 Err(error) => {
@@ -534,7 +563,11 @@ fn start_background_index_refresh<R: tauri::Runtime>(
                     let app_for_state = app_for_update.clone();
                     app_for_update.run_on_main_thread(move || {
                         let state = app_for_state.state::<QuickFoxAppState>();
-                        apply_failed_index_refresh(&state, generation, message);
+                        if let Some(status) =
+                            apply_failed_index_refresh(&state, generation, message)
+                        {
+                            let _ = app_for_state.emit("quickfox://index-status", status);
+                        }
                     })
                 }
             };
@@ -552,7 +585,7 @@ fn apply_completed_index_refresh(
     generation: u64,
     report: IndexReport,
     completed_at_ms: i64,
-) -> bool {
+) -> Option<IndexStatus> {
     let mut runtime = state
         .runtime
         .lock()
@@ -561,19 +594,27 @@ fn apply_completed_index_refresh(
         .index_lifecycle
         .complete_refresh(generation, report.entries.len(), completed_at_ms)
     {
-        return false;
+        return None;
     }
     runtime.index = SearchIndex::from_entries(report.entries.clone());
     runtime.last_report = report;
-    true
+    Some(runtime.index_status())
 }
 
-fn apply_failed_index_refresh(state: &QuickFoxAppState, generation: u64, message: String) -> bool {
+fn apply_failed_index_refresh(
+    state: &QuickFoxAppState,
+    generation: u64,
+    message: String,
+) -> Option<IndexStatus> {
     let mut runtime = state
         .runtime
         .lock()
         .expect("quickfox runtime lock poisoned");
-    runtime.index_lifecycle.fail_refresh(generation, message)
+    if runtime.index_lifecycle.fail_refresh(generation, message) {
+        Some(runtime.index_status())
+    } else {
+        None
+    }
 }
 
 fn build_runtime() -> QuickFoxRuntime {
@@ -870,6 +911,28 @@ fn show_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>, state: &QuickF
     apply_launcher_window_effect(app, effect);
 }
 
+fn show_settings_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    if let Some(window) = app.get_webview_window("settings") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
+fn hide_settings_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    if let Some(window) = app.get_webview_window("settings") {
+        let _ = window.hide();
+    }
+}
+
+fn tray_window_target(menu_id: &str) -> Option<TrayWindowTarget> {
+    match menu_id {
+        "show" => Some(TrayWindowTarget::Launcher),
+        "settings" => Some(TrayWindowTarget::Settings),
+        _ => None,
+    }
+}
+
 fn apply_launcher_window_effect<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     effect: LauncherWindowEffect,
@@ -1011,15 +1074,22 @@ pub fn run() {
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id().as_ref() {
-                    "show" => {
-                        let state = app.state::<QuickFoxAppState>();
-                        show_main_window(app, &state);
-                    }
-                    "settings" => {
-                        let state = app.state::<QuickFoxAppState>();
-                        show_main_window(app, &state);
-                        let _ = app.emit_to("main", "quickfox://open-settings", ());
-                    }
+                    "show" => match tray_window_target("show") {
+                        Some(TrayWindowTarget::Launcher) => {
+                            let state = app.state::<QuickFoxAppState>();
+                            show_main_window(app, &state);
+                        }
+                        Some(TrayWindowTarget::Settings) => show_settings_window(app),
+                        None => {}
+                    },
+                    "settings" => match tray_window_target("settings") {
+                        Some(TrayWindowTarget::Launcher) => {
+                            let state = app.state::<QuickFoxAppState>();
+                            show_main_window(app, &state);
+                        }
+                        Some(TrayWindowTarget::Settings) => show_settings_window(app),
+                        None => {}
+                    },
                     "quit" => app.exit(0),
                     _ => {}
                 })
@@ -1034,6 +1104,8 @@ pub fn run() {
             health_check,
             index_status,
             toggle_launcher_window,
+            open_settings_window,
+            return_to_launcher_window,
             search,
             execute_action,
             refresh_index,
@@ -1096,6 +1168,40 @@ mod tests {
     }
 
     #[test]
+    fn tauri_config_separates_launcher_and_settings_window_shapes() {
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).expect("valid tauri config");
+        let windows = config["app"]["windows"]
+            .as_array()
+            .expect("tauri windows array");
+        let launcher_window = windows
+            .iter()
+            .find(|window| window["label"] == "main")
+            .expect("launcher window config");
+        let settings_window = windows
+            .iter()
+            .find(|window| window["label"] == "settings")
+            .expect("settings window config");
+
+        assert_eq!(launcher_window["decorations"], false);
+        assert_eq!(launcher_window["resizable"], false);
+        assert_eq!(launcher_window["transparent"], true);
+        assert_eq!(settings_window["decorations"], true);
+        assert_eq!(settings_window["resizable"], true);
+        assert_eq!(settings_window["transparent"], false);
+    }
+
+    #[test]
+    fn tray_menu_routes_show_and_settings_to_separate_windows() {
+        assert_eq!(tray_window_target("show"), Some(TrayWindowTarget::Launcher));
+        assert_eq!(
+            tray_window_target("settings"),
+            Some(TrayWindowTarget::Settings)
+        );
+        assert_eq!(tray_window_target("quit"), None);
+    }
+
+    #[test]
     fn runtime_reports_current_index_status() {
         let runtime = QuickFoxRuntime {
             config: QuickFoxConfig::default_with_index_dirs(vec!["/tmp".to_owned()]),
@@ -1130,6 +1236,67 @@ mod tests {
         );
         assert_eq!(runtime.index_status().entry_count, 1);
         assert_eq!(runtime.index.entries()[0].name, "notes.md");
+    }
+
+    #[test]
+    fn completed_index_refresh_returns_status_for_frontend_event() {
+        let state = QuickFoxAppState {
+            runtime: Mutex::new(QuickFoxRuntime {
+                config: QuickFoxConfig::default_with_index_dirs(vec!["/tmp".to_owned()]),
+                index: SearchIndex::default(),
+                last_report: IndexReport::default(),
+                index_lifecycle: IndexLifecycle::default(),
+            }),
+            window_state: Mutex::new(LauncherWindowState::default()),
+            global_hotkey_status: Mutex::new(pending_global_hotkey_status()),
+        };
+        let generation = {
+            let mut runtime = state.runtime.lock().unwrap();
+            runtime.index_lifecycle.start_refresh(false)
+        };
+
+        let status = apply_completed_index_refresh(
+            &state,
+            generation,
+            IndexReport {
+                entries: vec![crate::core::index::IndexedEntry {
+                    path: "/tmp/notes.md".to_owned(),
+                    name: "notes.md".to_owned(),
+                    kind: crate::core::index::IndexedEntryKind::File,
+                }],
+                failures: Vec::new(),
+            },
+            123,
+        )
+        .expect("fresh completion emits status");
+
+        assert_eq!(status.kind, crate::core::index::IndexStatusKind::Ready);
+        assert_eq!(status.entry_count, 1);
+        assert_eq!(status.completed_at_ms, Some(123));
+    }
+
+    #[test]
+    fn failed_index_refresh_returns_status_for_frontend_event() {
+        let state = QuickFoxAppState {
+            runtime: Mutex::new(QuickFoxRuntime {
+                config: QuickFoxConfig::default_with_index_dirs(vec!["/tmp".to_owned()]),
+                index: SearchIndex::default(),
+                last_report: IndexReport::default(),
+                index_lifecycle: IndexLifecycle::default(),
+            }),
+            window_state: Mutex::new(LauncherWindowState::default()),
+            global_hotkey_status: Mutex::new(pending_global_hotkey_status()),
+        };
+        let generation = {
+            let mut runtime = state.runtime.lock().unwrap();
+            runtime.index_lifecycle.start_refresh(false)
+        };
+
+        let status = apply_failed_index_refresh(&state, generation, "权限不足".to_owned())
+            .expect("fresh failure emits status");
+
+        assert_eq!(status.kind, crate::core::index::IndexStatusKind::Failed);
+        assert_eq!(status.message.as_deref(), Some("权限不足"));
     }
 
     #[test]

@@ -38,6 +38,21 @@ jobs:
       - name: Install npm dependencies
         run: npm ci
 
+      - name: Load release notes
+        id: release_notes
+        shell: bash
+        run: |
+          NOTES_FILE="releases/${GITHUB_REF_NAME}/RELEASE_NOTES.md"
+          if [ -f "$NOTES_FILE" ]; then
+            {
+              echo "body<<EOF"
+              cat "$NOTES_FILE"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "body=QuickFox desktop release." >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build and upload Tauri release
         uses: tauri-apps/tauri-action@v0
         env:
@@ -45,7 +60,7 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "QuickFox ${{ github.ref_name }}"
-          releaseBody: "QuickFox desktop release."
+          releaseBody: ${{ steps.release_notes.outputs.body }}
           releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}

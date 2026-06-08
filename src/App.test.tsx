@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { App } from "./App";
@@ -7,12 +7,15 @@ import {
   executeAction,
   globalHotkeyStatus,
   listenGlobalHotkeyStatus,
+  listenIndexStatus,
   indexStatus,
   listenOpenSettings,
   loadConfig,
+  openSettingsWindow,
   recentInputHistory,
   recordInputHistory,
   refreshIndex,
+  returnToLauncherWindow,
   saveConfig,
   search,
 } from "./tauriClient";
@@ -22,12 +25,15 @@ vi.mock("./tauriClient", () => ({
   executeAction: vi.fn(),
   globalHotkeyStatus: vi.fn(),
   listenGlobalHotkeyStatus: vi.fn(),
+  listenIndexStatus: vi.fn(),
   indexStatus: vi.fn(),
   listenOpenSettings: vi.fn(),
   loadConfig: vi.fn(),
+  openSettingsWindow: vi.fn(),
   recentInputHistory: vi.fn(),
   recordInputHistory: vi.fn(),
   refreshIndex: vi.fn(),
+  returnToLauncherWindow: vi.fn(),
   saveConfig: vi.fn(),
   search: vi.fn(),
 }));
@@ -70,6 +76,19 @@ const webResults = [
     provider: "web-search",
     score: 800,
     mainAction: { type: "openUrl", url: "https://www.google.com/search?q=1234" },
+    secondaryActions: [],
+  },
+];
+
+const calculatorResults = [
+  {
+    id: "calculator:2+2",
+    title: "2 + 2 = 4",
+    detail: "按 Enter 复制结果",
+    kind: "calculator",
+    provider: "calculator",
+    score: 950,
+    mainAction: { type: "copyText", text: "4" },
     secondaryActions: [],
   },
 ];
@@ -192,12 +211,15 @@ describe("App", () => {
     vi.mocked(executeAction).mockReset();
     vi.mocked(globalHotkeyStatus).mockReset();
     vi.mocked(listenGlobalHotkeyStatus).mockReset();
+    vi.mocked(listenIndexStatus).mockReset();
     vi.mocked(indexStatus).mockReset();
     vi.mocked(listenOpenSettings).mockReset();
     vi.mocked(loadConfig).mockReset();
+    vi.mocked(openSettingsWindow).mockReset();
     vi.mocked(recentInputHistory).mockReset();
     vi.mocked(recordInputHistory).mockReset();
     vi.mocked(refreshIndex).mockReset();
+    vi.mocked(returnToLauncherWindow).mockReset();
     vi.mocked(saveConfig).mockReset();
     vi.mocked(search).mockResolvedValue([]);
     vi.mocked(appPaths).mockResolvedValue({
@@ -210,8 +232,10 @@ describe("App", () => {
       permissionSettingsUrl: null,
     });
     vi.mocked(listenGlobalHotkeyStatus).mockResolvedValue(() => undefined);
+    vi.mocked(listenIndexStatus).mockResolvedValue(() => undefined);
     vi.mocked(listenOpenSettings).mockResolvedValue(() => undefined);
     vi.mocked(loadConfig).mockResolvedValue(appConfig);
+    vi.mocked(openSettingsWindow).mockResolvedValue("completed");
     vi.mocked(indexStatus).mockResolvedValue({
       kind: "ready",
       entryCount: 12,
@@ -221,6 +245,7 @@ describe("App", () => {
     });
     vi.mocked(recentInputHistory).mockResolvedValue([]);
     vi.mocked(refreshIndex).mockResolvedValue({ entries: [], failures: [] });
+    vi.mocked(returnToLauncherWindow).mockResolvedValue("completed");
     vi.mocked(recordInputHistory).mockResolvedValue("recorded");
     vi.mocked(saveConfig).mockResolvedValue("saved");
   });
@@ -236,6 +261,15 @@ describe("App", () => {
     render(<App />);
 
     expect(screen.queryAllByRole("option")).toHaveLength(0);
+    expect(screen.queryByRole("region", { name: "启动器状态" })).not.toBeInTheDocument();
+  });
+
+  it("uses localized placeholder text with compact syntax hints for empty input", () => {
+    render(<App />);
+
+    expect(
+      screen.getByPlaceholderText("搜索文件、文件夹、计算器；g 关键词搜网页，re: 正则，> 命令"),
+    ).toBeInTheDocument();
   });
 
   it("renders search results returned by the Tauri search command and marks the first item", async () => {
@@ -252,6 +286,7 @@ describe("App", () => {
       "aria-selected",
       "true",
     );
+    expect(screen.queryByRole("region", { name: "启动器状态" })).not.toBeInTheDocument();
   });
 
   it("shows empty-state feedback when a non-empty query returns no results", async () => {
@@ -264,6 +299,29 @@ describe("App", () => {
     });
 
     expect(await screen.findByText("未找到结果")).toBeInTheDocument();
+    expect(screen.queryByText(/文件索引/)).not.toBeInTheDocument();
+  });
+
+  it("shows first-run index preparation feedback with recovery actions", async () => {
+    vi.mocked(indexStatus).mockResolvedValueOnce({
+      kind: "unbuilt",
+      entryCount: 0,
+      message: null,
+      generation: 0,
+      completedAtMs: null,
+    });
+    vi.mocked(search).mockResolvedValueOnce([]);
+
+    render(<App />);
+    fireEvent.change(screen.getByLabelText("搜索文件、目录、计算器、网页搜索或命令"), {
+      target: { value: "notes" },
+    });
+
+    const status = await screen.findByRole("region", { name: "启动器状态" });
+    expect(status).toHaveTextContent("文件搜索正在准备");
+    expect(status).toHaveTextContent("计算器和网页搜索仍可使用");
+    expect(within(status).getByRole("button", { name: "刷新索引" })).toBeInTheDocument();
+    expect(within(status).getByRole("button", { name: "打开设置" })).toBeInTheDocument();
   });
 
   it("shows index-building feedback without hiding other search behavior", async () => {
@@ -281,7 +339,145 @@ describe("App", () => {
       target: { value: "notes" },
     });
 
+    const status = await screen.findByRole("region", { name: "启动器状态" });
+    expect(status).toHaveTextContent("文件索引正在建立");
+    expect(status).toHaveTextContent("计算器和网页搜索仍可使用");
+  });
+
+  it("shows failed index feedback with retry and settings recovery actions", async () => {
+    vi.mocked(indexStatus).mockResolvedValueOnce({
+      kind: "failed",
+      entryCount: 0,
+      message: "权限不足，无法扫描目录",
+      generation: 3,
+      completedAtMs: null,
+    });
+    vi.mocked(search).mockResolvedValueOnce([]);
+
+    render(<App />);
+    fireEvent.change(screen.getByLabelText("搜索文件、目录、计算器、网页搜索或命令"), {
+      target: { value: "notes" },
+    });
+
+    const status = await screen.findByRole("region", { name: "启动器状态" });
+    expect(status).toHaveTextContent("文件索引构建失败");
+    expect(status).toHaveTextContent("权限不足，无法扫描目录");
+    fireEvent.click(within(status).getByRole("button", { name: "刷新索引" }));
+    expect(refreshIndex).toHaveBeenCalledOnce();
+
+    fireEvent.click(within(status).getByRole("button", { name: "打开设置" }));
+    expect(openSettingsWindow).toHaveBeenCalledOnce();
+    expect(screen.queryByRole("form", { name: "设置" })).not.toBeInTheDocument();
+  });
+
+  it("reloads index status after the launcher recovery refresh action", async () => {
+    vi.mocked(indexStatus)
+      .mockResolvedValueOnce({
+        kind: "failed",
+        entryCount: 0,
+        message: "权限不足，无法扫描目录",
+        generation: 3,
+        completedAtMs: null,
+      })
+      .mockResolvedValueOnce({
+        kind: "ready",
+        entryCount: 18,
+        message: "索引完成",
+        generation: 4,
+        completedAtMs: 200,
+      });
+    vi.mocked(search).mockResolvedValue([]);
+
+    render(<App />);
+    fireEvent.change(screen.getByLabelText("搜索文件、目录、计算器、网页搜索或命令"), {
+      target: { value: "notes" },
+    });
+    const status = await screen.findByRole("region", { name: "启动器状态" });
+
+    fireEvent.click(within(status).getByRole("button", { name: "刷新索引" }));
+
+    await waitFor(() => expect(indexStatus).toHaveBeenCalledTimes(2));
+    expect(await screen.findByText("未找到结果")).toBeInTheDocument();
+    expect(screen.queryByText("文件索引构建失败")).not.toBeInTheDocument();
+  });
+
+  it("refreshes the current query when an index status event reports ready", async () => {
+    let indexStatusHandler:
+      | ((status: {
+          kind: "ready";
+          entryCount: number;
+          message: string | null;
+          generation: number;
+          completedAtMs: number;
+        }) => void)
+      | undefined;
+    vi.mocked(indexStatus).mockResolvedValueOnce({
+      kind: "building",
+      entryCount: 0,
+      message: null,
+      generation: 2,
+      completedAtMs: null,
+    });
+    vi.mocked(listenIndexStatus).mockImplementation(async (handler) => {
+      indexStatusHandler = handler as typeof indexStatusHandler;
+      return () => undefined;
+    });
+    vi.mocked(search).mockResolvedValueOnce([]).mockResolvedValueOnce(fileResults);
+
+    render(<App />);
+    fireEvent.change(screen.getByLabelText("搜索文件、目录、计算器、网页搜索或命令"), {
+      target: { value: "doc" },
+    });
     expect(await screen.findByText("文件索引正在建立")).toBeInTheDocument();
+
+    indexStatusHandler?.({
+      kind: "ready",
+      entryCount: 12,
+      message: null,
+      generation: 3,
+      completedAtMs: 300,
+    });
+
+    expect(await screen.findByRole("option", { name: /Documents/ })).toBeInTheDocument();
+    expect(search).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps web search results visible when the file index is unavailable", async () => {
+    vi.mocked(indexStatus).mockResolvedValueOnce({
+      kind: "unbuilt",
+      entryCount: 0,
+      message: null,
+      generation: 0,
+      completedAtMs: null,
+    });
+    vi.mocked(search).mockResolvedValueOnce(webResults);
+
+    render(<App />);
+    fireEvent.change(screen.getByLabelText("搜索文件、目录、计算器、网页搜索或命令"), {
+      target: { value: "g 1234" },
+    });
+
+    expect(await screen.findByRole("option", { name: /Google: 1234/ })).toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "启动器状态" })).not.toBeInTheDocument();
+  });
+
+  it("keeps calculator results visible when the file index is unavailable", async () => {
+    vi.mocked(indexStatus).mockResolvedValueOnce({
+      kind: "unbuilt",
+      entryCount: 0,
+      message: null,
+      generation: 0,
+      completedAtMs: null,
+    });
+    vi.mocked(search).mockResolvedValueOnce(calculatorResults);
+
+    render(<App />);
+    fireEvent.change(screen.getByLabelText("搜索文件、目录、计算器、网页搜索或命令"), {
+      target: { value: "2 + 2" },
+    });
+
+    expect(await screen.findByRole("option", { name: /2 \+ 2 = 4/ })).toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "启动器状态" })).not.toBeInTheDocument();
   });
 
   it("moves selection with arrow keys and executes the selected primary action with Enter", async () => {
@@ -594,6 +790,40 @@ describe("App", () => {
     expect(await screen.findByRole("form", { name: "设置" })).toBeInTheDocument();
   });
 
+  it("opens the settings window from launcher recovery instead of rendering settings in-place", async () => {
+    vi.mocked(indexStatus).mockResolvedValueOnce({
+      kind: "failed",
+      entryCount: 0,
+      message: "权限不足，无法扫描目录",
+      generation: 3,
+      completedAtMs: null,
+    });
+    vi.mocked(search).mockResolvedValueOnce([]);
+
+    render(<App />);
+    fireEvent.change(screen.getByLabelText("搜索文件、目录、计算器、网页搜索或命令"), {
+      target: { value: "notes" },
+    });
+
+    const status = await screen.findByRole("region", { name: "启动器状态" });
+    fireEvent.click(within(status).getByRole("button", { name: "打开设置" }));
+
+    expect(openSettingsWindow).toHaveBeenCalledOnce();
+    expect(screen.queryByRole("form", { name: "设置" })).not.toBeInTheDocument();
+  });
+
+  it("returns from the settings window through the launcher window command", async () => {
+    render(<App initialView="settings" />);
+
+    fireEvent.click(screen.getByRole("button", { name: "返回搜索" }));
+
+    expect(returnToLauncherWindow).toHaveBeenCalledOnce();
+    expect(screen.getByRole("form", { name: "设置" })).toBeInTheDocument();
+    expect(
+      screen.queryByLabelText("搜索文件、目录、计算器、网页搜索或命令"),
+    ).not.toBeInTheDocument();
+  });
+
   it("saves updated command settings through the Tauri config command", async () => {
     render(<App initialView="settings" />);
     await screen.findByDisplayValue("/tmp");
@@ -646,7 +876,7 @@ describe("App", () => {
 
     const contentRegion = screen.getByRole("region", { name: "设置内容" });
     expect(contentRegion).toHaveClass("settings-content");
-    expect(contentRegion).toContainElement(screen.getByRole("group", { name: "搜索与索引" }));
+    expect(contentRegion).toContainElement(screen.getByRole("group", { name: "索引" }));
 
     fireEvent.click(screen.getByRole("tab", { name: "外观" }));
 
@@ -693,16 +923,53 @@ describe("App", () => {
     expect(screen.getByText("240 项")).toBeInTheDocument();
     expect(screen.getByText("第 7 代")).toBeInTheDocument();
     expect(screen.getByText(/最近完成:/)).toBeInTheDocument();
-    expect(screen.getByText("索引完成")).toBeInTheDocument();
+    expect(screen.getAllByText("索引完成").length).toBeGreaterThan(0);
+  });
+
+  it("shows the index settings as a layered workspace", async () => {
+    render(<App initialView="settings" />);
+    await screen.findByDisplayValue("/tmp");
+
+    const indexSection = screen.getByRole("group", { name: "索引" });
+    expect(within(indexSection).getByRole("region", { name: "索引状态摘要" })).toBeInTheDocument();
+    expect(within(indexSection).getByRole("region", { name: "主规则编辑" })).toBeInTheDocument();
+    expect(within(indexSection).getByRole("region", { name: "辅助信息" })).toBeInTheDocument();
+  });
+
+  it("keeps regex prefix and maintenance paths in the index auxiliary column", async () => {
+    render(<App initialView="settings" />);
+    await screen.findByDisplayValue("/tmp");
+
+    const auxiliaryColumn = screen.getByRole("region", { name: "辅助信息" });
+    expect(auxiliaryColumn).toContainElement(screen.getByLabelText("正则前缀"));
+    expect(auxiliaryColumn).toContainElement(screen.getByText("配置文件位置"));
+    expect(auxiliaryColumn).toContainElement(
+      screen.getByText("/Users/frank/Library/Application Support/QuickFox/config.json"),
+    );
+    expect(auxiliaryColumn).toContainElement(screen.getByText("索引快照位置"));
+    expect(auxiliaryColumn).toContainElement(
+      screen.getByText("/Users/frank/Library/Application Support/QuickFox/index.snapshot.json"),
+    );
+  });
+
+  it("places refresh index in the index workspace header", async () => {
+    render(<App initialView="settings" />);
+
+    const header = await screen.findByRole("region", { name: "索引工作区标题" });
+    fireEvent.click(within(header).getByRole("button", { name: "刷新索引" }));
+
+    expect(refreshIndex).toHaveBeenCalledOnce();
+    expect(await screen.findByText("索引已刷新")).toBeInTheDocument();
   });
 
   it("renders the basic settings view", () => {
     render(<App initialView="settings" />);
 
     expect(screen.getByRole("form", { name: "设置" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "设置" })).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: "索引" })).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: "网页搜索" })).toBeInTheDocument();
-    expect(screen.getByRole("group", { name: "搜索与索引" })).toBeInTheDocument();
+    expect(screen.getByRole("group", { name: "索引" })).toBeInTheDocument();
     expect(screen.getByRole("group", { name: "网页搜索" })).toBeInTheDocument();
     expect(screen.getByRole("group", { name: "历史" })).toBeInTheDocument();
     expect(screen.getByRole("group", { name: "命令执行" })).toBeInTheDocument();

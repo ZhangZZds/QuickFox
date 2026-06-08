@@ -78,7 +78,7 @@ TBD - created by archiving change build-quickfox-launcher. Update Purpose after 
 
 ### Requirement: 图形化管理索引规则
 
-系统 SHALL 允许用户在设置页管理索引包含目录、排除目录和排除模式，并在保存影响索引的配置后触发后台刷新。
+系统 SHALL 允许用户在设置页管理索引包含目录、排除目录和排除模式，并在保存影响索引的配置后触发后台刷新；索引目录、排除目录和排除模式 SHALL 作为索引分区的主规则编辑列展示，不被正则前缀、配置路径或其他辅助信息压缩。
 
 #### Scenario: 保存索引目录触发后台刷新
 
@@ -89,6 +89,11 @@ TBD - created by archiving change build-quickfox-launcher. Update Purpose after 
 
 - **WHEN** 用户新增排除目录或排除模式并保存
 - **THEN** 后续索引刷新跳过匹配的目录或条目
+
+#### Scenario: 主规则编辑优先展示
+
+- **WHEN** 用户打开设置页索引分区
+- **THEN** 索引目录、排除目录和排除模式显示在主规则编辑列中，且正则前缀、配置路径等辅助信息不打断该编辑流程
 
 ### Requirement: 输入历史默认持久化最近 15 条
 
@@ -132,12 +137,17 @@ TBD - created by archiving change build-quickfox-launcher. Update Purpose after 
 
 ### Requirement: 设置页显示配置文件位置
 
-系统 SHALL 在设置页显示当前配置文件的完整路径，便于维护者定位和排查配置问题。
+系统 SHALL 在设置页显示当前配置文件的完整路径，便于维护者定位和排查配置问题；配置文件路径 SHALL 位于索引分区的辅助信息列。
 
 #### Scenario: 配置文件路径可见
 
-- **WHEN** 用户打开设置页的索引或维护信息区域
+- **WHEN** 用户打开设置页的索引分区或辅助信息列
 - **THEN** 系统显示 QuickFox 当前使用的配置文件路径
+
+#### Scenario: 配置文件路径位于辅助信息列
+
+- **WHEN** 用户打开设置页索引分区
+- **THEN** 配置文件路径显示在辅助信息列中，而不是夹在索引目录、排除目录或排除模式字段之间
 
 ### Requirement: 设置页级保存配置
 

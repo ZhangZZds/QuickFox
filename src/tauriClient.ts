@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 
 export type FrontendAction =
   | { type: "openPath"; path: string }
@@ -37,6 +38,22 @@ export function globalHotkeyStatus() {
   return invoke("global_hotkey_status");
 }
 
+export function openSettingsWindow() {
+  return invoke("open_settings_window");
+}
+
+export function returnToLauncherWindow() {
+  return invoke("return_to_launcher_window");
+}
+
+export function currentWindowLabel() {
+  try {
+    return getCurrentWindow().label;
+  } catch {
+    return null;
+  }
+}
+
 export function loadConfig() {
   return invoke("load_config");
 }
@@ -62,13 +79,28 @@ export function clearInputHistory() {
 }
 
 export function listenOpenSettings(handler: () => void) {
-  return listen("quickfox://open-settings", handler);
+  return safeListen("quickfox://open-settings", handler);
 }
 
 export function listenGlobalHotkeyStatus(handler: (status: GlobalHotkeyStatus) => void) {
-  return listen<GlobalHotkeyStatus>("quickfox://global-hotkey-status", (event) =>
+  return safeListen<GlobalHotkeyStatus>("quickfox://global-hotkey-status", (event) =>
     handler(event.payload),
   );
+}
+
+export function listenIndexStatus(handler: (status: IndexStatus) => void) {
+  return safeListen<IndexStatus>("quickfox://index-status", (event) => handler(event.payload));
+}
+
+function safeListen<T>(
+  event: string,
+  handler: Parameters<typeof listen<T>>[1],
+): Promise<() => void> {
+  try {
+    return listen<T>(event, handler).catch(() => () => undefined);
+  } catch {
+    return Promise.resolve(() => undefined);
+  }
 }
 
 export type QuickFoxConfig = {

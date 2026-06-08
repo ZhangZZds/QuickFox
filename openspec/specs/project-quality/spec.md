@@ -97,6 +97,40 @@ TBD - created by archiving change build-quickfox-launcher. Update Purpose after 
 - **WHEN** 维护者执行 Linux 手工验收
 - **THEN** 文档要求验证托盘、窗口唤醒、终端 fallback 和后台索引状态
 
+### Requirement: 启动器视觉可用性验收
+
+系统 SHALL 为快速启动器关键状态提供视觉可用性验收，覆盖单元测试难以发现的真实布局、
+窗口外壳、背景污染、文本溢出和状态可读性问题。
+
+#### Scenario: 启动器首屏截图验收
+
+- **WHEN** 维护者完成启动器首屏相关变更
+- **THEN** 验收记录包含启动器空输入状态截图或等价视觉检查
+- **AND** 该检查确认启动器是紧凑浮层且没有被桌面背景文字或设置页窗口外壳干扰
+
+#### Scenario: 索引异常状态截图验收
+
+- **WHEN** 维护者完成索引未建立、构建中或失败状态相关变更
+- **THEN** 验收记录包含至少一个索引异常状态截图或等价视觉检查
+- **AND** 该检查确认状态文案、恢复动作和输入框没有重叠或溢出
+
+#### Scenario: 有结果状态截图验收
+
+- **WHEN** 维护者完成结果列表相关变更
+- **THEN** 验收记录包含有结果状态截图或等价视觉检查
+- **AND** 该检查确认结果列表紧凑、选中态明显且路径/标题文本可辨认
+
+### Requirement: 本地开发页面降级可观察
+
+系统 SHALL 让维护者在 Vite 浏览器页面中调试前端时能够看到可控降级状态，
+而不是被 Tauri API 初始化错误淹没。
+
+#### Scenario: 浏览器开发环境不产生未处理 Tauri 监听错误
+
+- **WHEN** 维护者通过普通浏览器打开 Vite 开发页面
+- **THEN** 前端不产生未处理的 Tauri event listen 初始化错误
+- **AND** 页面显示可用于布局调试的降级状态或测试数据入口
+
 ### Requirement: 发布打包
 
 QuickFox SHALL 为 1.0.0 及后续版本提供由 tag 触发的 GitHub Release workflow。

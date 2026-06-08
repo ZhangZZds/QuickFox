@@ -6,11 +6,14 @@ import {
   globalHotkeyStatus,
   listenGlobalHotkeyStatus,
   indexStatus,
+  listenIndexStatus,
   loadConfig,
   listenOpenSettings,
+  openSettingsWindow,
   recentInputHistory,
   recordInputHistory,
   refreshIndex,
+  returnToLauncherWindow,
   type AppPaths,
   type GlobalHotkeyStatus,
   type IndexStatus,
@@ -39,6 +42,20 @@ type LauncherResult = {
   primaryAction: LauncherAction;
   secondaryActions: Array<{ label: string; action: LauncherAction }>;
 };
+
+type LauncherStatusFeedback = {
+  title: string;
+  message: string;
+  detail?: string | null;
+  actions: Array<"refreshIndex" | "openSettings">;
+};
+
+type LauncherPresentation =
+  | { mode: "empty" }
+  | { mode: "command" }
+  | { mode: "history" }
+  | { mode: "results" }
+  | { mode: "status"; status: LauncherStatusFeedback };
 
 type BackendSearchResult = {
   id: string;
@@ -89,6 +106,8 @@ const fallbackConfig: QuickFoxConfig = {
     limit: 20,
   },
 };
+
+const launcherInputPlaceholder = "搜索文件、文件夹、计算器；g 关键词搜网页，re: 正则，> 命令";
 
 function labelForAction(action: LauncherAction, resultKind?: BackendSearchResult["kind"]) {
   switch (action.type) {
@@ -174,6 +193,7 @@ export function App({
     generation: 0,
     completedAtMs: null,
   });
+  const [indexSearchRevision, setIndexSearchRevision] = useState(0);
   const [currentAppPaths, setCurrentAppPaths] = useState<AppPaths>({
     configFilePath: null,
     indexSnapshotPath: null,
@@ -199,6 +219,13 @@ export function App({
   const commandText = query.trim().slice(1).trim();
   const selectedResult = results[Math.min(selectedIndex, Math.max(results.length - 1, 0))];
   const menuResult = results.find((result) => result.id === menuResultId);
+  const launcherPresentation = buildLauncherPresentation({
+    historyMode,
+    indexStatus: currentIndexStatus,
+    isCommandMode,
+    query,
+    results,
+  });
 
   useEffect(() => {
     let cancelled = false;
@@ -255,6 +282,20 @@ export function App({
   }, []);
 
   useEffect(() => {
+    let dispose: (() => void) | undefined;
+    void listenIndexStatus((nextStatus) => {
+      setCurrentIndexStatus(nextStatus);
+      setIndexSearchRevision((revision) => revision + 1);
+    }).then((unlisten) => {
+      dispose = unlisten;
+    });
+
+    return () => {
+      dispose?.();
+    };
+  }, []);
+
+  useEffect(() => {
     if (!query.trim() || isCommandQuery) {
       setResults([]);
       return;
@@ -276,7 +317,7 @@ export function App({
     return () => {
       cancelled = true;
     };
-  }, [isCommandQuery, query]);
+  }, [indexSearchRevision, isCommandQuery, query]);
 
   useEffect(() => {
     if (!historyMode && results.length > 0) {
@@ -402,9 +443,27 @@ export function App({
 
   const refreshSearchIndex = async () => {
     setRefreshStatus(null);
-    const nextStatus = (await refreshIndex()) as IndexStatus;
+    await refreshIndex();
+    const nextStatus = (await indexStatus()) as IndexStatus;
     setCurrentIndexStatus(nextStatus);
+    setIndexSearchRevision((revision) => revision + 1);
     setRefreshStatus("索引已刷新");
+  };
+
+  const openSettingsFromLauncher = async () => {
+    try {
+      await openSettingsWindow();
+    } catch {
+      setView("settings");
+    }
+  };
+
+  const returnToLauncherFromSettings = async () => {
+    try {
+      await returnToLauncherWindow();
+    } catch {
+      setView("launcher");
+    }
   };
 
   const addEngineFromWizard = () => {
@@ -467,10 +526,16 @@ export function App({
     return (
       <main className="launcher-shell" aria-label="QuickFox launcher">
         <section className="launcher-panel settings-panel">
-          <header className="panel-toolbar">
-            <button type="button" className="toolbar-button" onClick={() => setView("launcher")}>
+          <header className="panel-toolbar settings-toolbar">
+            <button
+              type="button"
+              className="toolbar-button"
+              onClick={() => void returnToLauncherFromSettings()}
+            >
               返回搜索
             </button>
+            <h1>设置</h1>
+            <span aria-hidden="true" />
           </header>
           <form aria-label="设置" className="settings-form">
             <div className="settings-sidebar">
@@ -516,76 +581,93 @@ export function App({
                     : "settings-section settings-section--index settings-section-muted"
                 }
               >
-                <legend>搜索与索引</legend>
-                <IndexStatusDetails status={currentIndexStatus} appPaths={currentAppPaths} />
-                <label className="settings-field settings-field--wide">
-                  索引目录
-                  <textarea
-                    value={config.index.include_dirs.join("\n")}
-                    onChange={(event) =>
-                      setConfig((current) => ({
-                        ...current,
-                        index: {
-                          ...current.index,
-                          include_dirs: event.target.value
-                            .split("\n")
-                            .map((item) => item.trim())
-                            .filter(Boolean),
-                        },
-                      }))
-                    }
-                  />
-                </label>
-                <label className="settings-field">
-                  排除目录
-                  <textarea
-                    value={config.index.exclude_dirs.join("\n")}
-                    onChange={(event) =>
-                      setConfig((current) => ({
-                        ...current,
-                        index: {
-                          ...current.index,
-                          exclude_dirs: linesFromTextarea(event.target.value),
-                        },
-                      }))
-                    }
-                  />
-                </label>
-                <label className="settings-field">
-                  排除模式
-                  <textarea
-                    value={config.index.exclude_patterns.join("\n")}
-                    onChange={(event) =>
-                      setConfig((current) => ({
-                        ...current,
-                        index: {
-                          ...current.index,
-                          exclude_patterns: linesFromTextarea(event.target.value),
-                        },
-                      }))
-                    }
-                  />
-                </label>
-                <label className="settings-field">
-                  正则前缀
-                  <input
-                    value={config.query.regex_prefix}
-                    onChange={(event) =>
-                      setConfig((current) => ({
-                        ...current,
-                        query: {
-                          ...current.query,
-                          regex_prefix: event.target.value,
-                        },
-                      }))
-                    }
-                  />
-                </label>
-                <div className="settings-field settings-field--action">
-                  <button type="button" onClick={() => void refreshSearchIndex()}>
-                    刷新索引
-                  </button>
-                  {refreshStatus ? <span className="settings-status">{refreshStatus}</span> : null}
+                <legend>索引</legend>
+                <header className="settings-index-header" role="region" aria-label="索引工作区标题">
+                  <div>
+                    <h2>索引</h2>
+                    <p>管理文件搜索范围、排除规则和索引状态。</p>
+                  </div>
+                  <div className="settings-index-refresh">
+                    <button type="button" onClick={() => void refreshSearchIndex()}>
+                      刷新索引
+                    </button>
+                    {refreshStatus ? (
+                      <span className="settings-status">{refreshStatus}</span>
+                    ) : null}
+                  </div>
+                </header>
+                <IndexStatusSummary status={currentIndexStatus} />
+                <div className="settings-index-workspace">
+                  <section aria-label="主规则编辑" className="settings-index-column">
+                    <span className="settings-column-label">主规则编辑</span>
+                    <label className="settings-field">
+                      索引目录
+                      <textarea
+                        value={config.index.include_dirs.join("\n")}
+                        onChange={(event) =>
+                          setConfig((current) => ({
+                            ...current,
+                            index: {
+                              ...current.index,
+                              include_dirs: event.target.value
+                                .split("\n")
+                                .map((item) => item.trim())
+                                .filter(Boolean),
+                            },
+                          }))
+                        }
+                      />
+                    </label>
+                    <label className="settings-field">
+                      排除目录
+                      <textarea
+                        value={config.index.exclude_dirs.join("\n")}
+                        onChange={(event) =>
+                          setConfig((current) => ({
+                            ...current,
+                            index: {
+                              ...current.index,
+                              exclude_dirs: linesFromTextarea(event.target.value),
+                            },
+                          }))
+                        }
+                      />
+                    </label>
+                    <label className="settings-field">
+                      排除模式
+                      <textarea
+                        value={config.index.exclude_patterns.join("\n")}
+                        onChange={(event) =>
+                          setConfig((current) => ({
+                            ...current,
+                            index: {
+                              ...current.index,
+                              exclude_patterns: linesFromTextarea(event.target.value),
+                            },
+                          }))
+                        }
+                      />
+                    </label>
+                  </section>
+                  <section aria-label="辅助信息" className="settings-index-column">
+                    <span className="settings-column-label">辅助信息</span>
+                    <label className="settings-field">
+                      正则前缀
+                      <input
+                        value={config.query.regex_prefix}
+                        onChange={(event) =>
+                          setConfig((current) => ({
+                            ...current,
+                            query: {
+                              ...current.query,
+                              regex_prefix: event.target.value,
+                            },
+                          }))
+                        }
+                      />
+                    </label>
+                    <IndexAuxiliaryDetails status={currentIndexStatus} appPaths={currentAppPaths} />
+                  </section>
                 </div>
               </fieldset>
               <fieldset
@@ -744,10 +826,10 @@ export function App({
             value={query}
             onChange={(event) => updateQuery(event.target.value)}
             onKeyDown={handleKeyDown}
-            placeholder="Search files, folders, calculator, web prefixes..."
+            placeholder={launcherInputPlaceholder}
           />
         </header>
-        {isCommandMode ? (
+        {launcherPresentation.mode === "command" ? (
           <section className="command-preview" aria-label="命令预览">
             <span className="result-title">
               {effectiveCommandEnabled ? commandText : "命令执行未启用"}
@@ -765,7 +847,7 @@ export function App({
           </section>
         ) : (
           <>
-            {historyMode ? (
+            {launcherPresentation.mode === "history" ? (
               <ul className="history-list" aria-label="输入历史">
                 {inputHistory.map((item, index) => (
                   <li
@@ -783,50 +865,54 @@ export function App({
                 ))}
               </ul>
             ) : null}
-            {query.trim() ? (
+            {launcherPresentation.mode === "results" || launcherPresentation.mode === "status" ? (
               <ul className="result-list" aria-label="搜索结果">
-                {results.length > 0
-                  ? results.map((result, index) => (
-                      <li
-                        aria-selected={index === selectedIndex}
-                        className={
-                          index === selectedIndex
-                            ? "result-item result-item--selected"
-                            : "result-item"
-                        }
-                        key={result.id}
-                        onContextMenu={(event) => {
-                          event.preventDefault();
-                          setMenuResultId(result.id);
-                          setMenuPosition({ left: event.clientX, top: event.clientY });
-                          setSelectedIndex(index);
-                        }}
-                        onMouseEnter={() => setSelectedIndex(index)}
-                        ref={(element) => {
-                          resultRefs.current[index] = element;
-                        }}
-                        role="option"
+                {launcherPresentation.mode === "results" ? (
+                  results.map((result, index) => (
+                    <li
+                      aria-selected={index === selectedIndex}
+                      className={
+                        index === selectedIndex
+                          ? "result-item result-item--selected"
+                          : "result-item"
+                      }
+                      key={result.id}
+                      onContextMenu={(event) => {
+                        event.preventDefault();
+                        setMenuResultId(result.id);
+                        setMenuPosition({ left: event.clientX, top: event.clientY });
+                        setSelectedIndex(index);
+                      }}
+                      onMouseEnter={() => setSelectedIndex(index)}
+                      ref={(element) => {
+                        resultRefs.current[index] = element;
+                      }}
+                      role="option"
+                    >
+                      <span className="result-title-cell">
+                        <ResultKindBadge kind={result.kind} />
+                        <span className="result-title" title={result.title}>
+                          <ResultTitle title={result.title} />
+                        </span>
+                      </span>
+                      <span
+                        aria-label={result.detail ? `完整路径 ${result.detail}` : undefined}
+                        className="result-detail"
+                        title={result.detail ?? undefined}
                       >
-                        <span className="result-title-cell">
-                          <ResultKindBadge kind={result.kind} />
-                          <span className="result-title" title={result.title}>
-                            <ResultTitle title={result.title} />
-                          </span>
-                        </span>
-                        <span
-                          aria-label={result.detail ? `完整路径 ${result.detail}` : undefined}
-                          className="result-detail"
-                          title={result.detail ?? undefined}
-                        >
-                          {summarizePath(result.detail)}
-                        </span>
-                      </li>
-                    ))
-                  : [
-                      <li className="empty-state" key="empty-state">
-                        {fileSearchStatusText(currentIndexStatus) ?? "未找到结果"}
-                      </li>,
-                    ]}
+                        {summarizePath(result.detail)}
+                      </span>
+                    </li>
+                  ))
+                ) : (
+                  <li className="empty-state" key="empty-state">
+                    <LauncherStatus
+                      status={launcherPresentation.status}
+                      onOpenSettings={() => void openSettingsFromLauncher()}
+                      onRefreshIndex={() => void refreshSearchIndex()}
+                    />
+                  </li>
+                )}
               </ul>
             ) : null}
           </>
@@ -900,6 +986,111 @@ function scrollElementIntoView(element: HTMLElement | null | undefined) {
   }
 }
 
+function buildLauncherPresentation({
+  historyMode,
+  indexStatus,
+  isCommandMode,
+  query,
+  results,
+}: {
+  historyMode: boolean;
+  indexStatus: IndexStatus;
+  isCommandMode: boolean;
+  query: string;
+  results: LauncherResult[];
+}): LauncherPresentation {
+  if (isCommandMode) {
+    return { mode: "command" };
+  }
+
+  if (historyMode) {
+    return { mode: "history" };
+  }
+
+  if (!query.trim()) {
+    return { mode: "empty" };
+  }
+
+  if (results.length > 0) {
+    return { mode: "results" };
+  }
+
+  return {
+    mode: "status",
+    status: launcherStatusForIndex(indexStatus),
+  };
+}
+
+function launcherStatusForIndex(status: IndexStatus): LauncherStatusFeedback {
+  switch (status.kind) {
+    case "unbuilt":
+      return {
+        title: "文件搜索正在准备",
+        message: "首次索引尚未建立，计算器和网页搜索仍可使用。",
+        actions: ["refreshIndex", "openSettings"],
+      };
+    case "building":
+      return {
+        title: "文件索引正在建立",
+        message: "请稍等片刻；计算器和网页搜索仍可使用。",
+        actions: ["refreshIndex", "openSettings"],
+      };
+    case "refreshing":
+      return {
+        title: "文件索引正在更新",
+        message: "正在刷新文件快照；计算器和网页搜索仍可使用。",
+        actions: [],
+      };
+    case "failed":
+      return {
+        title: "文件索引构建失败",
+        message: "计算器和网页搜索仍可使用，可刷新索引或打开设置调整范围。",
+        detail: status.message,
+        actions: ["refreshIndex", "openSettings"],
+      };
+    case "ready":
+      return {
+        title: "未找到结果",
+        message: "可以换个关键词，或使用 g 关键词、re: 正则和 > 命令。",
+        actions: [],
+      };
+  }
+}
+
+function LauncherStatus({
+  onOpenSettings,
+  onRefreshIndex,
+  status,
+}: {
+  onOpenSettings: () => void;
+  onRefreshIndex: () => void;
+  status: LauncherStatusFeedback;
+}) {
+  return (
+    <section aria-label="启动器状态" className="launcher-status">
+      <div className="launcher-status-copy">
+        <strong>{status.title}</strong>
+        <span>{status.message}</span>
+        {status.detail ? <small>{status.detail}</small> : null}
+      </div>
+      {status.actions.length > 0 ? (
+        <div className="launcher-status-actions">
+          {status.actions.includes("refreshIndex") ? (
+            <button type="button" onClick={onRefreshIndex}>
+              刷新索引
+            </button>
+          ) : null}
+          {status.actions.includes("openSettings") ? (
+            <button type="button" onClick={onOpenSettings}>
+              打开设置
+            </button>
+          ) : null}
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
 function ResultTitle({ title }: { title: string }) {
   const summary = summarizeTitle(title);
   if (!summary) {
@@ -946,31 +1137,37 @@ function summarizeTitle(title: string): { head: string; tail: string } | null {
   return { head, tail: tail.replace(/^_+/, "") };
 }
 
-function IndexStatusDetails({ status, appPaths }: { status: IndexStatus; appPaths: AppPaths }) {
+function IndexStatusSummary({ status }: { status: IndexStatus }) {
   return (
-    <div className="settings-status-grid">
-      <div className="settings-status-row">
-        <span>{indexStatusLabel(status)}</span>
-        <span>{status.entryCount} 项</span>
+    <section aria-label="索引状态摘要" className="settings-status-grid">
+      <div className="settings-status-card">
+        <span>状态</span>
+        <strong>{indexStatusLabel(status)}</strong>
+        {status.message ? <small>{status.message}</small> : null}
       </div>
-      <div className="settings-meta-row">
+      <div className="settings-status-card">
+        <span>条目</span>
+        <strong>{status.entryCount} 项</strong>
+      </div>
+      <div className="settings-status-card">
         <span>索引代次</span>
-        <span>第 {status.generation} 代</span>
+        <strong>第 {status.generation} 代</strong>
       </div>
-      <div className="settings-meta-row">
-        <span>最近完成</span>
-        <span>
+      <div className="settings-status-card">
+        <span>{status.kind === "failed" ? "失败摘要" : "最近完成"}</span>
+        <strong>
           {status.completedAtMs
             ? `最近完成: ${formatCompletedAt(status.completedAtMs)}`
-            : "尚未完成"}
-        </span>
+            : (status.message ?? "尚未完成")}
+        </strong>
       </div>
-      {status.message ? (
-        <div className="settings-meta-row">
-          <span>状态摘要</span>
-          <span>{status.message}</span>
-        </div>
-      ) : null}
+    </section>
+  );
+}
+
+function IndexAuxiliaryDetails({ status, appPaths }: { status: IndexStatus; appPaths: AppPaths }) {
+  return (
+    <div className="settings-auxiliary-list">
       <div className="settings-meta-row">
         <span>配置文件位置</span>
         <span title={appPaths.configFilePath ?? undefined}>
@@ -982,6 +1179,10 @@ function IndexStatusDetails({ status, appPaths }: { status: IndexStatus; appPath
         <span title={appPaths.indexSnapshotPath ?? undefined}>
           {appPaths.indexSnapshotPath ?? "尚未创建"}
         </span>
+      </div>
+      <div className="settings-meta-row">
+        <span>{status.kind === "failed" ? "失败摘要" : "状态摘要"}</span>
+        <span title={status.message ?? undefined}>{status.message ?? "暂无失败"}</span>
       </div>
     </div>
   );
@@ -1004,20 +1205,4 @@ function indexStatusLabel(status: IndexStatus) {
     case "unbuilt":
       return "文件索引尚未建立";
   }
-}
-
-function fileSearchStatusText(status: IndexStatus) {
-  if (status.kind === "building") {
-    return "文件索引正在建立";
-  }
-  if (status.kind === "refreshing") {
-    return "文件索引正在更新";
-  }
-  if (status.kind === "failed") {
-    return status.message ?? "文件索引构建失败";
-  }
-  if (status.kind === "unbuilt") {
-    return "文件索引尚未建立";
-  }
-  return null;
 }

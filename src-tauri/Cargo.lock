@@ -2853,7 +2853,7 @@ dependencies = [
 
 [[package]]
 name = "quickfox"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "arboard",
  "keytap",

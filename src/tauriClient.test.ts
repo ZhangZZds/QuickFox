@@ -1,19 +1,24 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   clearCommandHistory,
   clearInputHistory,
+  currentWindowLabel,
   executeAction,
   globalHotkeyStatus,
   indexStatus,
   listenGlobalHotkeyStatus,
+  listenIndexStatus,
   listenOpenSettings,
   loadConfig,
+  openSettingsWindow,
   recentInputHistory,
   recordInputHistory,
   refreshIndex,
+  returnToLauncherWindow,
   saveConfig,
   search,
 } from "./tauriClient";
@@ -24,14 +29,19 @@ vi.mock("@tauri-apps/api/core", () => ({
 vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn(),
 }));
+vi.mock("@tauri-apps/api/window", () => ({
+  getCurrentWindow: vi.fn(),
+}));
 
 const invokeMock = vi.mocked(invoke);
 const listenMock = vi.mocked(listen);
+const getCurrentWindowMock = vi.mocked(getCurrentWindow);
 
 describe("tauriClient", () => {
   beforeEach(() => {
     invokeMock.mockReset();
     listenMock.mockReset();
+    getCurrentWindowMock.mockReset();
   });
 
   it("calls the search command with the query text", async () => {
@@ -60,6 +70,8 @@ describe("tauriClient", () => {
     await globalHotkeyStatus();
     await loadConfig();
     await saveConfig(config);
+    await openSettingsWindow();
+    await returnToLauncherWindow();
     await clearCommandHistory();
     await recordInputHistory("g 1234");
     await recentInputHistory();
@@ -70,12 +82,30 @@ describe("tauriClient", () => {
     expect(invokeMock).toHaveBeenNthCalledWith(3, "global_hotkey_status");
     expect(invokeMock).toHaveBeenNthCalledWith(4, "load_config");
     expect(invokeMock).toHaveBeenNthCalledWith(5, "save_config", { config });
-    expect(invokeMock).toHaveBeenNthCalledWith(6, "clear_command_history");
-    expect(invokeMock).toHaveBeenNthCalledWith(7, "record_input_history", {
+    expect(invokeMock).toHaveBeenNthCalledWith(6, "open_settings_window");
+    expect(invokeMock).toHaveBeenNthCalledWith(7, "return_to_launcher_window");
+    expect(invokeMock).toHaveBeenNthCalledWith(8, "clear_command_history");
+    expect(invokeMock).toHaveBeenNthCalledWith(9, "record_input_history", {
       input: "g 1234",
     });
-    expect(invokeMock).toHaveBeenNthCalledWith(8, "recent_input_history");
-    expect(invokeMock).toHaveBeenNthCalledWith(9, "clear_input_history");
+    expect(invokeMock).toHaveBeenNthCalledWith(10, "recent_input_history");
+    expect(invokeMock).toHaveBeenNthCalledWith(11, "clear_input_history");
+  });
+
+  it("reports the current Tauri window label when it is available", () => {
+    getCurrentWindowMock.mockReturnValueOnce({ label: "settings" } as ReturnType<
+      typeof getCurrentWindow
+    >);
+
+    expect(currentWindowLabel()).toBe("settings");
+  });
+
+  it("returns null for current window label outside Tauri", () => {
+    getCurrentWindowMock.mockImplementationOnce(() => {
+      throw new Error("Tauri window bridge unavailable");
+    });
+
+    expect(currentWindowLabel()).toBeNull();
   });
 
   it("listens for the tray settings event", async () => {
@@ -99,5 +129,33 @@ describe("tauriClient", () => {
       "quickfox://global-hotkey-status",
       expect.any(Function),
     );
+  });
+
+  it("listens for index status events", async () => {
+    const handler = vi.fn();
+    const unlisten = vi.fn();
+    listenMock.mockResolvedValueOnce(unlisten);
+
+    await listenIndexStatus(handler);
+
+    expect(listenMock).toHaveBeenCalledWith("quickfox://index-status", expect.any(Function));
+  });
+
+  it("returns a noop unlisten when Tauri event listen is unavailable", async () => {
+    listenMock.mockRejectedValueOnce(new Error("Tauri event bridge unavailable"));
+
+    const unlisten = await listenOpenSettings(vi.fn());
+
+    expect(unlisten()).toBeUndefined();
+  });
+
+  it("returns a noop unlisten when Tauri event listen throws synchronously", async () => {
+    listenMock.mockImplementationOnce(() => {
+      throw new Error("Tauri event bridge unavailable");
+    });
+
+    const unlisten = await listenOpenSettings(vi.fn());
+
+    expect(unlisten()).toBeUndefined();
   });
 });
