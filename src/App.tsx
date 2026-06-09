@@ -1,4 +1,4 @@
-import { type KeyboardEvent, useEffect, useRef, useState } from "react";
+import { type KeyboardEvent, type ReactNode, useEffect, useRef, useState } from "react";
 
 import {
   appPaths,
@@ -13,11 +13,11 @@ import {
   recentInputHistory,
   recordInputHistory,
   refreshIndex,
-  returnToLauncherWindow,
   type AppPaths,
   type GlobalHotkeyStatus,
   type IndexStatus,
   type QuickFoxConfig,
+  type SearchSnippet,
   saveConfig,
   search as searchResults,
 } from "./tauriClient";
@@ -41,6 +41,7 @@ type LauncherResult = {
   kind: BackendSearchResult["kind"];
   primaryAction: LauncherAction;
   secondaryActions: Array<{ label: string; action: LauncherAction }>;
+  snippet?: SearchSnippet | null;
 };
 
 type LauncherStatusFeedback = {
@@ -64,6 +65,7 @@ type BackendSearchResult = {
   kind: "application" | "file" | "directory" | "calculator" | "webSearch" | "command" | "feedback";
   mainAction: LauncherAction;
   secondaryActions: LauncherAction[];
+  snippet?: SearchSnippet | null;
 };
 
 type AppProps = {
@@ -78,6 +80,11 @@ const fallbackConfig: QuickFoxConfig = {
     include_dirs: [],
     exclude_dirs: [],
     exclude_patterns: [],
+    performance_mode: "balanced",
+    respect_project_ignores: true,
+    content_include_dirs: [],
+    content_max_file_bytes: 2 * 1024 * 1024,
+    watcher_enabled: true,
   },
   query: {
     regex_prefix: "re:",
@@ -105,9 +112,17 @@ const fallbackConfig: QuickFoxConfig = {
   results: {
     limit: 20,
   },
+  hotkey: {
+    wake_shortcut: "Shift+Shift",
+  },
 };
 
 const launcherInputPlaceholder = "搜索文件、文件夹、计算器；g 关键词搜网页，re: 正则，> 命令";
+
+type ShortcutRecording = {
+  value: string | null;
+  error: string | null;
+};
 
 function labelForAction(action: LauncherAction, resultKind?: BackendSearchResult["kind"]) {
   switch (action.type) {
@@ -166,7 +181,73 @@ function toLauncherResults(results: BackendSearchResult[]): LauncherResult[] {
       label: labelForAction(action, result.kind),
       action,
     })),
+    snippet: result.snippet,
   }));
+}
+
+function shortcutFromKeyboardEvent(event: KeyboardEvent<HTMLElement>): ShortcutRecording {
+  const key = normalizedShortcutKey(event.key);
+  const modifiers = [
+    event.metaKey ? "Command" : null,
+    event.ctrlKey ? "Control" : null,
+    event.altKey ? "Alt" : null,
+    event.shiftKey && key !== "Shift" ? "Shift" : null,
+  ].filter(Boolean) as string[];
+
+  if (!key || key === "Control" || key === "Alt" || key === "Command" || key === "Shift") {
+    return { value: null, error: "请按一个修饰键加普通键，或连续按两次 Shift。" };
+  }
+
+  if (modifiers.length === 0) {
+    return { value: null, error: "唤醒键需要包含 Control、Command、Alt 或 Shift。" };
+  }
+
+  return { value: [...modifiers, key].join("+"), error: null };
+}
+
+function normalizedShortcutKey(key: string) {
+  const aliases: Record<string, string> = {
+    " ": "Space",
+    Control: "Control",
+    Meta: "Command",
+    OS: "Command",
+    Alt: "Alt",
+    Shift: "Shift",
+    Escape: "Escape",
+    Esc: "Escape",
+    Enter: "Enter",
+    Return: "Enter",
+    Tab: "Tab",
+    Backspace: "Backspace",
+    Delete: "Delete",
+    ArrowUp: "ArrowUp",
+    ArrowDown: "ArrowDown",
+    ArrowLeft: "ArrowLeft",
+    ArrowRight: "ArrowRight",
+  };
+  if (/^F([1-9]|1[0-9]|2[0-4])$/.test(key)) {
+    return key;
+  }
+  if (aliases[key]) {
+    return aliases[key];
+  }
+  if (key.length === 1) {
+    return key.toUpperCase();
+  }
+  return aliases[key] ?? null;
+}
+
+function HelpIcon({ label, text }: { label: string; text: string }) {
+  return (
+    <span className="settings-help">
+      <button type="button" aria-label={`${label}说明`} className="settings-help-button">
+        ?
+      </button>
+      <span role="tooltip" className="settings-help-tooltip">
+        {text}
+      </span>
+    </span>
+  );
 }
 
 export function App({
@@ -180,6 +261,7 @@ export function App({
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<LauncherResult[]>([]);
   const [selectedIndex, setSelectedIndex] = useState(0);
+  const [expandedSnippetResultId, setExpandedSnippetResultId] = useState<string | null>(null);
   const [menuResultId, setMenuResultId] = useState<string | null>(null);
   const [menuPosition, setMenuPosition] = useState<{ left: number; top: number } | null>(null);
   const [inputHistory, setInputHistory] = useState<string[]>([]);
@@ -208,9 +290,12 @@ export function App({
   const [engineWizardOpen, setEngineWizardOpen] = useState(false);
   const [engineDraft, setEngineDraft] = useState({ prefix: "", name: "", url: "" });
   const [engineError, setEngineError] = useState<string | null>(null);
+  const [hotkeyRecording, setHotkeyRecording] = useState(false);
+  const [hotkeyError, setHotkeyError] = useState<string | null>(null);
   const resultRefs = useRef<Array<HTMLLIElement | null>>([]);
   const historyRefs = useRef<Array<HTMLLIElement | null>>([]);
   const settingsContentRef = useRef<HTMLDivElement | null>(null);
+  const hotkeyShiftPressAtRef = useRef<number | null>(null);
   const effectiveCommandEnabled = commandEnabled ?? config.command.enabled;
   const hotkeyPermissionSettingsUrl = currentHotkeyStatus.permissionSettingsUrl;
 
@@ -345,6 +430,7 @@ export function App({
     setHistoryMode(false);
     setMenuResultId(null);
     setMenuPosition(null);
+    setExpandedSnippetResultId(null);
   };
 
   const executeSelected = async () => {
@@ -458,14 +544,6 @@ export function App({
     }
   };
 
-  const returnToLauncherFromSettings = async () => {
-    try {
-      await returnToLauncherWindow();
-    } catch {
-      setView("launcher");
-    }
-  };
-
   const addEngineFromWizard = () => {
     const prefix = engineDraft.prefix.trim();
     const name = engineDraft.name.trim();
@@ -508,7 +586,53 @@ export function App({
     await saveConfig(config);
     const nextStatus = (await indexStatus()) as IndexStatus;
     setCurrentIndexStatus(nextStatus);
-    setView("launcher");
+  };
+
+  const recordWakeShortcut = (event: KeyboardEvent<HTMLButtonElement>) => {
+    if (!hotkeyRecording) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    if (
+      event.key === "Shift" &&
+      !event.ctrlKey &&
+      !event.metaKey &&
+      !event.altKey &&
+      !event.repeat
+    ) {
+      const now = Date.now();
+      const lastShiftAt = hotkeyShiftPressAtRef.current;
+      hotkeyShiftPressAtRef.current = now;
+      if (lastShiftAt !== null && now - lastShiftAt <= 500) {
+        setConfig((current) => ({
+          ...current,
+          hotkey: {
+            ...current.hotkey,
+            wake_shortcut: "Shift+Shift",
+          },
+        }));
+        setHotkeyRecording(false);
+        setHotkeyError(null);
+        return;
+      }
+      setHotkeyError("再次按 Shift 可录制为 Shift+Shift。");
+      return;
+    }
+    const recording = shortcutFromKeyboardEvent(event);
+    if (recording.value) {
+      setConfig((current) => ({
+        ...current,
+        hotkey: {
+          ...current.hotkey,
+          wake_shortcut: recording.value ?? current.hotkey.wake_shortcut,
+        },
+      }));
+      setHotkeyRecording(false);
+      setHotkeyError(null);
+      return;
+    }
+    setHotkeyError(recording.error);
   };
 
   const openHotkeyPermissionSettings = () => {
@@ -527,13 +651,6 @@ export function App({
       <main className="launcher-shell" aria-label="QuickFox launcher">
         <section className="launcher-panel settings-panel">
           <header className="panel-toolbar settings-toolbar">
-            <button
-              type="button"
-              className="toolbar-button"
-              onClick={() => void returnToLauncherFromSettings()}
-            >
-              返回搜索
-            </button>
             <h1>设置</h1>
             <span aria-hidden="true" />
           </header>
@@ -601,8 +718,15 @@ export function App({
                   <section aria-label="主规则编辑" className="settings-index-column">
                     <span className="settings-column-label">主规则编辑</span>
                     <label className="settings-field">
-                      索引目录
+                      <span className="settings-field-title">
+                        索引目录
+                        <HelpIcon
+                          label="索引目录"
+                          text="每行填写一个完整目录路径，例如 C:\\Users\\frank\\Documents 或 D:\\Projects；保存后点击刷新索引生效。"
+                        />
+                      </span>
                       <textarea
+                        aria-label="索引目录"
                         value={config.index.include_dirs.join("\n")}
                         onChange={(event) =>
                           setConfig((current) => ({
@@ -619,8 +743,15 @@ export function App({
                       />
                     </label>
                     <label className="settings-field">
-                      排除目录
+                      <span className="settings-field-title">
+                        排除目录
+                        <HelpIcon
+                          label="排除目录"
+                          text="每行填写一个完整目录路径；该目录和子目录都不会进入索引，例如 D:\\Projects\\big-cache。"
+                        />
+                      </span>
                       <textarea
+                        aria-label="排除目录"
                         value={config.index.exclude_dirs.join("\n")}
                         onChange={(event) =>
                           setConfig((current) => ({
@@ -634,8 +765,15 @@ export function App({
                       />
                     </label>
                     <label className="settings-field">
-                      排除模式
+                      <span className="settings-field-title">
+                        排除模式
+                        <HelpIcon
+                          label="排除模式"
+                          text="每行填写一个名称或通配模式，匹配文件名/目录名，例如 node_modules、target、*.tmp。"
+                        />
+                      </span>
                       <textarea
+                        aria-label="排除模式"
                         value={config.index.exclude_patterns.join("\n")}
                         onChange={(event) =>
                           setConfig((current) => ({
@@ -648,12 +786,129 @@ export function App({
                         }
                       />
                     </label>
+                    <label className="settings-field">
+                      <span className="settings-field-title">
+                        索引性能模式
+                        <HelpIcon
+                          label="索引性能模式"
+                          text="fast 优先缩短首次扫描；balanced 适合日常使用；complete 会覆盖更多路径但首次索引更慢。"
+                        />
+                      </span>
+                      <select
+                        aria-label="索引性能模式"
+                        value={config.index.performance_mode}
+                        onChange={(event) =>
+                          setConfig((current) => ({
+                            ...current,
+                            index: {
+                              ...current.index,
+                              performance_mode: event.target
+                                .value as QuickFoxConfig["index"]["performance_mode"],
+                            },
+                          }))
+                        }
+                      >
+                        <option value="fast">fast</option>
+                        <option value="balanced">balanced</option>
+                        <option value="complete">complete</option>
+                      </select>
+                    </label>
+                    <label className="toggle-row">
+                      <input
+                        aria-label="尊重项目 ignore"
+                        checked={config.index.respect_project_ignores}
+                        type="checkbox"
+                        onChange={(event) =>
+                          setConfig((current) => ({
+                            ...current,
+                            index: {
+                              ...current.index,
+                              respect_project_ignores: event.target.checked,
+                            },
+                          }))
+                        }
+                      />
+                      <span>尊重项目 ignore</span>
+                    </label>
                   </section>
                   <section aria-label="辅助信息" className="settings-index-column">
                     <span className="settings-column-label">辅助信息</span>
                     <label className="settings-field">
-                      正则前缀
+                      <span className="settings-field-title">
+                        内容索引目录
+                        <HelpIcon
+                          label="内容索引目录"
+                          text="每行填写一个目录；content: 只读取并在本机索引这些目录内的文本文件内容。超限或二进制文件仍可按 name/path 搜索。"
+                        />
+                      </span>
+                      <textarea
+                        aria-label="内容索引目录"
+                        value={config.index.content_include_dirs.join("\n")}
+                        onChange={(event) =>
+                          setConfig((current) => ({
+                            ...current,
+                            index: {
+                              ...current.index,
+                              content_include_dirs: linesFromTextarea(event.target.value),
+                            },
+                          }))
+                        }
+                      />
+                    </label>
+                    <label className="settings-field">
+                      <span className="settings-field-title">
+                        内容大小上限 MB
+                        <HelpIcon
+                          label="内容大小上限 MB"
+                          text="单个文本文件超过上限时不读取正文内容；默认 2 MB。"
+                        />
+                      </span>
                       <input
+                        aria-label="内容大小上限 MB"
+                        min="1"
+                        type="number"
+                        value={bytesToMegabytes(config.index.content_max_file_bytes)}
+                        onChange={(event) =>
+                          setConfig((current) => ({
+                            ...current,
+                            index: {
+                              ...current.index,
+                              content_max_file_bytes: megabytesToBytes(event.target.value),
+                            },
+                          }))
+                        }
+                      />
+                    </label>
+                    <label className="toggle-row">
+                      <input
+                        aria-label="运行期文件监听"
+                        checked={config.index.watcher_enabled}
+                        type="checkbox"
+                        onChange={(event) =>
+                          setConfig((current) => ({
+                            ...current,
+                            index: {
+                              ...current.index,
+                              watcher_enabled: event.target.checked,
+                            },
+                          }))
+                        }
+                      />
+                      <span>运行期文件监听</span>
+                    </label>
+                    <p className="settings-help-text">
+                      字段查询示例：type:pdf、name:test、dir:**/workspace、content:"hello world"。
+                    </p>
+                    <label className="settings-field">
+                      <span className="settings-field-title">
+                        正则前缀
+                        <HelpIcon
+                          label="正则前缀"
+                          text="设置触发正则搜索的前缀；例如保持 re: 后，在搜索框输入 re:.*\\.pdf$ 查找 PDF。"
+                        />
+                      </span>
+                      <input
+                        aria-label="正则前缀"
                         value={config.query.regex_prefix}
                         onChange={(event) =>
                           setConfig((current) => ({
@@ -747,6 +1002,29 @@ export function App({
               >
                 <legend>外观与窗口</legend>
                 <span>Compact</span>
+                <label className="settings-field">
+                  <span className="settings-field-title">
+                    全局唤醒键
+                    <HelpIcon
+                      label="全局唤醒键"
+                      text="点击录制后按组合键；推荐 Control+Space 或 Command+Shift+K，也可以连续按两次 Shift。保存后新按键生效。"
+                    />
+                  </span>
+                  <button
+                    type="button"
+                    className="shortcut-recorder"
+                    aria-pressed={hotkeyRecording}
+                    onClick={() => {
+                      setHotkeyRecording(true);
+                      setHotkeyError(null);
+                      hotkeyShiftPressAtRef.current = null;
+                    }}
+                    onKeyDown={recordWakeShortcut}
+                  >
+                    {hotkeyRecording ? "正在录制..." : config.hotkey.wake_shortcut}
+                  </button>
+                  {hotkeyError ? <span className="settings-error">{hotkeyError}</span> : null}
+                </label>
                 <div
                   className={
                     hotkeyPermissionSettingsUrl
@@ -871,11 +1149,13 @@ export function App({
                   results.map((result, index) => (
                     <li
                       aria-selected={index === selectedIndex}
-                      className={
-                        index === selectedIndex
-                          ? "result-item result-item--selected"
-                          : "result-item"
-                      }
+                      className={[
+                        "result-item",
+                        index === selectedIndex ? "result-item--selected" : null,
+                        result.snippet ? "result-item--has-snippet" : null,
+                      ]
+                        .filter(Boolean)
+                        .join(" ")}
                       key={result.id}
                       onContextMenu={(event) => {
                         event.preventDefault();
@@ -883,7 +1163,17 @@ export function App({
                         setMenuPosition({ left: event.clientX, top: event.clientY });
                         setSelectedIndex(index);
                       }}
-                      onMouseEnter={() => setSelectedIndex(index)}
+                      onMouseEnter={() => {
+                        setSelectedIndex(index);
+                        if (result.snippet) {
+                          setExpandedSnippetResultId(result.id);
+                        }
+                      }}
+                      onMouseLeave={() => {
+                        setExpandedSnippetResultId((current) =>
+                          current === result.id ? null : current,
+                        );
+                      }}
                       ref={(element) => {
                         resultRefs.current[index] = element;
                       }}
@@ -902,6 +1192,12 @@ export function App({
                       >
                         {summarizePath(result.detail)}
                       </span>
+                      {result.snippet ? (
+                        <ResultSnippet
+                          expanded={expandedSnippetResultId === result.id}
+                          snippet={result.snippet}
+                        />
+                      ) : null}
                     </li>
                   ))
                 ) : (
@@ -956,6 +1252,15 @@ function linesFromTextarea(value: string) {
     .split("\n")
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+function bytesToMegabytes(value: number) {
+  return Math.max(1, Math.round(value / (1024 * 1024)));
+}
+
+function megabytesToBytes(value: string) {
+  const megabytes = Number.parseInt(value, 10);
+  return Math.max(1, Number.isFinite(megabytes) ? megabytes : 1) * 1024 * 1024;
 }
 
 function summarizePath(path?: string | null) {
@@ -1033,12 +1338,14 @@ function launcherStatusForIndex(status: IndexStatus): LauncherStatusFeedback {
       return {
         title: "文件索引正在建立",
         message: "请稍等片刻；计算器和网页搜索仍可使用。",
+        detail: indexProgressSummary(status),
         actions: ["refreshIndex", "openSettings"],
       };
     case "refreshing":
       return {
         title: "文件索引正在更新",
         message: "正在刷新文件快照；计算器和网页搜索仍可使用。",
+        detail: indexProgressSummary(status),
         actions: [],
       };
     case "failed":
@@ -1055,6 +1362,19 @@ function launcherStatusForIndex(status: IndexStatus): LauncherStatusFeedback {
         actions: [],
       };
   }
+}
+
+function indexProgressSummary(status: IndexStatus) {
+  const parts = [
+    status.stage,
+    status.currentRoot,
+    typeof status.scanned === "number" ? `已扫描 ${status.scanned}` : null,
+    typeof status.accepted === "number" ? `收录 ${status.accepted}` : null,
+    typeof status.skipped === "number" ? `跳过 ${status.skipped}` : null,
+    typeof status.failures === "number" ? `失败 ${status.failures}` : null,
+  ].filter(Boolean);
+
+  return parts.length > 0 ? parts.join(" · ") : null;
 }
 
 function LauncherStatus({
@@ -1122,6 +1442,91 @@ function ResultKindBadge({ kind }: { kind: BackendSearchResult["kind"] }) {
       {label.slice(0, 1)}
     </span>
   );
+}
+
+function ResultSnippet({ expanded, snippet }: { expanded: boolean; snippet: SearchSnippet }) {
+  const primaryHighlight = snippet.highlights[0];
+  const hitLineNumber = primaryHighlight?.line ?? snippet.startLine;
+  const hitLine = snippet.lines[hitLineNumber - snippet.startLine] ?? snippet.lines[0] ?? "";
+  const hitCount = snippet.highlights.length;
+
+  return (
+    <div
+      className={expanded ? "result-snippet result-snippet--expanded" : "result-snippet"}
+      aria-label="内容片段"
+    >
+      <div className="result-snippet-summary">
+        <span>命中 {hitCount} 次</span>
+        <span>第 {hitLineNumber} 行</span>
+      </div>
+      {expanded ? (
+        <div className="result-snippet-context">
+          {snippet.lines.map((line, index) => {
+            const lineNumber = snippet.startLine + index;
+            return (
+              <SnippetLine
+                key={`${lineNumber}:${line}`}
+                line={line}
+                lineNumber={lineNumber}
+                snippet={snippet}
+              />
+            );
+          })}
+        </div>
+      ) : (
+        <SnippetLine line={hitLine} lineNumber={hitLineNumber} snippet={snippet} />
+      )}
+    </div>
+  );
+}
+
+function SnippetLine({
+  line,
+  lineNumber,
+  snippet,
+}: {
+  line: string;
+  lineNumber: number;
+  snippet: SearchSnippet;
+}) {
+  return (
+    <span className="result-snippet-line">
+      <span className="result-snippet-number">{lineNumber}</span>
+      <span className="result-snippet-text">
+        {renderHighlightedSnippetLine(line, lineNumber, snippet)}
+      </span>
+    </span>
+  );
+}
+
+function renderHighlightedSnippetLine(line: string, lineNumber: number, snippet: SearchSnippet) {
+  const highlights = snippet.highlights
+    .filter((highlight) => highlight.line === lineNumber)
+    .sort((left, right) => left.startColumn - right.startColumn);
+  if (highlights.length === 0) {
+    return line;
+  }
+
+  const parts: ReactNode[] = [];
+  let cursor = 0;
+  for (const highlight of highlights) {
+    const rawStart = highlight.startColumn > 0 ? highlight.startColumn - 1 : highlight.startColumn;
+    const rawEnd =
+      highlight.startColumn > 0 && highlight.endColumn > 0
+        ? highlight.endColumn - 1
+        : highlight.endColumn;
+    const start = Math.max(cursor, Math.min(rawStart, line.length));
+    const end = Math.max(start, Math.min(rawEnd, line.length));
+    if (start > cursor) {
+      parts.push(line.slice(cursor, start));
+    }
+    parts.push(<mark key={`${lineNumber}:${start}:${end}`}>{line.slice(start, end)}</mark>);
+    cursor = end;
+  }
+  if (cursor < line.length) {
+    parts.push(line.slice(cursor));
+  }
+  return parts;
 }
 
 function summarizeTitle(title: string): { head: string; tail: string } | null {

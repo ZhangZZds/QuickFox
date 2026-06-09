@@ -2,12 +2,16 @@ pub mod core;
 
 use crate::core::actions::{Action, OpenApplication};
 use crate::core::config::{ConfigStore, QuickFoxConfig};
+use crate::core::content_index::{ContentIndex, ContentIndexOptions};
 use crate::core::index::{
     IndexLifecycle, IndexReport, IndexScanOptions, IndexScanner, IndexStatus, SearchIndex,
 };
+use crate::core::index_entry::{ContentIndexState, IndexScanStats, IndexedEntry, ScanEvent};
+use crate::core::index_scanner::{IndexScanPlan, IndexScanStage};
+use crate::core::index_watcher::{roots_from_entries, RuntimeIndexWatcher, WatcherFailure};
 use crate::core::platform::{
-    CommandSafetyChecker, CommandSafetyDecision, DevelopmentToolAdapter, LauncherWindowEffect,
-    LauncherWindowState, ProcessCommand,
+    CommandSafetyChecker, CommandSafetyDecision, DevelopmentToolAdapter, HotkeyKey, HotkeyState,
+    KeyPress, LauncherWindowEffect, LauncherWindowState, ProcessCommand, WakeShortcut,
 };
 use crate::core::providers::{
     CalculatorProvider, CommandProvider, CommandProviderConfig, FileProvider, ProviderRegistry,
@@ -22,7 +26,7 @@ use std::process::Command;
 use std::sync::Mutex;
 use std::thread;
 use tauri::image::Image;
-use tauri::{Emitter, Manager};
+use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 use tauri_plugin_opener::OpenerExt;
 
 #[cfg(target_os = "linux")]
@@ -37,6 +41,8 @@ struct QuickFoxRuntime {
     index: SearchIndex,
     last_report: IndexReport,
     index_lifecycle: IndexLifecycle,
+    index_watcher: Option<RuntimeIndexWatcher>,
+    watcher_failure_summary: Option<String>,
 }
 
 struct QuickFoxAppState {
@@ -129,16 +135,6 @@ fn open_settings_window(app: tauri::AppHandle) -> Result<&'static str, String> {
 }
 
 #[tauri::command]
-fn return_to_launcher_window(
-    app: tauri::AppHandle,
-    state: tauri::State<QuickFoxAppState>,
-) -> Result<&'static str, String> {
-    show_main_window(&app, &state);
-    hide_settings_window(&app);
-    Ok("completed")
-}
-
-#[tauri::command]
 fn execute_action(app: tauri::AppHandle, action: Action) -> Result<&'static str, String> {
     match action {
         Action::OpenPath { path } => app
@@ -206,7 +202,9 @@ fn save_config(
         store.save(&config).map_err(|error| format!("{error:?}"))?;
     }
     runtime.config = config;
+    let next_shortcut = current_wake_shortcut(&runtime.config);
     drop(runtime);
+    refresh_enabled_global_hotkey_status(&app, &next_shortcut);
     let _ = start_background_index_refresh(app, &state)?;
 
     Ok("saved")
@@ -262,9 +260,35 @@ fn clear_input_history() -> Result<&'static str, String> {
 }
 
 fn default_index_dirs() -> Vec<String> {
+    #[cfg(target_os = "windows")]
+    {
+        let roots = windows_existing_drive_roots();
+        if !roots.is_empty() {
+            return roots;
+        }
+    }
+
     std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .into_iter()
+        .collect()
+}
+
+#[cfg(target_os = "windows")]
+fn windows_existing_drive_roots() -> Vec<String> {
+    windows_drive_roots_from_letters('C'..='Z', |root| PathBuf::from(root).is_dir())
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_drive_roots_from_letters<I, F>(letters: I, exists: F) -> Vec<String>
+where
+    I: IntoIterator<Item = char>,
+    F: Fn(&str) -> bool,
+{
+    letters
+        .into_iter()
+        .map(|letter| format!("{letter}:\\"))
+        .filter(|root| exists(root))
         .collect()
 }
 
@@ -392,11 +416,202 @@ fn build_scan_options(config: &QuickFoxConfig) -> IndexScanOptions {
             .collect(),
         exclude_dirs,
         exclude_patterns,
+        respect_project_ignores: config.index.respect_project_ignores,
     }
 }
 
+fn build_scan_plans(config: &QuickFoxConfig) -> Vec<IndexScanPlan> {
+    let options = build_scan_options(config);
+    let mut plans = Vec::new();
+
+    let applications = existing_paths(application_index_roots());
+    if !applications.is_empty() {
+        plans.push(scan_plan_for_stage(
+            "applications",
+            10,
+            applications,
+            &options,
+        ));
+    }
+
+    let configured_roots = unique_pathbufs(options.include_dirs.clone());
+    let hot_paths = existing_paths(user_hot_path_roots())
+        .into_iter()
+        .filter(|path| !configured_roots.iter().any(|root| root == path))
+        .collect::<Vec<_>>();
+    if !hot_paths.is_empty() {
+        plans.push(scan_plan_for_stage(
+            "user-hot-paths",
+            20,
+            hot_paths,
+            &options,
+        ));
+    }
+
+    if !configured_roots.is_empty() {
+        plans.push(scan_plan_for_stage(
+            "configured-roots",
+            30,
+            configured_roots.clone(),
+            &options,
+        ));
+    }
+
+    let remaining_drives = remaining_drive_roots(&configured_roots);
+    if !remaining_drives.is_empty() {
+        plans.push(scan_plan_for_stage(
+            "remaining-drives",
+            40,
+            remaining_drives,
+            &options,
+        ));
+    }
+
+    if plans.is_empty() {
+        plans.push(scan_plan_for_stage(
+            "configured-roots",
+            30,
+            options.include_dirs.clone(),
+            &options,
+        ));
+    }
+
+    plans
+}
+
+fn scan_plan_for_stage(
+    stage: &str,
+    root_priority: u32,
+    include_roots: Vec<PathBuf>,
+    options: &IndexScanOptions,
+) -> IndexScanPlan {
+    IndexScanPlan {
+        include_roots,
+        exclude_dirs: options.exclude_dirs.clone(),
+        exclude_patterns: options.exclude_patterns.clone(),
+        respect_project_ignores: options.respect_project_ignores,
+        stage: Some(IndexScanStage::new(stage, root_priority)),
+    }
+}
+
+fn application_index_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+
+    #[cfg(target_os = "macos")]
+    {
+        roots.push(PathBuf::from("/Applications"));
+        if let Some(home) = home_dir() {
+            roots.push(home.join("Applications"));
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(program_data) = std::env::var("PROGRAMDATA") {
+            roots.push(
+                PathBuf::from(program_data)
+                    .join("Microsoft")
+                    .join("Windows")
+                    .join("Start Menu")
+                    .join("Programs"),
+            );
+        }
+        if let Ok(program_files) = std::env::var("ProgramFiles") {
+            roots.push(PathBuf::from(program_files));
+        }
+        if let Ok(program_files_x86) = std::env::var("ProgramFiles(x86)") {
+            roots.push(PathBuf::from(program_files_x86));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        roots.push(PathBuf::from("/usr/share/applications"));
+        if let Some(home) = home_dir() {
+            roots.push(home.join(".local").join("share").join("applications"));
+        }
+    }
+
+    roots
+}
+
+fn user_hot_path_roots() -> Vec<PathBuf> {
+    let Some(home) = home_dir() else {
+        return Vec::new();
+    };
+
+    [
+        "Desktop",
+        "Documents",
+        "Downloads",
+        "Projects",
+        "workspace",
+        "Workspace",
+    ]
+    .into_iter()
+    .map(|name| home.join(name))
+    .collect()
+}
+
+fn remaining_drive_roots(configured_roots: &[PathBuf]) -> Vec<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        return windows_existing_drive_roots()
+            .into_iter()
+            .map(PathBuf::from)
+            .filter(|path| !configured_roots.iter().any(|root| root == path))
+            .collect();
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = configured_roots;
+        Vec::new()
+    }
+}
+
+fn existing_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    paths.into_iter().filter(|path| path.is_dir()).collect()
+}
+
+fn unique_pathbufs(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut unique = Vec::new();
+    for path in paths {
+        if !unique.iter().any(|existing| existing == &path) {
+            unique.push(path);
+        }
+    }
+    unique
+}
+
 fn implicit_exclude_patterns() -> Vec<String> {
-    vec![".*".to_owned()]
+    [
+        ".*",
+        "$Recycle.Bin",
+        "System Volume Information",
+        "Windows",
+        "Recovery",
+        "AppData",
+        "node_modules",
+        "target",
+        ".git",
+        ".cache",
+        "__pycache__",
+        ".venv",
+        "venv",
+        "dist",
+        "build",
+        ".next",
+        ".turbo",
+        "*.tmp",
+        "*.log",
+        "pagefile.sys",
+        "hiberfil.sys",
+        "swapfile.sys",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
 }
 
 fn implicit_exclude_dirs(_config: &QuickFoxConfig) -> Vec<PathBuf> {
@@ -536,14 +751,78 @@ fn start_background_index_refresh<R: tauri::Runtime>(
     thread::Builder::new()
         .name("quickfox-index-refresh".to_owned())
         .spawn(move || {
-            let completed_at_ms = current_time_ms();
-            let scan_result = IndexScanner.scan(build_scan_options(&config));
-            let app_for_update = app.clone();
-            let update_result = match scan_result {
-                Ok(report) => {
+            let scanner = IndexScanner;
+            let mut aggregate_report = IndexReport::default();
+            let mut entries_by_path = std::collections::BTreeMap::new();
+            let mut update_result = Ok(());
+
+            for plan in build_scan_plans(&config) {
+                let stage_name = plan
+                    .stage
+                    .as_ref()
+                    .map(|stage| stage.name.clone())
+                    .unwrap_or_else(|| "configured-roots".to_owned());
+                let scan_result = scanner.scan_plan(plan);
+                let completed_at_ms = current_time_ms();
+                let app_for_update = app.clone();
+                match scan_result {
+                    Ok(stage_report) => {
+                        merge_index_report(
+                            &mut aggregate_report,
+                            &mut entries_by_path,
+                            stage_report,
+                        );
+                        if let Some(storage) = storage_store() {
+                            let _ = storage.save_completed_index_batch(
+                                completed_at_ms,
+                                &aggregate_report.entries,
+                            );
+                        }
+                        let progress_report = aggregate_report.clone();
+                        let current_root =
+                            last_finished_root_for_stage(&progress_report, &stage_name);
+                        let app_for_state = app_for_update.clone();
+                        update_result = app_for_update.run_on_main_thread(move || {
+                            let state = app_for_state.state::<QuickFoxAppState>();
+                            if let Some(status) = apply_index_refresh_progress(
+                                &state,
+                                generation,
+                                stage_name,
+                                current_root,
+                                progress_report,
+                            ) {
+                                let _ = app_for_state.emit("quickfox://index-status", status);
+                            }
+                        });
+                    }
+                    Err(error) => {
+                        let message = error.to_string();
+                        let app_for_state = app_for_update.clone();
+                        update_result = app_for_update.run_on_main_thread(move || {
+                            let state = app_for_state.state::<QuickFoxAppState>();
+                            if let Some(status) =
+                                apply_failed_index_refresh(&state, generation, message)
+                            {
+                                let _ = app_for_state.emit("quickfox://index-status", status);
+                            }
+                        });
+                        break;
+                    }
+                }
+
+                if update_result.is_err() {
+                    break;
+                }
+            }
+
+            if update_result.is_ok() {
+                let completed_at_ms = current_time_ms();
+                let app_for_update = app.clone();
+                let final_report = aggregate_report;
+                update_result = {
                     if let Some(storage) = storage_store() {
-                        let _ =
-                            storage.save_completed_index_batch(completed_at_ms, &report.entries);
+                        let _ = storage
+                            .save_completed_index_batch(completed_at_ms, &final_report.entries);
                     }
                     let app_for_state = app_for_update.clone();
                     app_for_update.run_on_main_thread(move || {
@@ -551,26 +830,15 @@ fn start_background_index_refresh<R: tauri::Runtime>(
                         if let Some(status) = apply_completed_index_refresh(
                             &state,
                             generation,
-                            report,
+                            final_report,
                             completed_at_ms,
                         ) {
                             let _ = app_for_state.emit("quickfox://index-status", status);
                         }
                     })
-                }
-                Err(error) => {
-                    let message = error.to_string();
-                    let app_for_state = app_for_update.clone();
-                    app_for_update.run_on_main_thread(move || {
-                        let state = app_for_state.state::<QuickFoxAppState>();
-                        if let Some(status) =
-                            apply_failed_index_refresh(&state, generation, message)
-                        {
-                            let _ = app_for_state.emit("quickfox://index-status", status);
-                        }
-                    })
-                }
-            };
+                };
+            }
+
             if let Err(error) = update_result {
                 eprintln!("QuickFox index refresh dispatch failed: {error}");
             }
@@ -596,6 +864,63 @@ fn apply_completed_index_refresh(
     {
         return None;
     }
+    runtime.index = build_search_index_for_config(&runtime.config, report.entries.clone());
+    runtime.last_report = report;
+    match start_runtime_index_watcher(&mut runtime) {
+        Ok(()) => {}
+        Err(failure) => {
+            let _ = record_watcher_failure(&mut runtime, failure);
+        }
+    }
+    Some(runtime.index_status())
+}
+
+fn start_runtime_index_watcher(runtime: &mut QuickFoxRuntime) -> Result<(), WatcherFailure> {
+    if !runtime.config.index.watcher_enabled {
+        runtime.index_watcher = None;
+        runtime.watcher_failure_summary = None;
+        return Ok(());
+    }
+
+    let roots = roots_from_entries(runtime.index.entries());
+    if roots.is_empty() {
+        runtime.index_watcher = None;
+        runtime.watcher_failure_summary = None;
+        return Ok(());
+    }
+
+    let (sender, _receiver) = std::sync::mpsc::channel();
+    let watcher = RuntimeIndexWatcher::watch_roots(roots, sender)?;
+    runtime.index_watcher = Some(watcher);
+    runtime.watcher_failure_summary = None;
+    Ok(())
+}
+
+fn record_watcher_failure(runtime: &mut QuickFoxRuntime, failure: WatcherFailure) -> IndexStatus {
+    runtime.watcher_failure_summary = Some(failure.message);
+    runtime.index_status()
+}
+
+fn apply_index_refresh_progress(
+    state: &QuickFoxAppState,
+    generation: u64,
+    stage: String,
+    current_root: Option<String>,
+    report: IndexReport,
+) -> Option<IndexStatus> {
+    let mut runtime = state
+        .runtime
+        .lock()
+        .expect("quickfox runtime lock poisoned");
+    if !runtime.index_lifecycle.update_progress(
+        generation,
+        stage,
+        current_root,
+        report.scan_stats.clone(),
+        report.entries.len(),
+    ) {
+        return None;
+    }
     runtime.index = SearchIndex::from_entries(report.entries.clone());
     runtime.last_report = report;
     Some(runtime.index_status())
@@ -615,6 +940,58 @@ fn apply_failed_index_refresh(
     } else {
         None
     }
+}
+
+fn merge_index_report(
+    aggregate_report: &mut IndexReport,
+    entries_by_path: &mut std::collections::BTreeMap<String, crate::core::index::IndexedEntry>,
+    stage_report: IndexReport,
+) {
+    aggregate_report.failures.extend(stage_report.failures);
+    aggregate_report
+        .scan_events
+        .extend(stage_report.scan_events);
+    aggregate_report.scan_stats = IndexScanStats {
+        scanned: aggregate_report
+            .scan_stats
+            .scanned
+            .saturating_add(stage_report.scan_stats.scanned),
+        accepted: aggregate_report
+            .scan_stats
+            .accepted
+            .saturating_add(stage_report.scan_stats.accepted),
+        skipped: aggregate_report
+            .scan_stats
+            .skipped
+            .saturating_add(stage_report.scan_stats.skipped),
+        failures: aggregate_report
+            .scan_stats
+            .failures
+            .saturating_add(stage_report.scan_stats.failures),
+    };
+    for entry in stage_report.entries {
+        entries_by_path.insert(entry.path.clone(), entry);
+    }
+    aggregate_report.entries = entries_by_path.values().cloned().collect();
+}
+
+fn last_finished_root_for_stage(report: &IndexReport, stage: &str) -> Option<String> {
+    report
+        .scan_events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            ScanEvent::RootFinished {
+                root,
+                stage: event_stage,
+                ..
+            } if event_stage.as_deref() == Some(stage) => Some(root.clone()),
+            ScanEvent::RootStarted {
+                root,
+                stage: event_stage,
+            } if event_stage.as_deref() == Some(stage) => Some(root.clone()),
+            _ => None,
+        })
 }
 
 fn build_runtime() -> QuickFoxRuntime {
@@ -643,18 +1020,103 @@ fn build_runtime_from_snapshot(
     let report = IndexReport {
         entries: entries.clone(),
         failures: Vec::new(),
+        ..Default::default()
     };
+    let index = build_search_index_for_config(&config, entries.clone());
     QuickFoxRuntime {
         config,
-        index: SearchIndex::from_entries(entries),
+        index,
         index_lifecycle,
         last_report: report,
+        index_watcher: None,
+        watcher_failure_summary: None,
     }
+}
+
+fn build_search_index_for_config(
+    config: &QuickFoxConfig,
+    mut entries: Vec<IndexedEntry>,
+) -> SearchIndex {
+    let content_roots = content_index_roots(config);
+    if content_roots.is_empty() || entries.is_empty() {
+        return SearchIndex::from_entries(entries);
+    }
+
+    let mut content_entries: Vec<_> = entries
+        .iter()
+        .filter(|entry| entry_is_under_content_root(entry, &content_roots))
+        .cloned()
+        .collect();
+    if content_entries.is_empty() {
+        return SearchIndex::from_entries(entries);
+    }
+
+    match ContentIndex::build(&mut content_entries, content_index_options(config)) {
+        Ok(content_index) => {
+            let states_by_path: std::collections::HashMap<_, _> = content_entries
+                .into_iter()
+                .map(|entry| (entry.path, entry.content_index_state))
+                .collect();
+            for entry in &mut entries {
+                entry.content_index_state = states_by_path
+                    .get(&entry.path)
+                    .cloned()
+                    .unwrap_or(ContentIndexState::NotIndexed);
+            }
+            SearchIndex::from_entries_with_content_index(entries, content_index)
+        }
+        Err(error) => {
+            eprintln!("QuickFox content index build failed: {error}");
+            SearchIndex::from_entries(entries)
+        }
+    }
+}
+
+fn content_index_roots(config: &QuickFoxConfig) -> Vec<PathBuf> {
+    config
+        .index
+        .content_include_dirs
+        .iter()
+        .map(|root| PathBuf::from(expand_user_path(root)))
+        .collect()
+}
+
+fn entry_is_under_content_root(entry: &IndexedEntry, roots: &[PathBuf]) -> bool {
+    let path = PathBuf::from(&entry.path);
+    roots.iter().any(|root| path.starts_with(root))
+}
+
+fn content_index_options(config: &QuickFoxConfig) -> ContentIndexOptions {
+    ContentIndexOptions {
+        index_dir: content_index_base_dir(),
+        max_file_bytes: config.index.content_max_file_bytes,
+    }
+}
+
+#[cfg(not(test))]
+fn content_index_base_dir() -> PathBuf {
+    storage_file_path()
+        .and_then(|path| path.parent().map(|parent| parent.join("content-index")))
+        .unwrap_or_else(|| std::env::temp_dir().join("quickfox").join("content-index"))
+}
+
+#[cfg(test)]
+fn content_index_base_dir() -> PathBuf {
+    static CONTENT_INDEX_TEST_COUNTER: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+    let nonce = CONTENT_INDEX_TEST_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::env::temp_dir()
+        .join("quickfox")
+        .join(format!("content-index-test-{}-{nonce}", std::process::id()))
 }
 
 impl QuickFoxRuntime {
     fn index_status(&self) -> IndexStatus {
-        self.index_lifecycle.status().clone()
+        let mut status = self.index_lifecycle.status().clone();
+        if let Some(message) = &self.watcher_failure_summary {
+            status.message = Some(message.clone());
+        }
+        status
     }
 }
 
@@ -820,30 +1282,39 @@ fn build_app_paths(config_file_path: PathBuf, index_snapshot_path: PathBuf) -> A
 fn pending_global_hotkey_status() -> GlobalHotkeyStatus {
     GlobalHotkeyStatus {
         enabled: false,
-        message: "Shift+Shift 全局唤醒监听启动中".to_owned(),
+        message: "全局唤醒监听启动中".to_owned(),
         permission_settings_url: None,
     }
 }
 
-fn enabled_global_hotkey_status() -> GlobalHotkeyStatus {
+fn enabled_global_hotkey_status(shortcut: &WakeShortcut) -> GlobalHotkeyStatus {
     GlobalHotkeyStatus {
         enabled: true,
-        message: "Shift+Shift 全局唤醒可用".to_owned(),
+        message: format!("{} 全局唤醒可用", shortcut.display_label()),
         permission_settings_url: None,
     }
 }
 
-fn failed_global_hotkey_status(error: &keytap::Error) -> GlobalHotkeyStatus {
+fn failed_global_hotkey_status(
+    error: &keytap::Error,
+    shortcut: &WakeShortcut,
+) -> GlobalHotkeyStatus {
     let (message, permission_settings_url) = match error {
         keytap::Error::PermissionDenied => (
-            global_hotkey_permission_denied_message(),
+            global_hotkey_permission_denied_message(shortcut),
             global_hotkey_permission_settings_url(),
         ),
         keytap::Error::NoDevices => (
-            "未找到可监听的键盘设备，Shift+Shift 全局唤醒不可用".to_owned(),
+            format!(
+                "未找到可监听的键盘设备，{} 全局唤醒不可用",
+                shortcut.display_label()
+            ),
             None,
         ),
-        _ => (format!("Shift+Shift 全局唤醒监听启动失败: {error}"), None),
+        _ => (
+            format!("{} 全局唤醒监听启动失败: {error}", shortcut.display_label()),
+            None,
+        ),
     };
 
     GlobalHotkeyStatus {
@@ -853,20 +1324,21 @@ fn failed_global_hotkey_status(error: &keytap::Error) -> GlobalHotkeyStatus {
     }
 }
 
-fn global_hotkey_permission_denied_message() -> String {
+fn global_hotkey_permission_denied_message(shortcut: &WakeShortcut) -> String {
+    let shortcut_label = shortcut.display_label();
     #[cfg(target_os = "macos")]
     {
-        "需要授予输入监控权限后才能使用 Shift+Shift 全局唤醒".to_owned()
+        format!("需要授予输入监控权限后才能使用 {shortcut_label} 全局唤醒")
     }
 
     #[cfg(target_os = "linux")]
     {
-        "需要授予键盘设备读取权限后才能使用 Shift+Shift 全局唤醒".to_owned()
+        format!("需要授予键盘设备读取权限后才能使用 {shortcut_label} 全局唤醒")
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        "需要授予系统键盘监听权限后才能使用 Shift+Shift 全局唤醒".to_owned()
+        format!("需要授予系统键盘监听权限后才能使用 {shortcut_label} 全局唤醒")
     }
 }
 
@@ -900,13 +1372,36 @@ fn set_global_hotkey_status<R: tauri::Runtime>(
     let _ = app.emit_to("main", "quickfox://global-hotkey-status", status);
 }
 
-fn show_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>, state: &QuickFoxAppState) {
-    let effect = {
+fn refresh_enabled_global_hotkey_status<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    shortcut: &WakeShortcut,
+) {
+    let app_state = app.state::<QuickFoxAppState>();
+    let should_refresh = app_state
+        .global_hotkey_status
+        .lock()
+        .expect("quickfox global hotkey status lock poisoned")
+        .enabled;
+    if should_refresh {
+        set_global_hotkey_status(app, enabled_global_hotkey_status(shortcut));
+    }
+}
+
+fn toggle_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>, state: &QuickFoxAppState) {
+    let effect = if let Some(window) = app.get_webview_window("main") {
+        let visible = window.is_visible().unwrap_or(false);
+        let focused = window.is_focused().unwrap_or(false);
         let mut window_state = state
             .window_state
             .lock()
             .expect("quickfox window state lock poisoned");
-        sync_launcher_window_state_for_tray_show(&mut window_state)
+        next_launcher_window_effect(visible, focused, &mut window_state)
+    } else {
+        let mut window_state = state
+            .window_state
+            .lock()
+            .expect("quickfox window state lock poisoned");
+        sync_launcher_window_state_for_tray_toggle(&mut window_state)
     };
     apply_launcher_window_effect(app, effect);
 }
@@ -916,13 +1411,40 @@ fn show_settings_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
+        return;
+    }
+
+    match WebviewWindowBuilder::new(app, "settings", WebviewUrl::App("?view=settings".into()))
+        .title("QuickFox 设置")
+        .inner_size(940.0, 680.0)
+        .min_inner_size(420.0, 520.0)
+        .resizable(true)
+        .decorations(true)
+        .transparent(false)
+        .visible(true)
+        .build()
+    {
+        Ok(window) => {
+            let _ = window.set_focus();
+        }
+        Err(error) => {
+            eprintln!("QuickFox settings window open failed: {error}");
+        }
     }
 }
 
-fn hide_settings_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
-    if let Some(window) = app.get_webview_window("settings") {
-        let _ = window.hide();
+fn hide_launcher_after_focus_loss<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    state: &QuickFoxAppState,
+) {
+    {
+        let mut window_state = state
+            .window_state
+            .lock()
+            .expect("quickfox window state lock poisoned");
+        window_state.hide();
     }
+    apply_launcher_window_effect(app, LauncherWindowEffect::Hide);
 }
 
 fn tray_window_target(menu_id: &str) -> Option<TrayWindowTarget> {
@@ -969,33 +1491,132 @@ fn toggle_launcher_window_for_app<R: tauri::Runtime>(
     Ok(())
 }
 
-fn key_press_from_global_event(event: &keytap::Event) -> Option<crate::core::platform::KeyPress> {
+fn key_press_from_global_event(event: &keytap::Event) -> Option<KeyPress> {
     match event.kind {
-        EventKind::KeyDown(Key::ShiftLeft | Key::ShiftRight) => {
-            Some(crate::core::platform::KeyPress::Shift)
-        }
-        EventKind::KeyDown(_) => Some(crate::core::platform::KeyPress::Other),
-        EventKind::KeyUp(_) | EventKind::KeyRepeat(_) => None,
+        EventKind::KeyDown(key) => Some(KeyPress::KeyDown(hotkey_key_from_keytap(key))),
+        EventKind::KeyUp(key) => Some(KeyPress::KeyUp(hotkey_key_from_keytap(key))),
+        EventKind::KeyRepeat(_) => None,
     }
+}
+
+fn hotkey_key_from_keytap(key: Key) -> HotkeyKey {
+    match key {
+        Key::ShiftLeft | Key::ShiftRight => HotkeyKey::Shift,
+        Key::ControlLeft | Key::ControlRight => HotkeyKey::Control,
+        Key::AltLeft | Key::AltRight => HotkeyKey::Alt,
+        Key::MetaLeft | Key::MetaRight => HotkeyKey::Command,
+        Key::Space => HotkeyKey::Space,
+        Key::Enter | Key::NumpadEnter => HotkeyKey::Enter,
+        Key::Escape => HotkeyKey::Escape,
+        Key::Tab => HotkeyKey::Tab,
+        Key::Backspace => HotkeyKey::Backspace,
+        Key::Delete => HotkeyKey::Delete,
+        Key::ArrowUp => HotkeyKey::ArrowUp,
+        Key::ArrowDown => HotkeyKey::ArrowDown,
+        Key::ArrowLeft => HotkeyKey::ArrowLeft,
+        Key::ArrowRight => HotkeyKey::ArrowRight,
+        Key::A => HotkeyKey::Character('A'),
+        Key::B => HotkeyKey::Character('B'),
+        Key::C => HotkeyKey::Character('C'),
+        Key::D => HotkeyKey::Character('D'),
+        Key::E => HotkeyKey::Character('E'),
+        Key::F => HotkeyKey::Character('F'),
+        Key::G => HotkeyKey::Character('G'),
+        Key::H => HotkeyKey::Character('H'),
+        Key::I => HotkeyKey::Character('I'),
+        Key::J => HotkeyKey::Character('J'),
+        Key::K => HotkeyKey::Character('K'),
+        Key::L => HotkeyKey::Character('L'),
+        Key::M => HotkeyKey::Character('M'),
+        Key::N => HotkeyKey::Character('N'),
+        Key::O => HotkeyKey::Character('O'),
+        Key::P => HotkeyKey::Character('P'),
+        Key::Q => HotkeyKey::Character('Q'),
+        Key::R => HotkeyKey::Character('R'),
+        Key::S => HotkeyKey::Character('S'),
+        Key::T => HotkeyKey::Character('T'),
+        Key::U => HotkeyKey::Character('U'),
+        Key::V => HotkeyKey::Character('V'),
+        Key::W => HotkeyKey::Character('W'),
+        Key::X => HotkeyKey::Character('X'),
+        Key::Y => HotkeyKey::Character('Y'),
+        Key::Z => HotkeyKey::Character('Z'),
+        Key::Digit0 | Key::Numpad0 => HotkeyKey::Character('0'),
+        Key::Digit1 | Key::Numpad1 => HotkeyKey::Character('1'),
+        Key::Digit2 | Key::Numpad2 => HotkeyKey::Character('2'),
+        Key::Digit3 | Key::Numpad3 => HotkeyKey::Character('3'),
+        Key::Digit4 | Key::Numpad4 => HotkeyKey::Character('4'),
+        Key::Digit5 | Key::Numpad5 => HotkeyKey::Character('5'),
+        Key::Digit6 | Key::Numpad6 => HotkeyKey::Character('6'),
+        Key::Digit7 | Key::Numpad7 => HotkeyKey::Character('7'),
+        Key::Digit8 | Key::Numpad8 => HotkeyKey::Character('8'),
+        Key::Digit9 | Key::Numpad9 => HotkeyKey::Character('9'),
+        Key::F1 => HotkeyKey::Function(1),
+        Key::F2 => HotkeyKey::Function(2),
+        Key::F3 => HotkeyKey::Function(3),
+        Key::F4 => HotkeyKey::Function(4),
+        Key::F5 => HotkeyKey::Function(5),
+        Key::F6 => HotkeyKey::Function(6),
+        Key::F7 => HotkeyKey::Function(7),
+        Key::F8 => HotkeyKey::Function(8),
+        Key::F9 => HotkeyKey::Function(9),
+        Key::F10 => HotkeyKey::Function(10),
+        Key::F11 => HotkeyKey::Function(11),
+        Key::F12 => HotkeyKey::Function(12),
+        Key::F13 => HotkeyKey::Function(13),
+        Key::F14 => HotkeyKey::Function(14),
+        Key::F15 => HotkeyKey::Function(15),
+        Key::F16 => HotkeyKey::Function(16),
+        Key::F17 => HotkeyKey::Function(17),
+        Key::F18 => HotkeyKey::Function(18),
+        Key::F19 => HotkeyKey::Function(19),
+        Key::F20 => HotkeyKey::Function(20),
+        Key::F21 => HotkeyKey::Function(21),
+        Key::F22 => HotkeyKey::Function(22),
+        Key::F23 => HotkeyKey::Function(23),
+        Key::F24 => HotkeyKey::Function(24),
+        _ => HotkeyKey::Other,
+    }
+}
+
+fn current_wake_shortcut(config: &QuickFoxConfig) -> WakeShortcut {
+    WakeShortcut::parse(&config.hotkey.wake_shortcut).unwrap_or_default()
 }
 
 fn start_global_double_shift_listener(app: tauri::AppHandle) {
     thread::Builder::new()
         .name("quickfox-global-hotkey".to_owned())
         .spawn(move || {
+            let initial_shortcut = {
+                let state = app.state::<QuickFoxAppState>();
+                let runtime = state
+                    .runtime
+                    .lock()
+                    .expect("quickfox runtime lock poisoned");
+                current_wake_shortcut(&runtime.config)
+            };
             let tap = match Tap::builder().macos_no_repeat_detection().build() {
                 Ok(tap) => tap,
                 Err(error) => {
-                    let status = failed_global_hotkey_status(&error);
+                    let status = failed_global_hotkey_status(&error, &initial_shortcut);
                     set_global_hotkey_status(&app, status);
                     eprintln!("QuickFox global hotkey listener disabled: {error}");
                     return;
                 }
             };
-            set_global_hotkey_status(&app, enabled_global_hotkey_status());
-            let mut hotkey_state = crate::core::platform::HotkeyState::default();
+            set_global_hotkey_status(&app, enabled_global_hotkey_status(&initial_shortcut));
+            let mut hotkey_state = HotkeyState::with_shortcut(initial_shortcut);
 
             for event in tap.iter() {
+                let shortcut = {
+                    let state = app.state::<QuickFoxAppState>();
+                    let runtime = state
+                        .runtime
+                        .lock()
+                        .expect("quickfox runtime lock poisoned");
+                    current_wake_shortcut(&runtime.config)
+                };
+                hotkey_state.set_shortcut(shortcut);
                 let Some(key_press) = key_press_from_global_event(&event) else {
                     continue;
                 };
@@ -1030,11 +1651,10 @@ fn next_launcher_window_effect(
     state.toggle_for_global_hotkey()
 }
 
-fn sync_launcher_window_state_for_tray_show(
+fn sync_launcher_window_state_for_tray_toggle(
     state: &mut LauncherWindowState,
 ) -> LauncherWindowEffect {
-    state.show();
-    LauncherWindowEffect::ShowAndFocus
+    state.toggle_for_global_hotkey()
 }
 
 fn validate_command_action(command: &str, requires_confirmation: bool) -> Result<(), String> {
@@ -1065,7 +1685,7 @@ pub fn run() {
             use tauri::tray::TrayIconBuilder;
 
             let settings = MenuItem::with_id(app, "settings", "设置", true, None::<&str>)?;
-            let show = MenuItem::with_id(app, "show", "显示 QuickFox", true, None::<&str>)?;
+            let show = MenuItem::with_id(app, "show", "显示/隐藏 QuickFox", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&show, &settings, &quit])?;
             TrayIconBuilder::with_id("quickfox")
@@ -1077,23 +1697,29 @@ pub fn run() {
                     "show" => match tray_window_target("show") {
                         Some(TrayWindowTarget::Launcher) => {
                             let state = app.state::<QuickFoxAppState>();
-                            show_main_window(app, &state);
+                            toggle_main_window(app, &state);
                         }
                         Some(TrayWindowTarget::Settings) => show_settings_window(app),
                         None => {}
                     },
                     "settings" => match tray_window_target("settings") {
-                        Some(TrayWindowTarget::Launcher) => {
-                            let state = app.state::<QuickFoxAppState>();
-                            show_main_window(app, &state);
-                        }
                         Some(TrayWindowTarget::Settings) => show_settings_window(app),
-                        None => {}
+                        Some(TrayWindowTarget::Launcher) | None => {}
                     },
                     "quit" => app.exit(0),
                     _ => {}
                 })
                 .build(app)?;
+
+            if let Some(main_window) = app.get_webview_window("main") {
+                let handle = app.handle().clone();
+                main_window.on_window_event(move |event| {
+                    if matches!(event, WindowEvent::Focused(false)) {
+                        let state = handle.state::<QuickFoxAppState>();
+                        hide_launcher_after_focus_loss(&handle, &state);
+                    }
+                });
+            }
 
             start_global_double_shift_listener(app.handle().clone());
             let _ = start_background_index_refresh(app.handle().clone(), &app.state());
@@ -1105,7 +1731,6 @@ pub fn run() {
             index_status,
             toggle_launcher_window,
             open_settings_window,
-            return_to_launcher_window,
             search,
             execute_action,
             refresh_index,
@@ -1125,6 +1750,7 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn execute_action_refuses_unconfirmed_commands() {
@@ -1208,6 +1834,8 @@ mod tests {
             index: SearchIndex::default(),
             last_report: IndexReport::default(),
             index_lifecycle: IndexLifecycle::default(),
+            index_watcher: None,
+            watcher_failure_summary: None,
         };
 
         assert_eq!(
@@ -1226,7 +1854,13 @@ mod tests {
                     path: "/tmp/notes.md".to_owned(),
                     name: "notes.md".to_owned(),
                     kind: crate::core::index::IndexedEntryKind::File,
+                    ..crate::core::index::IndexedEntry::legacy(
+                        "",
+                        "",
+                        crate::core::index::IndexedEntryKind::File,
+                    )
                 }],
+                needs_full_refresh: false,
             }),
         );
 
@@ -1246,6 +1880,8 @@ mod tests {
                 index: SearchIndex::default(),
                 last_report: IndexReport::default(),
                 index_lifecycle: IndexLifecycle::default(),
+                index_watcher: None,
+                watcher_failure_summary: None,
             }),
             window_state: Mutex::new(LauncherWindowState::default()),
             global_hotkey_status: Mutex::new(pending_global_hotkey_status()),
@@ -1263,8 +1899,14 @@ mod tests {
                     path: "/tmp/notes.md".to_owned(),
                     name: "notes.md".to_owned(),
                     kind: crate::core::index::IndexedEntryKind::File,
+                    ..crate::core::index::IndexedEntry::legacy(
+                        "",
+                        "",
+                        crate::core::index::IndexedEntryKind::File,
+                    )
                 }],
                 failures: Vec::new(),
+                ..Default::default()
             },
             123,
         )
@@ -1276,6 +1918,126 @@ mod tests {
     }
 
     #[test]
+    fn completed_index_refresh_wires_configured_content_index_into_search() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("AGENTS.md");
+        fs::write(
+            &file,
+            "intro\nAgent type: md\ncontent mentions openspec workflow\nnext line\n",
+        )
+        .unwrap();
+        let root_text = root.path().to_string_lossy().to_string();
+        let mut config = QuickFoxConfig::default_with_index_dirs(vec![root_text.clone()]);
+        config.index.content_include_dirs = vec![root_text.clone()];
+        config.index.watcher_enabled = false;
+        let state = QuickFoxAppState {
+            runtime: Mutex::new(QuickFoxRuntime {
+                config: config.clone(),
+                index: SearchIndex::default(),
+                last_report: IndexReport::default(),
+                index_lifecycle: IndexLifecycle::default(),
+                index_watcher: None,
+                watcher_failure_summary: None,
+            }),
+            window_state: Mutex::new(LauncherWindowState::default()),
+            global_hotkey_status: Mutex::new(pending_global_hotkey_status()),
+        };
+        let generation = {
+            let mut runtime = state.runtime.lock().unwrap();
+            runtime.index_lifecycle.start_refresh(false)
+        };
+
+        apply_completed_index_refresh(
+            &state,
+            generation,
+            IndexReport {
+                entries: vec![crate::core::index::IndexedEntry::from_path_metadata(
+                    &file,
+                    root.path(),
+                    crate::core::index::IndexedEntryKind::File,
+                )],
+                failures: Vec::new(),
+                ..Default::default()
+            },
+            123,
+        )
+        .expect("fresh completion emits status");
+
+        let runtime = state.runtime.lock().unwrap();
+        let results = perform_search_with_index_status(
+            &runtime.config,
+            &runtime.index,
+            &runtime.index_status(),
+            "name:AGENTS content:”openspec”",
+        );
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "AGENTS.md");
+        let snippet = results[0].snippet.as_ref().expect("content snippet");
+        assert!(snippet.lines.iter().any(|line| line.contains("openspec")));
+        assert_eq!(
+            runtime.index.entries()[0].content_index_state,
+            ContentIndexState::Indexed
+        );
+    }
+
+    #[test]
+    fn index_refresh_progress_updates_runtime_and_stage_payload() {
+        let state = QuickFoxAppState {
+            runtime: Mutex::new(QuickFoxRuntime {
+                config: QuickFoxConfig::default_with_index_dirs(vec!["/tmp".to_owned()]),
+                index: SearchIndex::default(),
+                last_report: IndexReport::default(),
+                index_lifecycle: IndexLifecycle::default(),
+                index_watcher: None,
+                watcher_failure_summary: None,
+            }),
+            window_state: Mutex::new(LauncherWindowState::default()),
+            global_hotkey_status: Mutex::new(pending_global_hotkey_status()),
+        };
+        let generation = {
+            let mut runtime = state.runtime.lock().unwrap();
+            runtime.index_lifecycle.start_refresh(false)
+        };
+
+        let status = apply_index_refresh_progress(
+            &state,
+            generation,
+            "configured-roots".to_owned(),
+            Some("/tmp".to_owned()),
+            IndexReport {
+                entries: vec![crate::core::index::IndexedEntry::legacy(
+                    "/tmp/notes.md",
+                    "notes.md",
+                    crate::core::index::IndexedEntryKind::File,
+                )],
+                failures: Vec::new(),
+                scan_stats: IndexScanStats {
+                    scanned: 4,
+                    accepted: 1,
+                    skipped: 2,
+                    failures: 1,
+                },
+                scan_events: Vec::new(),
+            },
+        )
+        .expect("fresh progress emits status");
+
+        assert_eq!(status.kind, crate::core::index::IndexStatusKind::Building);
+        assert_eq!(status.entry_count, 1);
+        assert_eq!(status.stage, "configured-roots");
+        assert_eq!(status.current_root.as_deref(), Some("/tmp"));
+        assert_eq!(status.scanned, 4);
+        assert_eq!(status.accepted, 1);
+        assert_eq!(status.skipped, 2);
+        assert_eq!(status.failures, 1);
+        assert_eq!(
+            state.runtime.lock().unwrap().index.entries()[0].name,
+            "notes.md"
+        );
+    }
+
+    #[test]
     fn failed_index_refresh_returns_status_for_frontend_event() {
         let state = QuickFoxAppState {
             runtime: Mutex::new(QuickFoxRuntime {
@@ -1283,6 +2045,8 @@ mod tests {
                 index: SearchIndex::default(),
                 last_report: IndexReport::default(),
                 index_lifecycle: IndexLifecycle::default(),
+                index_watcher: None,
+                watcher_failure_summary: None,
             }),
             window_state: Mutex::new(LauncherWindowState::default()),
             global_hotkey_status: Mutex::new(pending_global_hotkey_status()),
@@ -1297,6 +2061,71 @@ mod tests {
 
         assert_eq!(status.kind, crate::core::index::IndexStatusKind::Failed);
         assert_eq!(status.message.as_deref(), Some("权限不足"));
+    }
+
+    #[test]
+    fn watcher_failure_summary_is_exposed_without_disabling_ready_index() {
+        let state = QuickFoxAppState {
+            runtime: Mutex::new(QuickFoxRuntime {
+                config: QuickFoxConfig::default_with_index_dirs(vec!["/tmp".to_owned()]),
+                index: SearchIndex::from_entries(vec![crate::core::index::IndexedEntry::legacy(
+                    "/tmp/notes.md",
+                    "notes.md",
+                    crate::core::index::IndexedEntryKind::File,
+                )]),
+                last_report: IndexReport::default(),
+                index_lifecycle: IndexLifecycle::from_ready(1, 123),
+                index_watcher: None,
+                watcher_failure_summary: None,
+            }),
+            window_state: Mutex::new(LauncherWindowState::default()),
+            global_hotkey_status: Mutex::new(pending_global_hotkey_status()),
+        };
+
+        let status = {
+            let mut runtime = state.runtime.lock().unwrap();
+            record_watcher_failure(
+                &mut runtime,
+                crate::core::index_watcher::WatcherFailure::new(
+                    PathBuf::from("/tmp"),
+                    "too many open files".to_owned(),
+                ),
+            )
+        };
+
+        assert_eq!(status.kind, crate::core::index::IndexStatusKind::Ready);
+        assert_eq!(status.entry_count, 1);
+        assert!(status.message.unwrap().contains("background refresh"));
+        assert_eq!(state.runtime.lock().unwrap().index.entries().len(), 1);
+    }
+
+    #[test]
+    fn runtime_watcher_uses_index_entry_roots() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("notes.md");
+        fs::write(&file, "notes").unwrap();
+        let mut runtime = QuickFoxRuntime {
+            config: QuickFoxConfig::default_with_index_dirs(vec![root
+                .path()
+                .to_string_lossy()
+                .to_string()]),
+            index: SearchIndex::from_entries(vec![
+                crate::core::index::IndexedEntry::from_path_metadata(
+                    &file,
+                    root.path(),
+                    crate::core::index::IndexedEntryKind::File,
+                ),
+            ]),
+            last_report: IndexReport::default(),
+            index_lifecycle: IndexLifecycle::from_ready(1, 123),
+            index_watcher: None,
+            watcher_failure_summary: None,
+        };
+
+        start_runtime_index_watcher(&mut runtime).unwrap();
+
+        let roots = runtime.index_watcher.as_ref().unwrap().watched_roots();
+        assert_eq!(roots, &[root.path().to_path_buf()]);
     }
 
     #[test]
@@ -1331,6 +2160,11 @@ mod tests {
             path: "/tmp/Downloads".to_owned(),
             name: "Downloads".to_owned(),
             kind: crate::core::index::IndexedEntryKind::Directory,
+            ..crate::core::index::IndexedEntry::legacy(
+                "",
+                "",
+                crate::core::index::IndexedEntryKind::Directory,
+            )
         }]);
 
         let file_results = perform_search(&config, &index, "down");
@@ -1355,6 +2189,12 @@ mod tests {
             message: None,
             generation: 1,
             completed_at_ms: None,
+            stage: String::new(),
+            current_root: None,
+            scanned: 0,
+            accepted: 0,
+            skipped: 0,
+            failures: 0,
         };
 
         let calculator_results =
@@ -1384,11 +2224,21 @@ mod tests {
                 path: "/tmp/Documents".to_owned(),
                 name: "Documents".to_owned(),
                 kind: crate::core::index::IndexedEntryKind::Directory,
+                ..crate::core::index::IndexedEntry::legacy(
+                    "",
+                    "",
+                    crate::core::index::IndexedEntryKind::Directory,
+                )
             },
             crate::core::index::IndexedEntry {
                 path: "/tmp/Documents-2".to_owned(),
                 name: "Documents-2".to_owned(),
                 kind: crate::core::index::IndexedEntryKind::Directory,
+                ..crate::core::index::IndexedEntry::legacy(
+                    "",
+                    "",
+                    crate::core::index::IndexedEntryKind::Directory,
+                )
             },
         ]);
 
@@ -1404,6 +2254,57 @@ mod tests {
         let options = build_scan_options(&config);
 
         assert!(options.exclude_patterns.contains(&".*".to_owned()));
+        assert!(options.exclude_patterns.contains(&"Windows".to_owned()));
+        assert!(options.exclude_patterns.contains(&"AppData".to_owned()));
+        assert!(options
+            .exclude_patterns
+            .contains(&"System Volume Information".to_owned()));
+    }
+
+    #[test]
+    fn build_scan_plan_uses_project_ignore_config() {
+        let mut config = QuickFoxConfig::default_with_index_dirs(vec!["/tmp".to_owned()]);
+        config.index.respect_project_ignores = false;
+
+        let plans = build_scan_plans(&config);
+
+        assert!(plans.iter().any(|plan| !plan.respect_project_ignores));
+    }
+
+    #[test]
+    fn disabled_watcher_skips_runtime_watcher_start() {
+        let mut runtime = QuickFoxRuntime {
+            config: QuickFoxConfig::default_with_index_dirs(vec!["/tmp".to_owned()]),
+            index: SearchIndex::from_entries(vec![crate::core::index::IndexedEntry {
+                path: "/tmp/report.md".to_owned(),
+                name: "report.md".to_owned(),
+                kind: crate::core::index::IndexedEntryKind::File,
+                root: "/tmp".to_owned(),
+                ..crate::core::index::IndexedEntry::legacy(
+                    "",
+                    "",
+                    crate::core::index::IndexedEntryKind::File,
+                )
+            }]),
+            last_report: IndexReport::default(),
+            index_lifecycle: IndexLifecycle::default(),
+            index_watcher: None,
+            watcher_failure_summary: None,
+        };
+        runtime.config.index.watcher_enabled = false;
+
+        start_runtime_index_watcher(&mut runtime).unwrap();
+
+        assert!(runtime.index_watcher.is_none());
+    }
+
+    #[test]
+    fn windows_drive_root_discovery_uses_available_fixed_drives() {
+        let roots = windows_drive_roots_from_letters(['C', 'D', 'E'], |root| {
+            root == "C:\\" || root == "E:\\"
+        });
+
+        assert_eq!(roots, vec!["C:\\".to_owned(), "E:\\".to_owned()]);
     }
 
     #[test]
@@ -1477,21 +2378,28 @@ mod tests {
     }
 
     #[test]
-    fn tray_show_marks_window_visible_and_focused_for_next_hotkey_toggle() {
+    fn tray_toggle_hides_focused_window_and_shows_hidden_window() {
         let mut state = LauncherWindowState::default();
 
+        state.show();
         assert_eq!(
-            sync_launcher_window_state_for_tray_show(&mut state),
+            sync_launcher_window_state_for_tray_toggle(&mut state),
+            LauncherWindowEffect::Hide
+        );
+        assert!(!state.is_visible());
+
+        assert_eq!(
+            sync_launcher_window_state_for_tray_toggle(&mut state),
             LauncherWindowEffect::ShowAndFocus
         );
         assert!(state.is_visible());
         assert!(state.is_focused());
-        assert_eq!(state.toggle_for_global_hotkey(), LauncherWindowEffect::Hide);
     }
 
     #[test]
     fn global_hotkey_permission_failure_returns_actionable_status() {
-        let status = failed_global_hotkey_status(&keytap::Error::PermissionDenied);
+        let status =
+            failed_global_hotkey_status(&keytap::Error::PermissionDenied, &WakeShortcut::default());
 
         assert!(!status.enabled);
         assert!(status.message.contains("Shift+Shift"));
@@ -1509,11 +2417,21 @@ mod tests {
 
     #[test]
     fn global_hotkey_enabled_status_describes_shift_shift() {
-        let status = enabled_global_hotkey_status();
+        let status = enabled_global_hotkey_status(&WakeShortcut::default());
 
         assert!(status.enabled);
         assert_eq!(status.message, "Shift+Shift 全局唤醒可用");
         assert_eq!(status.permission_settings_url, None);
+    }
+
+    #[test]
+    fn global_hotkey_enabled_status_describes_custom_shortcut() {
+        let status = enabled_global_hotkey_status(
+            &WakeShortcut::parse("Control+Space").expect("valid shortcut"),
+        );
+
+        assert!(status.enabled);
+        assert_eq!(status.message, "Control+Space 全局唤醒可用");
     }
 
     #[test]
@@ -1523,14 +2441,21 @@ mod tests {
                 time: std::time::Instant::now(),
                 kind: EventKind::KeyDown(Key::ShiftLeft),
             }),
-            Some(crate::core::platform::KeyPress::Shift)
+            Some(KeyPress::KeyDown(HotkeyKey::Shift))
         );
         assert_eq!(
             key_press_from_global_event(&keytap::Event {
                 time: std::time::Instant::now(),
                 kind: EventKind::KeyDown(Key::A),
             }),
-            Some(crate::core::platform::KeyPress::Other)
+            Some(KeyPress::KeyDown(HotkeyKey::Character('A')))
+        );
+        assert_eq!(
+            key_press_from_global_event(&keytap::Event {
+                time: std::time::Instant::now(),
+                kind: EventKind::KeyUp(Key::ControlLeft),
+            }),
+            Some(KeyPress::KeyUp(HotkeyKey::Control))
         );
         assert_eq!(
             key_press_from_global_event(&keytap::Event {

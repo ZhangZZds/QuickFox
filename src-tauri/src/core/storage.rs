@@ -1,6 +1,7 @@
 //! SQLite storage will live here.
 
 use crate::core::index::{IndexedEntry, IndexedEntryKind};
+use crate::core::index_entry::{build_search_text, ContentIndexState};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::PathBuf;
 
@@ -22,6 +23,7 @@ pub struct PathUsage {
 pub struct IndexSnapshot {
     pub completed_at_ms: i64,
     pub entries: Vec<IndexedEntry>,
+    pub needs_full_refresh: bool,
 }
 
 #[derive(Debug)]
@@ -96,6 +98,30 @@ impl SqliteStorage {
                 ON index_entries(batch_id);
             "#,
         )?;
+        self.ensure_index_entry_metadata_columns()?;
+        self.connection.pragma_update(None, "user_version", 2)?;
+        Ok(())
+    }
+
+    fn ensure_index_entry_metadata_columns(&self) -> Result<(), StorageError> {
+        let existing = index_entry_columns(&self.connection)?;
+        let columns = [
+            ("parent", "TEXT"),
+            ("extension", "TEXT"),
+            ("depth", "INTEGER"),
+            ("root", "TEXT"),
+            ("modified_ms", "INTEGER"),
+            ("size_bytes", "INTEGER"),
+            ("content_index_state", "TEXT"),
+        ];
+        for (name, sql_type) in columns {
+            if !existing.contains(&name.to_owned()) {
+                self.connection.execute(
+                    &format!("ALTER TABLE index_entries ADD COLUMN {name} {sql_type}"),
+                    [],
+                )?;
+            }
+        }
         Ok(())
     }
 
@@ -153,8 +179,22 @@ impl SqliteStorage {
             let mut statement = transaction.prepare(
                 r#"
                 INSERT INTO index_entries
-                    (batch_id, path, name, kind, search_text, updated_at_ms)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                    (
+                        batch_id,
+                        path,
+                        name,
+                        kind,
+                        search_text,
+                        updated_at_ms,
+                        parent,
+                        extension,
+                        depth,
+                        root,
+                        modified_ms,
+                        size_bytes,
+                        content_index_state
+                    )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
                 "#,
             )?;
             for entry in entries {
@@ -165,6 +205,13 @@ impl SqliteStorage {
                     index_kind_to_storage(&entry.kind),
                     searchable_text(entry),
                     completed_at_ms,
+                    nullable_text(&entry.parent),
+                    entry.extension.as_deref(),
+                    entry.depth as i64,
+                    nullable_text(&entry.root),
+                    entry.modified_ms,
+                    entry.size_bytes.map(|size| size as i64),
+                    content_index_state_to_storage(&entry.content_index_state),
                 ])?;
             }
         }
@@ -193,17 +240,45 @@ impl SqliteStorage {
 
         let mut statement = self.connection.prepare(
             r#"
-            SELECT path, name, kind
+            SELECT
+                path,
+                name,
+                kind,
+                COALESCE(parent, ''),
+                extension,
+                COALESCE(depth, 0),
+                COALESCE(root, ''),
+                modified_ms,
+                size_bytes,
+                COALESCE(search_text, ''),
+                COALESCE(content_index_state, 'not_indexed')
             FROM index_entries
             WHERE batch_id = ?1
             ORDER BY path ASC, name ASC
             "#,
         )?;
         let rows = statement.query_map(params![batch_id], |row| {
+            let path: String = row.get(0)?;
+            let name: String = row.get(1)?;
+            let search_text: String = row.get(9)?;
             Ok(IndexedEntry {
-                path: row.get(0)?,
-                name: row.get(1)?,
+                path: path.clone(),
+                name: name.clone(),
                 kind: index_kind_from_storage(row.get::<_, String>(2)?.as_str()),
+                parent: row.get(3)?,
+                extension: row.get(4)?,
+                depth: row.get::<_, i64>(5)?.max(0) as usize,
+                root: row.get(6)?,
+                modified_ms: row.get(7)?,
+                size_bytes: row.get::<_, Option<i64>>(8)?.map(|size| size.max(0) as u64),
+                search_text: if search_text.is_empty() {
+                    build_search_text(&name, &path)
+                } else {
+                    search_text
+                },
+                content_index_state: content_index_state_from_storage(
+                    row.get::<_, String>(10)?.as_str(),
+                ),
             })
         })?;
         let mut entries = Vec::new();
@@ -214,6 +289,7 @@ impl SqliteStorage {
         Ok(Some(IndexSnapshot {
             completed_at_ms,
             entries,
+            needs_full_refresh: snapshot_needs_full_refresh(&self.connection, batch_id)?,
         }))
     }
 
@@ -367,7 +443,19 @@ impl SqliteStorage {
 }
 
 fn searchable_text(entry: &IndexedEntry) -> String {
-    format!("{} {}", entry.name, entry.path).to_lowercase()
+    if entry.search_text.is_empty() {
+        build_search_text(&entry.name, &entry.path)
+    } else {
+        entry.search_text.clone()
+    }
+}
+
+fn nullable_text(value: &str) -> Option<&str> {
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
 }
 
 fn index_kind_to_storage(kind: &IndexedEntryKind) -> &'static str {
@@ -384,6 +472,59 @@ fn index_kind_from_storage(kind: &str) -> IndexedEntryKind {
         "directory" => IndexedEntryKind::Directory,
         _ => IndexedEntryKind::File,
     }
+}
+
+fn content_index_state_to_storage(state: &ContentIndexState) -> &'static str {
+    match state {
+        ContentIndexState::NotIndexed => "not_indexed",
+        ContentIndexState::Indexed => "indexed",
+        ContentIndexState::SkippedTooLarge => "skipped_too_large",
+        ContentIndexState::SkippedBinary => "skipped_binary",
+        ContentIndexState::ReadFailed => "read_failed",
+    }
+}
+
+fn content_index_state_from_storage(state: &str) -> ContentIndexState {
+    match state {
+        "indexed" => ContentIndexState::Indexed,
+        "skipped_too_large" => ContentIndexState::SkippedTooLarge,
+        "skipped_binary" => ContentIndexState::SkippedBinary,
+        "read_failed" => ContentIndexState::ReadFailed,
+        _ => ContentIndexState::NotIndexed,
+    }
+}
+
+fn index_entry_columns(connection: &Connection) -> Result<Vec<String>, StorageError> {
+    let mut statement = connection.prepare("PRAGMA table_info(index_entries)")?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+    let mut columns = Vec::new();
+    for row in rows {
+        columns.push(row?);
+    }
+    Ok(columns)
+}
+
+fn snapshot_needs_full_refresh(
+    connection: &Connection,
+    batch_id: i64,
+) -> Result<bool, StorageError> {
+    Ok(connection.query_row(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM index_entries
+            WHERE batch_id = ?1
+              AND (
+                parent IS NULL
+                OR root IS NULL
+                OR depth IS NULL
+                OR content_index_state IS NULL
+              )
+        )
+        "#,
+        params![batch_id],
+        |row| row.get::<_, i64>(0),
+    )? != 0)
 }
 
 #[cfg(test)]
@@ -439,11 +580,13 @@ mod tests {
                         path: "/home/frank/Documents".to_owned(),
                         name: "Documents".to_owned(),
                         kind: IndexedEntryKind::Directory,
+                        ..IndexedEntry::legacy("", "", IndexedEntryKind::Directory)
                     },
                     IndexedEntry {
                         path: "/home/frank/notes.md".to_owned(),
                         name: "notes.md".to_owned(),
                         kind: IndexedEntryKind::File,
+                        ..IndexedEntry::legacy("", "", IndexedEntryKind::File)
                     },
                 ],
             )
@@ -455,6 +598,7 @@ mod tests {
                     path: "/home/frank/Downloads".to_owned(),
                     name: "Downloads".to_owned(),
                     kind: IndexedEntryKind::Directory,
+                    ..IndexedEntry::legacy("", "", IndexedEntryKind::Directory)
                 }],
             )
             .unwrap();
@@ -467,8 +611,89 @@ mod tests {
                 path: "/home/frank/Downloads".to_owned(),
                 name: "Downloads".to_owned(),
                 kind: IndexedEntryKind::Directory,
+                ..IndexedEntry::legacy("", "", IndexedEntryKind::Directory)
             }]
         );
+
+        drop(storage);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn latest_snapshot_restores_index_metadata() {
+        let path = temp_db_path("index-snapshot-metadata");
+        let storage = SqliteStorage::open(path.clone()).unwrap();
+        let entry = IndexedEntry {
+            path: "/home/frank/Documents/report.PDF".to_owned(),
+            name: "report.PDF".to_owned(),
+            kind: IndexedEntryKind::File,
+            parent: "/home/frank/Documents".to_owned(),
+            extension: Some("pdf".to_owned()),
+            depth: 2,
+            root: "/home/frank".to_owned(),
+            modified_ms: Some(1234),
+            size_bytes: Some(4096),
+            search_text: "report.pdf /home/frank/documents/report.pdf".to_owned(),
+            content_index_state: crate::core::index_entry::ContentIndexState::SkippedTooLarge,
+        };
+
+        storage
+            .save_completed_index_batch(300, std::slice::from_ref(&entry))
+            .unwrap();
+
+        let snapshot = storage.latest_index_snapshot().unwrap().unwrap();
+        assert_eq!(snapshot.entries, vec![entry]);
+        assert!(!snapshot.needs_full_refresh);
+
+        drop(storage);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn legacy_index_snapshot_without_metadata_still_loads() {
+        let path = temp_db_path("index-snapshot-legacy");
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute_batch(
+                    r#"
+                    CREATE TABLE index_batches (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        completed_at_ms INTEGER NOT NULL,
+                        entry_count INTEGER NOT NULL
+                    );
+                    CREATE TABLE index_entries (
+                        batch_id INTEGER NOT NULL,
+                        path TEXT NOT NULL,
+                        name TEXT NOT NULL,
+                        kind TEXT NOT NULL,
+                        search_text TEXT NOT NULL,
+                        updated_at_ms INTEGER NOT NULL,
+                        PRIMARY KEY (batch_id, path)
+                    );
+                    INSERT INTO index_batches (completed_at_ms, entry_count)
+                    VALUES (500, 1);
+                    INSERT INTO index_entries
+                        (batch_id, path, name, kind, search_text, updated_at_ms)
+                    VALUES
+                        (1, '/tmp/legacy.txt', 'legacy.txt', 'file', 'legacy.txt /tmp/legacy.txt', 500);
+                    "#,
+                )
+                .unwrap();
+        }
+
+        let storage = SqliteStorage::open(path.clone()).unwrap();
+        let snapshot = storage.latest_index_snapshot().unwrap().unwrap();
+
+        assert_eq!(snapshot.completed_at_ms, 500);
+        assert_eq!(snapshot.entries.len(), 1);
+        assert_eq!(snapshot.entries[0].path, "/tmp/legacy.txt");
+        assert_eq!(snapshot.entries[0].parent, "");
+        assert_eq!(
+            snapshot.entries[0].content_index_state,
+            crate::core::index_entry::ContentIndexState::NotIndexed
+        );
+        assert!(snapshot.needs_full_refresh);
 
         drop(storage);
         let _ = fs::remove_file(path);

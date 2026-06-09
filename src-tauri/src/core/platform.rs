@@ -288,40 +288,265 @@ impl CommandSafetyChecker {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyPress {
+    KeyDown(HotkeyKey),
+    KeyUp(HotkeyKey),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HotkeyKey {
     Shift,
+    Control,
+    Alt,
+    Command,
+    Character(char),
+    Space,
+    Enter,
+    Escape,
+    Tab,
+    Backspace,
+    Delete,
+    ArrowUp,
+    ArrowDown,
+    ArrowLeft,
+    ArrowRight,
+    Function(u8),
     Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HotkeyModifier {
+    Shift,
+    Control,
+    Alt,
+    Command,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum WakeShortcut {
+    #[default]
+    DoubleShift,
+    Chord {
+        modifiers: Vec<HotkeyModifier>,
+        key: HotkeyKey,
+    },
+}
+
+impl WakeShortcut {
+    pub fn parse(value: &str) -> Option<Self> {
+        let normalized = value.trim();
+        if normalized.eq_ignore_ascii_case("Shift+Shift") {
+            return Some(Self::DoubleShift);
+        }
+
+        let mut modifiers = Vec::new();
+        let mut key = None;
+        for part in normalized
+            .split('+')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+        {
+            if let Some(modifier) = parse_hotkey_modifier(part) {
+                if !modifiers.contains(&modifier) {
+                    modifiers.push(modifier);
+                }
+            } else if key.is_none() {
+                key = parse_hotkey_key(part);
+            } else {
+                return None;
+            }
+        }
+
+        let key = key?;
+        if modifiers.is_empty() || is_modifier_key(key) {
+            return None;
+        }
+        Some(Self::Chord { modifiers, key })
+    }
+
+    pub fn display_label(&self) -> String {
+        match self {
+            Self::DoubleShift => "Shift+Shift".to_owned(),
+            Self::Chord { modifiers, key } => modifiers
+                .iter()
+                .map(|modifier| match modifier {
+                    HotkeyModifier::Shift => "Shift".to_owned(),
+                    HotkeyModifier::Control => "Control".to_owned(),
+                    HotkeyModifier::Alt => "Alt".to_owned(),
+                    HotkeyModifier::Command => "Command".to_owned(),
+                })
+                .chain(std::iter::once(display_hotkey_key(*key)))
+                .collect::<Vec<_>>()
+                .join("+"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HotkeyState {
+    shortcut: WakeShortcut,
     last_shift_at_ms: Option<u64>,
     double_shift_window_ms: u64,
+    pressed_modifiers: Vec<HotkeyModifier>,
 }
 
 impl Default for HotkeyState {
     fn default() -> Self {
         Self {
+            shortcut: WakeShortcut::default(),
             last_shift_at_ms: None,
             double_shift_window_ms: 500,
+            pressed_modifiers: Vec::new(),
         }
     }
 }
 
 impl HotkeyState {
+    pub fn with_shortcut(shortcut: WakeShortcut) -> Self {
+        Self {
+            shortcut,
+            ..Self::default()
+        }
+    }
+
+    pub fn set_shortcut(&mut self, shortcut: WakeShortcut) {
+        if self.shortcut != shortcut {
+            self.shortcut = shortcut;
+            self.last_shift_at_ms = None;
+            self.pressed_modifiers.clear();
+        }
+    }
+
     pub fn register_key_press(&mut self, key: KeyPress, timestamp_ms: u64) -> bool {
+        match self.shortcut.clone() {
+            WakeShortcut::DoubleShift => self.register_double_shift(key, timestamp_ms),
+            WakeShortcut::Chord {
+                modifiers,
+                key: wake_key,
+            } => self.register_chord(key, &modifiers, wake_key),
+        }
+    }
+
+    fn register_double_shift(&mut self, key: KeyPress, timestamp_ms: u64) -> bool {
         match key {
-            KeyPress::Other => {
-                self.last_shift_at_ms = None;
-                false
-            }
-            KeyPress::Shift => {
+            KeyPress::KeyDown(HotkeyKey::Shift) => {
                 let should_show = self.last_shift_at_ms.is_some_and(|last| {
                     timestamp_ms.saturating_sub(last) <= self.double_shift_window_ms
                 });
                 self.last_shift_at_ms = Some(timestamp_ms);
                 should_show
             }
+            KeyPress::KeyDown(_) => {
+                self.last_shift_at_ms = None;
+                false
+            }
+            KeyPress::KeyUp(_) => false,
         }
+    }
+
+    fn register_chord(
+        &mut self,
+        key: KeyPress,
+        modifiers: &[HotkeyModifier],
+        wake_key: HotkeyKey,
+    ) -> bool {
+        match key {
+            KeyPress::KeyDown(pressed_key) => {
+                if let Some(modifier) = modifier_for_key(pressed_key) {
+                    if !self.pressed_modifiers.contains(&modifier) {
+                        self.pressed_modifiers.push(modifier);
+                    }
+                    false
+                } else if pressed_key == wake_key {
+                    modifiers
+                        .iter()
+                        .all(|modifier| self.pressed_modifiers.contains(modifier))
+                } else {
+                    false
+                }
+            }
+            KeyPress::KeyUp(released_key) => {
+                if let Some(modifier) = modifier_for_key(released_key) {
+                    self.pressed_modifiers
+                        .retain(|current| *current != modifier);
+                }
+                false
+            }
+        }
+    }
+}
+
+fn parse_hotkey_modifier(part: &str) -> Option<HotkeyModifier> {
+    match part.to_ascii_lowercase().as_str() {
+        "shift" => Some(HotkeyModifier::Shift),
+        "control" | "ctrl" => Some(HotkeyModifier::Control),
+        "alt" | "option" => Some(HotkeyModifier::Alt),
+        "command" | "cmd" | "meta" | "super" => Some(HotkeyModifier::Command),
+        _ => None,
+    }
+}
+
+fn parse_hotkey_key(part: &str) -> Option<HotkeyKey> {
+    let lower = part.to_ascii_lowercase();
+    match lower.as_str() {
+        "space" => Some(HotkeyKey::Space),
+        "enter" | "return" => Some(HotkeyKey::Enter),
+        "escape" | "esc" => Some(HotkeyKey::Escape),
+        "tab" => Some(HotkeyKey::Tab),
+        "backspace" => Some(HotkeyKey::Backspace),
+        "delete" | "del" => Some(HotkeyKey::Delete),
+        "arrowup" | "up" => Some(HotkeyKey::ArrowUp),
+        "arrowdown" | "down" => Some(HotkeyKey::ArrowDown),
+        "arrowleft" | "left" => Some(HotkeyKey::ArrowLeft),
+        "arrowright" | "right" => Some(HotkeyKey::ArrowRight),
+        _ if lower.len() == 1 => lower
+            .chars()
+            .next()
+            .map(|ch| HotkeyKey::Character(ch.to_ascii_uppercase())),
+        _ if lower.starts_with('f') => lower[1..]
+            .parse::<u8>()
+            .ok()
+            .filter(|number| (1..=24).contains(number))
+            .map(HotkeyKey::Function),
+        _ => None,
+    }
+}
+
+fn display_hotkey_key(key: HotkeyKey) -> String {
+    match key {
+        HotkeyKey::Character(ch) => ch.to_string(),
+        HotkeyKey::Space => "Space".to_owned(),
+        HotkeyKey::Enter => "Enter".to_owned(),
+        HotkeyKey::Escape => "Escape".to_owned(),
+        HotkeyKey::Tab => "Tab".to_owned(),
+        HotkeyKey::Backspace => "Backspace".to_owned(),
+        HotkeyKey::Delete => "Delete".to_owned(),
+        HotkeyKey::ArrowUp => "ArrowUp".to_owned(),
+        HotkeyKey::ArrowDown => "ArrowDown".to_owned(),
+        HotkeyKey::ArrowLeft => "ArrowLeft".to_owned(),
+        HotkeyKey::ArrowRight => "ArrowRight".to_owned(),
+        HotkeyKey::Function(number) => format!("F{number}"),
+        HotkeyKey::Shift => "Shift".to_owned(),
+        HotkeyKey::Control => "Control".to_owned(),
+        HotkeyKey::Alt => "Alt".to_owned(),
+        HotkeyKey::Command => "Command".to_owned(),
+        HotkeyKey::Other => "Other".to_owned(),
+    }
+}
+
+fn is_modifier_key(key: HotkeyKey) -> bool {
+    matches!(
+        key,
+        HotkeyKey::Shift | HotkeyKey::Control | HotkeyKey::Alt | HotkeyKey::Command
+    )
+}
+
+fn modifier_for_key(key: HotkeyKey) -> Option<HotkeyModifier> {
+    match key {
+        HotkeyKey::Shift => Some(HotkeyModifier::Shift),
+        HotkeyKey::Control => Some(HotkeyModifier::Control),
+        HotkeyKey::Alt => Some(HotkeyModifier::Alt),
+        HotkeyKey::Command => Some(HotkeyModifier::Command),
+        _ => None,
     }
 }
 
@@ -592,18 +817,58 @@ mod tests {
     fn hotkey_state_detects_double_shift_within_window() {
         let mut state = HotkeyState::default();
 
-        assert!(!state.register_key_press(KeyPress::Shift, 1_000));
-        assert!(state.register_key_press(KeyPress::Shift, 1_300));
+        assert!(!state.register_key_press(KeyPress::KeyDown(HotkeyKey::Shift), 1_000));
+        assert!(state.register_key_press(KeyPress::KeyDown(HotkeyKey::Shift), 1_300));
     }
 
     #[test]
     fn hotkey_state_ignores_slow_or_interrupted_shift_presses() {
         let mut state = HotkeyState::default();
 
-        assert!(!state.register_key_press(KeyPress::Shift, 1_000));
-        assert!(!state.register_key_press(KeyPress::Shift, 2_000));
-        assert!(!state.register_key_press(KeyPress::Other, 2_100));
-        assert!(!state.register_key_press(KeyPress::Shift, 2_200));
+        assert!(!state.register_key_press(KeyPress::KeyDown(HotkeyKey::Shift), 1_000));
+        assert!(!state.register_key_press(KeyPress::KeyDown(HotkeyKey::Shift), 2_000));
+        assert!(!state.register_key_press(KeyPress::KeyDown(HotkeyKey::Other), 2_100));
+        assert!(!state.register_key_press(KeyPress::KeyDown(HotkeyKey::Shift), 2_200));
+    }
+
+    #[test]
+    fn wake_shortcut_parses_double_shift_and_chords() {
+        assert_eq!(
+            WakeShortcut::parse("Shift+Shift"),
+            Some(WakeShortcut::DoubleShift)
+        );
+        assert_eq!(
+            WakeShortcut::parse("Control+Space"),
+            Some(WakeShortcut::Chord {
+                modifiers: vec![HotkeyModifier::Control],
+                key: HotkeyKey::Space,
+            })
+        );
+        assert_eq!(
+            WakeShortcut::parse("Command+Shift+K").map(|shortcut| shortcut.display_label()),
+            Some("Command+Shift+K".to_owned())
+        );
+    }
+
+    #[test]
+    fn wake_shortcut_rejects_empty_or_bare_modifier_shortcuts() {
+        assert_eq!(WakeShortcut::parse(""), None);
+        assert_eq!(WakeShortcut::parse("Shift"), None);
+        assert_eq!(WakeShortcut::parse("Control+Alt"), None);
+        assert_eq!(WakeShortcut::parse("Space"), None);
+    }
+
+    #[test]
+    fn hotkey_state_detects_configured_chord() {
+        let mut state = HotkeyState::with_shortcut(WakeShortcut::Chord {
+            modifiers: vec![HotkeyModifier::Control],
+            key: HotkeyKey::Space,
+        });
+
+        assert!(!state.register_key_press(KeyPress::KeyDown(HotkeyKey::Control), 1_000));
+        assert!(state.register_key_press(KeyPress::KeyDown(HotkeyKey::Space), 1_010));
+        assert!(!state.register_key_press(KeyPress::KeyUp(HotkeyKey::Control), 1_020));
+        assert!(!state.register_key_press(KeyPress::KeyDown(HotkeyKey::Space), 1_030));
     }
 
     #[test]

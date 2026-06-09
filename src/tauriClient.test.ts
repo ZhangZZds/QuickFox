@@ -18,7 +18,6 @@ import {
   recentInputHistory,
   recordInputHistory,
   refreshIndex,
-  returnToLauncherWindow,
   saveConfig,
   search,
 } from "./tauriClient";
@@ -71,7 +70,6 @@ describe("tauriClient", () => {
     await loadConfig();
     await saveConfig(config);
     await openSettingsWindow();
-    await returnToLauncherWindow();
     await clearCommandHistory();
     await recordInputHistory("g 1234");
     await recentInputHistory();
@@ -83,13 +81,12 @@ describe("tauriClient", () => {
     expect(invokeMock).toHaveBeenNthCalledWith(4, "load_config");
     expect(invokeMock).toHaveBeenNthCalledWith(5, "save_config", { config });
     expect(invokeMock).toHaveBeenNthCalledWith(6, "open_settings_window");
-    expect(invokeMock).toHaveBeenNthCalledWith(7, "return_to_launcher_window");
-    expect(invokeMock).toHaveBeenNthCalledWith(8, "clear_command_history");
-    expect(invokeMock).toHaveBeenNthCalledWith(9, "record_input_history", {
+    expect(invokeMock).toHaveBeenNthCalledWith(7, "clear_command_history");
+    expect(invokeMock).toHaveBeenNthCalledWith(8, "record_input_history", {
       input: "g 1234",
     });
-    expect(invokeMock).toHaveBeenNthCalledWith(10, "recent_input_history");
-    expect(invokeMock).toHaveBeenNthCalledWith(11, "clear_input_history");
+    expect(invokeMock).toHaveBeenNthCalledWith(9, "recent_input_history");
+    expect(invokeMock).toHaveBeenNthCalledWith(10, "clear_input_history");
   });
 
   it("reports the current Tauri window label when it is available", () => {

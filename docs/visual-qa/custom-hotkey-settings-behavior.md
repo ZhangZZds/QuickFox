@@ -1,0 +1,28 @@
+# QuickFox 自定义唤醒键与设置页视觉验收
+
+日期：2026-06-08
+
+对应 OpenSpec change: `custom-hotkey-window-behavior-settings-help`
+
+## 覆盖场景
+
+- 设置页“外观”分区的全局唤醒键录制控件。
+- 设置页关键字段的问号帮助图标和 hover/focus tooltip。
+- 设置页去掉“返回搜索”入口，保存后停留在设置窗口。
+- 设置窗口在窄宽度和低高度下改为单列或内部滚动。
+- 托盘“显示/隐藏 QuickFox”和设置窗口可靠重建的桌面行为。
+
+## 自动化验收
+
+- `src/App.test.tsx` 覆盖 `Control+Space` 录制后写入 `hotkey.wake_shortcut`、设置页没有“返回搜索”、保存后仍停留设置页、关键字段帮助图标存在。
+- `src/tauriClient.test.ts` 覆盖前端不再调用返回搜索窗口命令。
+- Rust 单元测试覆盖可配置唤醒键解析、无效快捷键拒绝、全局键盘事件映射、配置默认值/TOML 读写/校验、托盘 show/hide toggle 状态。
+- `npm run check` 覆盖 Prettier、ESLint、Vitest、TypeScript/Vite build、rustfmt、clippy 和 Rust 单元测试。
+
+## 人工验收重点
+
+- 真实桌面环境中，设置窗口关闭后从托盘再次点“设置”能重新显示。
+- Windows 后台形态只保留托盘图标，不呈现一个最小化任务栏窗口。
+- 全局唤醒键保存为自定义组合键后，重启应用仍按新组合键唤醒/隐藏。
+- 启动器失去焦点后自动隐藏；设置窗口失焦不被隐藏。
+- 缩小设置窗口时问号 tooltip、录制按钮、保存按钮和滚动区域不重叠。

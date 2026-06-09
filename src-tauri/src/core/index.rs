@@ -1,299 +1,44 @@
 //! File and directory indexing will live here.
 
 use crate::core::actions::Action;
+use crate::core::content_index::{
+    ContentIndex, ContentIndexOptions, ContentSearchHit, PlainTextExtractor,
+};
+use crate::core::file_matcher::FileMatcher;
+use crate::core::file_query::FileQuery;
+pub use crate::core::index_entry::{
+    ContentIndexState, IndexFailure, IndexLifecycle, IndexReport, IndexScanOptions, IndexStatus,
+    IndexStatusKind, IndexedEntry, IndexedEntryKind,
+};
+use crate::core::index_scanner::{FileSystemScanner, IgnoreScanner, IndexScanPlan};
 use crate::core::search::{QueryRequest, SearchMode, SearchResult, SearchResultKind};
 use regex::Regex;
-use serde::{Deserialize, Serialize};
-use std::fs;
-use std::path::{Path, PathBuf};
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum IndexedEntryKind {
-    Application,
-    File,
-    Directory,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IndexedEntry {
-    pub path: String,
-    pub name: String,
-    pub kind: IndexedEntryKind,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IndexFailure {
-    pub root: String,
-    pub message: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct IndexReport {
-    pub entries: Vec<IndexedEntry>,
-    pub failures: Vec<IndexFailure>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum IndexStatusKind {
-    Unbuilt,
-    Building,
-    Ready,
-    Refreshing,
-    Failed,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct IndexStatus {
-    pub kind: IndexStatusKind,
-    pub entry_count: usize,
-    pub message: Option<String>,
-    pub generation: u64,
-    pub completed_at_ms: Option<i64>,
-}
-
-#[derive(Debug, Clone)]
-pub struct IndexLifecycle {
-    generation: u64,
-    status: IndexStatus,
-}
-
-impl Default for IndexLifecycle {
-    fn default() -> Self {
-        Self {
-            generation: 0,
-            status: IndexStatus {
-                kind: IndexStatusKind::Unbuilt,
-                entry_count: 0,
-                message: None,
-                generation: 0,
-                completed_at_ms: None,
-            },
-        }
-    }
-}
-
-impl IndexLifecycle {
-    pub fn from_ready(entry_count: usize, completed_at_ms: i64) -> Self {
-        Self {
-            generation: 0,
-            status: IndexStatus {
-                kind: IndexStatusKind::Ready,
-                entry_count,
-                message: None,
-                generation: 0,
-                completed_at_ms: Some(completed_at_ms),
-            },
-        }
-    }
-
-    pub fn status(&self) -> &IndexStatus {
-        &self.status
-    }
-
-    pub fn start_refresh(&mut self, has_existing_index: bool) -> u64 {
-        self.generation = self.generation.saturating_add(1);
-        self.status.kind = if has_existing_index {
-            IndexStatusKind::Refreshing
-        } else {
-            IndexStatusKind::Building
-        };
-        self.status.message = None;
-        self.status.generation = self.generation;
-        self.generation
-    }
-
-    pub fn complete_refresh(
-        &mut self,
-        generation: u64,
-        entry_count: usize,
-        completed_at_ms: i64,
-    ) -> bool {
-        if generation != self.generation {
-            return false;
-        }
-
-        self.status = IndexStatus {
-            kind: IndexStatusKind::Ready,
-            entry_count,
-            message: None,
-            generation,
-            completed_at_ms: Some(completed_at_ms),
-        };
-        true
-    }
-
-    pub fn fail_refresh(&mut self, generation: u64, message: String) -> bool {
-        if generation != self.generation {
-            return false;
-        }
-
-        self.status.kind = IndexStatusKind::Failed;
-        self.status.message = Some(message);
-        self.status.generation = generation;
-        true
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct IndexScanOptions {
-    pub include_dirs: Vec<PathBuf>,
-    pub exclude_dirs: Vec<PathBuf>,
-    pub exclude_patterns: Vec<String>,
-}
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Default)]
 pub struct IndexScanner;
 
 impl IndexScanner {
     pub fn scan(&self, options: IndexScanOptions) -> Result<IndexReport, std::io::Error> {
-        let exclude_dirs = canonicalize_existing_paths(&options.exclude_dirs);
-        let mut report = IndexReport::default();
-
-        for root in options.include_dirs {
-            if !root.is_dir() {
-                report.failures.push(IndexFailure {
-                    root: path_to_string(&root),
-                    message: "index root is not a readable directory".to_owned(),
-                });
-                continue;
-            }
-
-            self.scan_dir(
-                &root,
-                &root,
-                &exclude_dirs,
-                &options.exclude_patterns,
-                &mut report,
-            )?;
-        }
-
-        report.entries.sort_by(|left, right| {
-            left.path
-                .cmp(&right.path)
-                .then_with(|| left.name.cmp(&right.name))
-        });
-        Ok(report)
+        self.scan_plan(IndexScanPlan {
+            include_roots: options.include_dirs,
+            exclude_dirs: options.exclude_dirs,
+            exclude_patterns: options.exclude_patterns,
+            respect_project_ignores: options.respect_project_ignores,
+            stage: None,
+        })
     }
 
-    fn scan_dir(
-        &self,
-        root: &Path,
-        dir: &Path,
-        exclude_dirs: &[PathBuf],
-        exclude_patterns: &[String],
-        report: &mut IndexReport,
-    ) -> Result<(), std::io::Error> {
-        let read_dir = match fs::read_dir(dir) {
-            Ok(read_dir) => read_dir,
-            Err(error) => {
-                report.failures.push(IndexFailure {
-                    root: path_to_string(dir),
-                    message: error.to_string(),
-                });
-                if dir == root {
-                    return Err(error);
-                }
-                return Ok(());
-            }
-        };
-
-        for entry in read_dir {
-            let entry = entry?;
-            let path = entry.path();
-            let name = entry.file_name().to_string_lossy().to_string();
-
-            if is_excluded_dir(&path, exclude_dirs) || matches_any_pattern(&name, exclude_patterns)
-            {
-                continue;
-            }
-
-            let file_type = entry.file_type()?;
-            if file_type.is_dir() {
-                if is_application_path(&path) {
-                    report.entries.push(IndexedEntry {
-                        path: path_to_string(&path),
-                        name,
-                        kind: IndexedEntryKind::Application,
-                    });
-                    continue;
-                }
-                report.entries.push(IndexedEntry {
-                    path: path_to_string(&path),
-                    name,
-                    kind: IndexedEntryKind::Directory,
-                });
-                self.scan_dir(root, &path, exclude_dirs, exclude_patterns, report)?;
-            } else if file_type.is_file() {
-                let kind = if is_application_path(&path) {
-                    IndexedEntryKind::Application
-                } else {
-                    IndexedEntryKind::File
-                };
-                report.entries.push(IndexedEntry {
-                    path: path_to_string(&path),
-                    name,
-                    kind,
-                });
-            }
-        }
-
-        Ok(())
+    pub fn scan_plan(&self, plan: IndexScanPlan) -> Result<IndexReport, std::io::Error> {
+        IgnoreScanner::default().scan(plan)
     }
-}
-
-fn canonicalize_existing_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
-    paths
-        .iter()
-        .filter_map(|path| path.canonicalize().ok())
-        .collect()
-}
-
-fn is_excluded_dir(path: &Path, exclude_dirs: &[PathBuf]) -> bool {
-    let Ok(canonical) = path.canonicalize() else {
-        return false;
-    };
-    exclude_dirs.contains(&canonical)
-}
-
-fn matches_any_pattern(name: &str, patterns: &[String]) -> bool {
-    patterns
-        .iter()
-        .any(|pattern| wildcard_matches(pattern, name))
-}
-
-fn wildcard_matches(pattern: &str, text: &str) -> bool {
-    if pattern == "*" {
-        return true;
-    }
-
-    if let Some((prefix, suffix)) = pattern.split_once('*') {
-        return text.starts_with(prefix) && text.ends_with(suffix);
-    }
-
-    pattern == text
-}
-
-fn is_application_path(path: &Path) -> bool {
-    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-        return false;
-    };
-    let lower = name.to_lowercase();
-    lower.ends_with(".app")
-        || lower.ends_with(".exe")
-        || lower.ends_with(".lnk")
-        || lower.ends_with(".desktop")
-}
-
-fn path_to_string(path: &Path) -> String {
-    path.to_string_lossy().to_string()
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct SearchIndex {
     entries: Vec<IndexedEntry>,
     search_texts: Vec<String>,
+    content_index: Option<ContentIndex>,
 }
 
 impl SearchIndex {
@@ -302,6 +47,19 @@ impl SearchIndex {
         Self {
             entries,
             search_texts,
+            content_index: None,
+        }
+    }
+
+    pub fn from_entries_with_content_index(
+        entries: Vec<IndexedEntry>,
+        content_index: ContentIndex,
+    ) -> Self {
+        let search_texts = entries.iter().map(searchable_text).collect();
+        Self {
+            entries,
+            search_texts,
+            content_index: Some(content_index),
         }
     }
 
@@ -325,7 +83,7 @@ impl SearchIndex {
         options: IndexScanOptions,
     ) -> Result<IndexReport, std::io::Error> {
         let report = scanner.scan(options)?;
-        let mut previous_by_path: std::collections::HashMap<_, _> = self
+        let previous_by_path: std::collections::HashMap<_, _> = self
             .entries
             .iter()
             .cloned()
@@ -337,8 +95,9 @@ impl SearchIndex {
             .iter()
             .map(|entry| {
                 previous_by_path
-                    .remove(&entry.path)
-                    .filter(|previous| previous == entry)
+                    .get(&entry.path)
+                    .filter(|previous| snapshot_metadata_matches(previous, entry))
+                    .cloned()
                     .unwrap_or_else(|| entry.clone())
             })
             .collect();
@@ -348,6 +107,54 @@ impl SearchIndex {
 
     pub fn search(&self, query: &QueryRequest) -> Vec<SearchResult> {
         self.search_with_limit(query, usize::MAX)
+    }
+
+    pub fn apply_update_batch(
+        &mut self,
+        batch: &crate::core::index_watcher::IndexUpdateBatch,
+        changed_entries: Vec<IndexedEntry>,
+    ) {
+        self.apply_update_batch_with_content_options(batch, changed_entries, None);
+    }
+
+    pub fn apply_update_batch_with_content_options(
+        &mut self,
+        batch: &crate::core::index_watcher::IndexUpdateBatch,
+        mut changed_entries: Vec<IndexedEntry>,
+        content_options: Option<&ContentIndexOptions>,
+    ) {
+        let removed_paths: HashSet<_> = batch
+            .removed_paths
+            .iter()
+            .map(|path| path.to_string_lossy().to_string())
+            .collect();
+        let changed_paths: HashSet<_> = changed_entries
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect();
+
+        self.entries.retain(|entry| {
+            !path_is_affected(&entry.path, &removed_paths) && !changed_paths.contains(&entry.path)
+        });
+
+        if let Some(content_index) = &mut self.content_index {
+            for path in &batch.removed_paths {
+                let _ = content_index.remove_path(path);
+            }
+            if let Some(options) = content_options {
+                for entry in &mut changed_entries {
+                    let _ = content_index.update_entry(entry, options, &PlainTextExtractor);
+                }
+            }
+        }
+
+        self.entries.extend(changed_entries);
+        self.entries.sort_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        self.search_texts = self.entries.iter().map(searchable_text).collect();
     }
 
     pub fn search_with_limit(&self, query: &QueryRequest, limit: usize) -> Vec<SearchResult> {
@@ -361,20 +168,108 @@ impl SearchIndex {
     fn replace_entries(&mut self, entries: Vec<IndexedEntry>) {
         self.search_texts = entries.iter().map(searchable_text).collect();
         self.entries = entries;
+        self.content_index = None;
     }
 
     fn search_normal(&self, query: &str, limit: usize) -> Vec<SearchResult> {
-        let query = query.trim().to_lowercase();
-        if query.is_empty() || limit == 0 {
+        let query = FileQuery::parse(query);
+        if limit == 0 || (!query.has_name_path_constraints() && !query.has_content_query()) {
             return Vec::new();
         }
 
-        self.entries
+        if query.has_content_query() && !query.has_name_path_constraints() {
+            return self.search_content_only(&query, limit);
+        }
+
+        let matcher = FileMatcher::default();
+        let candidates: Vec<_> = self
+            .entries
             .iter()
-            .filter(|entry| entry_matches_normal_query(entry, &query))
+            .zip(self.search_texts.iter())
+            .filter(|(entry, search_text)| {
+                matcher.matches_with_search_text(&query, entry, search_text)
+            })
             .take(limit)
-            .map(entry_to_result)
-            .collect()
+            .map(|(entry, _)| entry)
+            .collect();
+
+        if !query.has_content_query() {
+            return candidates.into_iter().map(entry_to_result).collect();
+        }
+
+        let candidate_paths: HashSet<_> =
+            candidates.iter().map(|entry| entry.path.clone()).collect();
+        let content_hits = self.search_content_hits(&query, Some(&candidate_paths), limit);
+        let hit_by_path: HashMap<_, _> = content_hits
+            .into_iter()
+            .map(|hit| (hit.path.clone(), hit))
+            .collect();
+        let mut results: Vec<_> = candidates
+            .into_iter()
+            .map(|entry| {
+                let mut result = entry_to_result(entry);
+                if let Some(hit) = hit_by_path.get(&entry.path) {
+                    result = result
+                        .with_snippet(hit.snippet.clone())
+                        .with_score(content_score(hit).saturating_add(10_000));
+                }
+                result
+            })
+            .collect();
+
+        results.sort_by(|left, right| {
+            right
+                .score
+                .cmp(&left.score)
+                .then_with(|| left.title.cmp(&right.title))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        results.truncate(limit);
+        results
+    }
+
+    fn search_content_only(&self, query: &FileQuery, limit: usize) -> Vec<SearchResult> {
+        let hits = self.search_content_hits(query, None, limit);
+        let entry_by_path: HashMap<_, _> = self
+            .entries
+            .iter()
+            .map(|entry| (entry.path.as_str(), entry))
+            .collect();
+        let mut results: Vec<_> = hits
+            .into_iter()
+            .filter_map(|hit| {
+                let score = content_score(&hit);
+                entry_by_path.get(hit.path.as_str()).map(|entry| {
+                    entry_to_result(entry)
+                        .with_snippet(hit.snippet)
+                        .with_score(score)
+                })
+            })
+            .collect();
+        results.sort_by(|left, right| {
+            right
+                .score
+                .cmp(&left.score)
+                .then_with(|| left.title.cmp(&right.title))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        results.truncate(limit);
+        results
+    }
+
+    fn search_content_hits(
+        &self,
+        query: &FileQuery,
+        candidate_paths: Option<&HashSet<String>>,
+        limit: usize,
+    ) -> Vec<ContentSearchHit> {
+        let Some(content_index) = &self.content_index else {
+            return Vec::new();
+        };
+        let content_query = query.content_queries.join(" ");
+        content_index
+            .search(&content_query, candidate_paths, limit)
+            .unwrap_or_default()
     }
 
     fn search_regex(&self, pattern: &str, limit: usize) -> Vec<SearchResult> {
@@ -401,37 +296,33 @@ impl SearchIndex {
     }
 }
 
+fn content_score(hit: &ContentSearchHit) -> i64 {
+    (hit.score * 1_000.0).round() as i64
+}
+
 fn searchable_text(entry: &IndexedEntry) -> String {
-    format!("{} {}", entry.name, entry.path).to_lowercase()
+    if entry.search_text.is_empty() {
+        crate::core::index_entry::build_search_text(&entry.name, &entry.path)
+    } else {
+        entry.search_text.clone()
+    }
 }
 
-fn entry_matches_normal_query(entry: &IndexedEntry, query: &str) -> bool {
-    let name = entry.name.to_lowercase();
-    if name.contains(query) || fuzzy_matches_with_quality(query, &name) {
-        return true;
-    }
+fn snapshot_metadata_matches(previous: &IndexedEntry, scanned: &IndexedEntry) -> bool {
+    previous.path == scanned.path
+        && previous.kind == scanned.kind
+        && previous.root == scanned.root
+        && previous.modified_ms == scanned.modified_ms
+        && previous.size_bytes == scanned.size_bytes
+}
 
-    let path = entry.path.to_lowercase();
-    if query.contains(['/', '\\']) {
-        return path.contains(query);
-    }
-
-    path_segments(&entry.path).any(|segment| {
-        let segment = segment.to_lowercase();
-        segment.starts_with(query)
-            || segment
-                .chars()
-                .next()
-                .zip(query.chars().next())
-                .is_some_and(|(segment_first, query_first)| {
-                    segment_first == query_first && fuzzy_segment_matches(query, &segment)
-                })
+fn path_is_affected(path: &str, roots: &HashSet<String>) -> bool {
+    roots.iter().any(|root| {
+        path == root
+            || path
+                .strip_prefix(root)
+                .is_some_and(|rest| rest.starts_with(std::path::MAIN_SEPARATOR))
     })
-}
-
-fn path_segments(path: &str) -> impl Iterator<Item = &str> {
-    path.split(['/', '\\'])
-        .filter(|segment| !segment.is_empty())
 }
 
 fn entry_to_result(entry: &IndexedEntry) -> SearchResult {
@@ -474,45 +365,11 @@ fn entry_to_result(entry: &IndexedEntry) -> SearchResult {
     })
 }
 
-fn fuzzy_matches_with_quality(query: &str, haystack: &str) -> bool {
-    if query.len() < 2 {
-        return false;
-    }
-
-    haystack
-        .split(|candidate: char| !candidate.is_alphanumeric())
-        .filter(|segment| !segment.is_empty())
-        .any(|segment| fuzzy_segment_matches(query, segment))
-}
-
-fn fuzzy_segment_matches(query: &str, segment: &str) -> bool {
-    let mut chars = query.chars();
-    let Some(mut current) = chars.next() else {
-        return true;
-    };
-    let mut first_match: Option<usize> = None;
-
-    for (index, candidate) in segment.chars().enumerate() {
-        if candidate == current {
-            first_match.get_or_insert(index);
-            match chars.next() {
-                Some(next) => current = next,
-                None => {
-                    let span = index.saturating_sub(first_match.unwrap_or(index)) + 1;
-                    let max_span = query.chars().count().saturating_mul(2).max(8);
-                    return span <= max_span;
-                }
-            }
-        }
-    }
-
-    false
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+    use std::time::Instant;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -526,6 +383,7 @@ mod tests {
                 include_dirs: vec![root.clone()],
                 exclude_dirs: Vec::new(),
                 exclude_patterns: Vec::new(),
+                respect_project_ignores: true,
             })
             .unwrap();
 
@@ -556,12 +414,14 @@ mod tests {
         fs::write(excluded_dir.join("hidden.md"), "").unwrap();
         fs::write(root.join("keep.md"), "").unwrap();
         fs::write(root.join("debug.log"), "").unwrap();
+        fs::write(root.join("ERROR.LOG"), "").unwrap();
 
         let report = IndexScanner
             .scan(IndexScanOptions {
                 include_dirs: vec![root.clone()],
                 exclude_dirs: vec![excluded_dir.clone()],
                 exclude_patterns: vec!["*.log".to_owned()],
+                respect_project_ignores: true,
             })
             .unwrap();
 
@@ -574,6 +434,32 @@ mod tests {
         assert!(!names.contains(&"vendor"));
         assert!(!names.contains(&"hidden.md"));
         assert!(!names.contains(&"debug.log"));
+        assert!(!names.contains(&"ERROR.LOG"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn scanner_deduplicates_include_roots_before_scanning() {
+        let root = temp_dir("scan-deduplicate");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("keep.md"), "").unwrap();
+
+        let report = IndexScanner
+            .scan(IndexScanOptions {
+                include_dirs: vec![root.clone(), root.clone()],
+                exclude_dirs: Vec::new(),
+                exclude_patterns: Vec::new(),
+                respect_project_ignores: true,
+            })
+            .unwrap();
+
+        let keep_count = report
+            .entries
+            .iter()
+            .filter(|entry| entry.name == "keep.md")
+            .count();
+        assert_eq!(keep_count, 1);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -597,6 +483,7 @@ mod tests {
                 include_dirs: vec![root.clone()],
                 exclude_dirs: Vec::new(),
                 exclude_patterns: Vec::new(),
+                respect_project_ignores: true,
             })
             .unwrap();
 
@@ -634,6 +521,7 @@ mod tests {
                     include_dirs: vec![root.clone()],
                     exclude_dirs: Vec::new(),
                     exclude_patterns: Vec::new(),
+                    respect_project_ignores: true,
                 },
             )
             .unwrap();
@@ -649,6 +537,7 @@ mod tests {
                     include_dirs: vec![root.clone(), missing.clone()],
                     exclude_dirs: Vec::new(),
                     exclude_patterns: Vec::new(),
+                    respect_project_ignores: true,
                 },
             )
             .unwrap();
@@ -677,6 +566,7 @@ mod tests {
                     include_dirs: vec![root.clone()],
                     exclude_dirs: Vec::new(),
                     exclude_patterns: Vec::new(),
+                    respect_project_ignores: true,
                 },
             )
             .unwrap();
@@ -690,6 +580,7 @@ mod tests {
                     include_dirs: vec![root.clone()],
                     exclude_dirs: Vec::new(),
                     exclude_patterns: Vec::new(),
+                    respect_project_ignores: true,
                 },
             )
             .unwrap();
@@ -702,6 +593,100 @@ mod tests {
         assert!(names.contains(&"keep.md"));
         assert!(names.contains(&"new.md"));
         assert!(!names.contains(&"old.md"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn incremental_refresh_reuses_snapshot_entry_when_metadata_is_unchanged() {
+        let root = temp_dir("incremental-refresh-snapshot-assisted");
+        fs::create_dir_all(&root).unwrap();
+        let keep = root.join("keep.md");
+        fs::write(&keep, "same bytes").unwrap();
+
+        let mut index = SearchIndex::default();
+        let scanner = IndexScanner;
+        index
+            .refresh_with_scanner(
+                &scanner,
+                IndexScanOptions {
+                    include_dirs: vec![root.clone()],
+                    exclude_dirs: Vec::new(),
+                    exclude_patterns: Vec::new(),
+                    respect_project_ignores: true,
+                },
+            )
+            .unwrap();
+        let entry = index
+            .entries
+            .iter_mut()
+            .find(|entry| entry.name == "keep.md")
+            .unwrap();
+        entry.search_text = "snapshot-only-search-text".to_owned();
+        entry.content_index_state = ContentIndexState::Indexed;
+
+        index
+            .refresh_incremental_with_scanner(
+                &scanner,
+                IndexScanOptions {
+                    include_dirs: vec![root.clone()],
+                    exclude_dirs: Vec::new(),
+                    exclude_patterns: Vec::new(),
+                    respect_project_ignores: true,
+                },
+            )
+            .unwrap();
+
+        let refreshed = index
+            .entries()
+            .iter()
+            .find(|entry| entry.name == "keep.md")
+            .unwrap();
+        assert_eq!(refreshed.search_text, "snapshot-only-search-text");
+        assert_eq!(refreshed.content_index_state, ContentIndexState::Indexed);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn update_batch_removes_replaces_and_adds_name_path_entries() {
+        let root = temp_dir("update-batch");
+        fs::create_dir_all(&root).unwrap();
+        let removed = root.join("removed.md");
+        let changed = root.join("changed.md");
+        let added = root.join("added.md");
+        fs::write(&removed, "removed").unwrap();
+        fs::write(&changed, "old").unwrap();
+        fs::write(&added, "new").unwrap();
+
+        let mut index = SearchIndex::from_entries(vec![
+            IndexedEntry::from_path_metadata(&removed, &root, IndexedEntryKind::File),
+            IndexedEntry::from_path_metadata(&changed, &root, IndexedEntryKind::File),
+        ]);
+        let mut changed_entry =
+            IndexedEntry::from_path_metadata(&changed, &root, IndexedEntryKind::File);
+        changed_entry.name = "renamed-changed.md".to_owned();
+        changed_entry.search_text =
+            crate::core::index_entry::build_search_text(&changed_entry.name, &changed_entry.path);
+        let added_entry = IndexedEntry::from_path_metadata(&added, &root, IndexedEntryKind::File);
+
+        let batch = crate::core::index_watcher::IndexUpdateBatch {
+            changed_paths: vec![changed.clone(), added.clone()],
+            removed_paths: vec![removed.clone()],
+        };
+        index.apply_update_batch(&batch, vec![changed_entry, added_entry]);
+
+        let names: Vec<_> = index
+            .entries()
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["added.md", "renamed-changed.md"]);
+
+        let parser = crate::core::search::QueryParser::new(Default::default());
+        let results = index.search(&parser.parse("renamed-changed"));
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "renamed-changed.md");
 
         let _ = fs::remove_dir_all(root);
     }
@@ -722,6 +707,7 @@ mod tests {
                 include_dirs: vec![root.clone()],
                 exclude_dirs: Vec::new(),
                 exclude_patterns: Vec::new(),
+                respect_project_ignores: true,
             })
             .unwrap();
 
@@ -786,6 +772,7 @@ mod tests {
             path: "/Users/frank/Applications/PyCharm.app/Contents/plugins/python-ce/helpers/pydev/_pydevd_bundle/pydevd_cython_win32_312_64.cp312-win_amd64.pyd".to_owned(),
             name: "pydevd_cython_win32_312_64.cp312-win_amd64.pyd".to_owned(),
             kind: IndexedEntryKind::File,
+            ..IndexedEntry::legacy("", "", IndexedEntryKind::File)
         }]);
         let parser = crate::core::search::QueryParser::new(Default::default());
 
@@ -801,11 +788,13 @@ mod tests {
                 path: "/Users/frankzhang/Desktop/Codex.app".to_owned(),
                 name: "Codex.app".to_owned(),
                 kind: IndexedEntryKind::Application,
+                ..IndexedEntry::legacy("", "", IndexedEntryKind::Application)
             },
             IndexedEntry {
                 path: "/Users/frankzhang/Documents/Codex".to_owned(),
                 name: "Codex".to_owned(),
                 kind: IndexedEntryKind::Directory,
+                ..IndexedEntry::legacy("", "", IndexedEntryKind::Directory)
             },
             file_entry("/Users/frankzhang/workspace/QuickFox/index.html"),
             file_entry("/Users/frankzhang/Library/Metadata/CoreSpotlight/index.spotlightV3/0.ivf-vector-indexes"),
@@ -888,6 +877,71 @@ mod tests {
     }
 
     #[test]
+    fn structured_file_query_filters_by_type_name_and_dir() {
+        let index = SearchIndex::from_entries(vec![
+            file_entry("/Users/frank/workspace/reports/budget.PDF"),
+            file_entry("/Users/frank/workspace/reports/budget.md"),
+            file_entry("/Users/frank/downloads/reports/budget.PDF"),
+            file_entry("/Users/frank/workspace/reports/notes.PDF"),
+        ]);
+        let parser = crate::core::search::QueryParser::new(Default::default());
+
+        let titles: Vec<_> = index
+            .search(&parser.parse("budget type:pdf name:budget dir:workspace"))
+            .into_iter()
+            .map(|result| result.title)
+            .collect();
+
+        assert_eq!(titles, vec!["budget.PDF"]);
+    }
+
+    #[test]
+    fn structured_file_query_allows_space_after_field_colon() {
+        let index = SearchIndex::from_entries(vec![
+            file_entry("/Users/frank/workspace/QuickFox/AGENTS.md"),
+            file_entry("/Users/frank/workspace/QuickFox/README.txt"),
+        ]);
+        let parser = crate::core::search::QueryParser::new(Default::default());
+
+        let titles: Vec<_> = index
+            .search(&parser.parse("Agent type: md"))
+            .into_iter()
+            .map(|result| result.title)
+            .collect();
+
+        assert_eq!(titles, vec!["AGENTS.md"]);
+    }
+
+    #[test]
+    fn content_only_query_returns_no_name_path_results_before_content_indexing() {
+        let index = SearchIndex::from_entries(vec![file_entry("/Users/frank/workspace/hello.md")]);
+        let parser = crate::core::search::QueryParser::new(Default::default());
+
+        let results = index.search(&parser.parse(r#"content:"hello world""#));
+
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn large_index_search_stops_at_candidate_limit() {
+        let entries: Vec<_> = (0..10_000)
+            .map(|index| file_entry(&format!("/tmp/project-{index}.md")))
+            .collect();
+        let index = SearchIndex::from_entries(entries);
+        let parser = crate::core::search::QueryParser::new(Default::default());
+
+        let started = Instant::now();
+        let results = index.search_with_limit(&parser.parse("project"), 25);
+        let elapsed = started.elapsed();
+
+        assert_eq!(results.len(), 25);
+        assert!(
+            elapsed.as_millis() < 500,
+            "large index query took {elapsed:?}, expected bounded candidate work"
+        );
+    }
+
+    #[test]
     fn index_lifecycle_tracks_unbuilt_building_ready_refreshing_and_failed_states() {
         let mut lifecycle = IndexLifecycle::default();
 
@@ -930,12 +984,142 @@ mod tests {
         assert_eq!(lifecycle.status().entry_count, 20);
     }
 
-    fn file_entry(path: &str) -> IndexedEntry {
-        IndexedEntry {
-            path: path.to_owned(),
-            name: path.rsplit('/').next().unwrap().to_owned(),
-            kind: IndexedEntryKind::File,
+    #[test]
+    fn entry_and_status_types_are_available_from_entry_module_and_index_facade() {
+        let entry_from_entry_module = crate::core::index_entry::IndexedEntry {
+            path: "/tmp/report.md".to_owned(),
+            name: "report.md".to_owned(),
+            kind: crate::core::index_entry::IndexedEntryKind::File,
+            ..crate::core::index_entry::IndexedEntry::legacy(
+                "",
+                "",
+                crate::core::index_entry::IndexedEntryKind::File,
+            )
+        };
+        let entry_from_index_facade: IndexedEntry = entry_from_entry_module.clone();
+
+        assert_eq!(entry_from_index_facade, entry_from_entry_module);
+        assert_eq!(
+            IndexStatusKind::Ready,
+            crate::core::index_entry::IndexStatusKind::Ready
+        );
+    }
+
+    #[test]
+    #[ignore = "baseline fixture prints machine-dependent scanner/query timings"]
+    fn indexing_baseline_fixture_reports_current_scanner_characteristics() {
+        let root = temp_dir("index-baseline");
+        let small = root.join("small");
+        let deep = root.join("deep");
+        let windows_c = root.join("windows-drives").join("C");
+        let windows_d = root.join("windows-drives").join("D");
+        let excluded = root.join("excluded");
+        let text = root.join("content-text");
+
+        fs::create_dir_all(&small).unwrap();
+        fs::write(small.join("report-budget.md"), "ordinary name/path fixture").unwrap();
+        fs::write(small.join("notes.txt"), "ordinary notes").unwrap();
+
+        let mut current = deep.clone();
+        for level in 0..12 {
+            current = current.join(format!("level-{level}"));
+            fs::create_dir_all(&current).unwrap();
+            fs::write(current.join(format!("deep-file-{level}.txt")), "").unwrap();
         }
+
+        fs::create_dir_all(windows_c.join("Users").join("Frank").join("Desktop")).unwrap();
+        fs::create_dir_all(windows_d.join("Projects").join("QuickFox")).unwrap();
+        fs::write(
+            windows_c
+                .join("Users")
+                .join("Frank")
+                .join("Desktop")
+                .join("desktop-report.txt"),
+            "",
+        )
+        .unwrap();
+        fs::write(
+            windows_d
+                .join("Projects")
+                .join("QuickFox")
+                .join("workspace-readme.md"),
+            "",
+        )
+        .unwrap();
+
+        let mut exclude_dirs = Vec::new();
+        for index in 0..32 {
+            let dir = excluded.join(format!("node_modules_{index}"));
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("ignored.js"), "").unwrap();
+            exclude_dirs.push(dir);
+        }
+
+        fs::create_dir_all(&text).unwrap();
+        fs::write(
+            text.join("body.txt"),
+            "alpha\nbeta\nneedle-from-file-content-only\ngamma\n",
+        )
+        .unwrap();
+
+        let scan_started = Instant::now();
+        let report = IndexScanner
+            .scan(IndexScanOptions {
+                include_dirs: vec![root.clone()],
+                exclude_dirs,
+                exclude_patterns: vec!["*.log".to_owned()],
+                respect_project_ignores: true,
+            })
+            .unwrap();
+        let scan_duration = scan_started.elapsed();
+
+        let index = SearchIndex::from_entries(report.entries.clone());
+        let parser = crate::core::search::QueryParser::new(Default::default());
+
+        let query_started = Instant::now();
+        let ordinary_results = index.search(&parser.parse("report"));
+        let query_duration = query_started.elapsed();
+        let content_results = index.search(&parser.parse("content:needle-from-file-content-only"));
+
+        println!(
+            "QUICKFOX_INDEX_BASELINE scan_ms={} entries={} failures={} ordinary_query_us={} ordinary_results={} content_query_results={}",
+            scan_duration.as_millis(),
+            report.entries.len(),
+            report.failures.len(),
+            query_duration.as_micros(),
+            ordinary_results.len(),
+            content_results.len()
+        );
+
+        assert!(report.failures.is_empty());
+        assert!(report
+            .entries
+            .iter()
+            .any(|entry| entry.name == "report-budget.md"));
+        assert!(report
+            .entries
+            .iter()
+            .any(|entry| entry.name == "deep-file-11.txt"));
+        assert!(report
+            .entries
+            .iter()
+            .any(|entry| entry.path.contains("windows-drives")));
+        assert!(!report
+            .entries
+            .iter()
+            .any(|entry| entry.name == "ignored.js"));
+        assert!(!ordinary_results.is_empty());
+        assert!(content_results.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn file_entry(path: &str) -> IndexedEntry {
+        IndexedEntry::legacy(
+            path,
+            path.rsplit('/').next().unwrap().to_owned(),
+            IndexedEntryKind::File,
+        )
     }
 
     fn temp_dir(label: &str) -> std::path::PathBuf {

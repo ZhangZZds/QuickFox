@@ -15,9 +15,10 @@ import {
   recentInputHistory,
   recordInputHistory,
   refreshIndex,
-  returnToLauncherWindow,
   saveConfig,
   search,
+  type QuickFoxConfig,
+  type SearchResult,
 } from "./tauriClient";
 
 vi.mock("./tauriClient", () => ({
@@ -33,12 +34,11 @@ vi.mock("./tauriClient", () => ({
   recentInputHistory: vi.fn(),
   recordInputHistory: vi.fn(),
   refreshIndex: vi.fn(),
-  returnToLauncherWindow: vi.fn(),
   saveConfig: vi.fn(),
   search: vi.fn(),
 }));
 
-const fileResults = [
+const fileResults: SearchResult[] = [
   {
     id: "path:/tmp/Documents",
     title: "Documents",
@@ -67,7 +67,7 @@ const fileResults = [
   },
 ];
 
-const webResults = [
+const webResults: SearchResult[] = [
   {
     id: "web:g:1234",
     title: "Google: 1234",
@@ -80,7 +80,7 @@ const webResults = [
   },
 ];
 
-const calculatorResults = [
+const calculatorResults: SearchResult[] = [
   {
     id: "calculator:2+2",
     title: "2 + 2 = 4",
@@ -93,7 +93,7 @@ const calculatorResults = [
   },
 ];
 
-const longPathResults = [
+const longPathResults: SearchResult[] = [
   {
     id: "path:/Users/frankzhang/workspace/QuickFox/src/components/DeeplyNestedFeature/VeryLongMatchingFileName.fixture.tsx",
     title: "VeryLongMatchingFileName.fixture.tsx",
@@ -124,7 +124,7 @@ const longPathResults = [
   },
 ];
 
-const typedResults = [
+const typedResults: SearchResult[] = [
   {
     id: "path:/Applications/Codex.app",
     title: "Codex.app",
@@ -171,11 +171,54 @@ const typedResults = [
   },
 ];
 
-const appConfig = {
+const contentSnippetResults: SearchResult[] = [
+  {
+    id: "path:/tmp/report.md",
+    title: "report.md",
+    detail: "/tmp/report.md",
+    kind: "file",
+    provider: "files",
+    score: 1200,
+    mainAction: { type: "openPath", path: "/tmp/report.md" },
+    secondaryActions: [],
+    snippet: {
+      startLine: 40,
+      lines: ["project alpha", "hello world appears here", "next action"],
+      highlights: [
+        {
+          line: 41,
+          startColumn: 0,
+          endColumn: 11,
+          matchedText: "hello world",
+        },
+      ],
+    },
+  },
+];
+
+const commandResults: SearchResult[] = [
+  {
+    id: "command:git status",
+    title: "git status",
+    detail: "需要确认后执行",
+    kind: "command",
+    provider: "commands",
+    score: 1000,
+    mainAction: { type: "executeCommand", command: "git status", requiresConfirmation: true },
+    secondaryActions: [],
+  },
+];
+
+const appConfig: QuickFoxConfig = {
   index: {
     include_dirs: ["/tmp"],
     exclude_dirs: [],
     exclude_patterns: [],
+    performance_mode: "balanced",
+    respect_project_ignores: true,
+    content_include_dirs: ["/tmp/Documents"],
+    content_max_file_bytes: 2097152,
+    watcher_enabled: true,
   },
   query: {
     regex_prefix: "re:",
@@ -202,6 +245,9 @@ const appConfig = {
   results: {
     limit: 20,
   },
+  hotkey: {
+    wake_shortcut: "Shift+Shift",
+  },
 };
 
 describe("App", () => {
@@ -219,7 +265,6 @@ describe("App", () => {
     vi.mocked(recentInputHistory).mockReset();
     vi.mocked(recordInputHistory).mockReset();
     vi.mocked(refreshIndex).mockReset();
-    vi.mocked(returnToLauncherWindow).mockReset();
     vi.mocked(saveConfig).mockReset();
     vi.mocked(search).mockResolvedValue([]);
     vi.mocked(appPaths).mockResolvedValue({
@@ -245,7 +290,6 @@ describe("App", () => {
     });
     vi.mocked(recentInputHistory).mockResolvedValue([]);
     vi.mocked(refreshIndex).mockResolvedValue({ entries: [], failures: [] });
-    vi.mocked(returnToLauncherWindow).mockResolvedValue("completed");
     vi.mocked(recordInputHistory).mockResolvedValue("recorded");
     vi.mocked(saveConfig).mockResolvedValue("saved");
   });
@@ -478,6 +522,83 @@ describe("App", () => {
 
     expect(await screen.findByRole("option", { name: /2 \+ 2 = 4/ })).toBeInTheDocument();
     expect(screen.queryByRole("region", { name: "启动器状态" })).not.toBeInTheDocument();
+  });
+
+  it("keeps command results visible when the file index is unavailable", async () => {
+    vi.mocked(indexStatus).mockResolvedValueOnce({
+      kind: "building",
+      entryCount: 0,
+      message: null,
+      generation: 2,
+      completedAtMs: null,
+      stage: "configured-roots",
+      currentRoot: "/tmp",
+      scanned: 120,
+      accepted: 90,
+      skipped: 20,
+      failures: 1,
+    });
+    vi.mocked(search).mockResolvedValueOnce(commandResults);
+
+    render(<App commandEnabled />);
+    fireEvent.change(screen.getByLabelText("搜索文件、目录、计算器、网页搜索或命令"), {
+      target: { value: "> git status" },
+    });
+
+    expect(await screen.findByRole("region", { name: "命令预览" })).toHaveTextContent("git status");
+    expect(screen.queryByRole("region", { name: "启动器状态" })).not.toBeInTheDocument();
+  });
+
+  it("shows lightweight index progress when file results are still empty", async () => {
+    vi.mocked(indexStatus).mockResolvedValueOnce({
+      kind: "building",
+      entryCount: 0,
+      message: null,
+      generation: 2,
+      completedAtMs: null,
+      stage: "configured-roots",
+      currentRoot: "/Users/frank/workspace",
+      scanned: 120,
+      accepted: 90,
+      skipped: 20,
+      failures: 1,
+    });
+    vi.mocked(search).mockResolvedValueOnce([]);
+
+    render(<App />);
+    fireEvent.change(screen.getByLabelText("搜索文件、目录、计算器、网页搜索或命令"), {
+      target: { value: "notes" },
+    });
+
+    const status = await screen.findByRole("region", { name: "启动器状态" });
+    expect(status).toHaveTextContent("configured-roots");
+    expect(status).toHaveTextContent("/Users/frank/workspace");
+    expect(status).toHaveTextContent("已扫描 120");
+    expect(status).toHaveTextContent("收录 90");
+    expect(status).toHaveTextContent("跳过 20");
+    expect(status).toHaveTextContent("失败 1");
+  });
+
+  it("renders content snippets collapsed and expands line context on hover", async () => {
+    vi.mocked(search).mockResolvedValueOnce(contentSnippetResults);
+
+    render(<App />);
+    fireEvent.change(screen.getByLabelText("搜索文件、目录、计算器、网页搜索或命令"), {
+      target: { value: 'content:"hello world"' },
+    });
+
+    const result = await screen.findByRole("option", { name: /report.md/ });
+    expect(within(result).getByText("命中 1 次")).toBeInTheDocument();
+    expect(within(result).getByText("第 41 行")).toBeInTheDocument();
+    expect(within(result).getByText("41")).toBeInTheDocument();
+    expect(within(result).getByText("hello world")).toHaveProperty("tagName", "MARK");
+    expect(within(result).queryByText("project alpha")).not.toBeInTheDocument();
+    expect(within(result).queryByText("next action")).not.toBeInTheDocument();
+
+    fireEvent.mouseEnter(result);
+
+    expect(within(result).getByText("project alpha")).toBeInTheDocument();
+    expect(within(result).getByText("next action")).toBeInTheDocument();
   });
 
   it("moves selection with arrow keys and executes the selected primary action with Enter", async () => {
@@ -812,16 +933,14 @@ describe("App", () => {
     expect(screen.queryByRole("form", { name: "设置" })).not.toBeInTheDocument();
   });
 
-  it("returns from the settings window through the launcher window command", async () => {
+  it("does not offer a return-to-search action in the settings window", async () => {
     render(<App initialView="settings" />);
 
-    fireEvent.click(screen.getByRole("button", { name: "返回搜索" }));
-
-    expect(returnToLauncherWindow).toHaveBeenCalledOnce();
     expect(screen.getByRole("form", { name: "设置" })).toBeInTheDocument();
     expect(
       screen.queryByLabelText("搜索文件、目录、计算器、网页搜索或命令"),
     ).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "返回搜索" })).not.toBeInTheDocument();
   });
 
   it("saves updated command settings through the Tauri config command", async () => {
@@ -837,6 +956,7 @@ describe("App", () => {
         enabled: true,
       },
     });
+    expect(screen.getByRole("form", { name: "设置" })).toBeInTheDocument();
   });
 
   it("loads app paths through the Tauri client contract for settings", async () => {
@@ -906,6 +1026,78 @@ describe("App", () => {
       type: "openUrl",
       url: "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent",
     });
+  });
+
+  it("records a custom global wake shortcut from appearance settings", async () => {
+    render(<App initialView="settings" />);
+    await screen.findByDisplayValue("/tmp");
+    fireEvent.click(screen.getByRole("tab", { name: "外观" }));
+
+    const recorder = screen.getByRole("button", { name: "Shift+Shift" });
+    fireEvent.click(recorder);
+    fireEvent.keyDown(recorder, { key: " ", ctrlKey: true });
+    fireEvent.click(screen.getByRole("button", { name: "保存设置" }));
+
+    expect(saveConfig).toHaveBeenCalledWith({
+      ...appConfig,
+      hotkey: {
+        wake_shortcut: "Control+Space",
+      },
+    });
+  });
+
+  it("records double Shift as the default wake shortcut from two Shift presses", async () => {
+    vi.mocked(loadConfig).mockResolvedValueOnce({
+      ...appConfig,
+      hotkey: {
+        wake_shortcut: "Control+Space",
+      },
+    });
+    render(<App initialView="settings" />);
+    await screen.findByDisplayValue("/tmp");
+    fireEvent.click(screen.getByRole("tab", { name: "外观" }));
+
+    const recorder = screen.getByRole("button", { name: "Control+Space" });
+    fireEvent.click(recorder);
+    fireEvent.keyDown(recorder, { key: "Shift" });
+    expect(screen.getByText("再次按 Shift 可录制为 Shift+Shift。")).toBeInTheDocument();
+    fireEvent.keyDown(recorder, { key: "Shift" });
+    fireEvent.click(screen.getByRole("button", { name: "保存设置" }));
+
+    expect(saveConfig).toHaveBeenCalledWith({
+      ...appConfig,
+      hotkey: {
+        wake_shortcut: "Shift+Shift",
+      },
+    });
+  });
+
+  it("rejects a bare modifier while recording the global wake shortcut", async () => {
+    render(<App initialView="settings" />);
+    await screen.findByDisplayValue("/tmp");
+    fireEvent.click(screen.getByRole("tab", { name: "外观" }));
+
+    const recorder = screen.getByRole("button", { name: "Shift+Shift" });
+    fireEvent.click(recorder);
+    fireEvent.keyDown(recorder, { key: "Alt", altKey: true });
+
+    expect(screen.getByText("请按一个修饰键加普通键，或连续按两次 Shift。")).toBeInTheDocument();
+    expect(saveConfig).not.toHaveBeenCalled();
+  });
+
+  it("shows help icons for configurable settings fields", async () => {
+    render(<App initialView="settings" />);
+    await screen.findByDisplayValue("/tmp");
+
+    expect(screen.getByRole("button", { name: "索引目录说明" })).toBeInTheDocument();
+    expect(screen.getByText(/每行填写一个完整目录路径，例如/)).toBeInTheDocument();
+    expect(screen.getByText(/type:pdf/)).toBeInTheDocument();
+    expect(screen.getByText(/content:"hello world"/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("tab", { name: "外观" }));
+
+    expect(screen.getByRole("button", { name: "全局唤醒键说明" })).toBeInTheDocument();
+    expect(screen.getByText(/保存后新按键生效/)).toBeInTheDocument();
   });
 
   it("shows complete index status details in settings", async () => {
@@ -1036,6 +1228,17 @@ describe("App", () => {
     fireEvent.change(screen.getByLabelText("排除模式"), {
       target: { value: "*.log\nnode_modules" },
     });
+    fireEvent.change(screen.getByLabelText("索引性能模式"), {
+      target: { value: "complete" },
+    });
+    fireEvent.click(screen.getByLabelText("尊重项目 ignore"));
+    fireEvent.change(screen.getByLabelText("内容索引目录"), {
+      target: { value: "/tmp/Documents\n/Users/frank/workspace" },
+    });
+    fireEvent.change(screen.getByLabelText("内容大小上限 MB"), {
+      target: { value: "4" },
+    });
+    fireEvent.click(screen.getByLabelText("运行期文件监听"));
     fireEvent.click(screen.getByRole("button", { name: "保存设置" }));
 
     await waitFor(() =>
@@ -1045,6 +1248,11 @@ describe("App", () => {
           include_dirs: ["/tmp", "/Users/frank/Documents"],
           exclude_dirs: ["/tmp/cache"],
           exclude_patterns: ["*.log", "node_modules"],
+          performance_mode: "complete",
+          respect_project_ignores: false,
+          content_include_dirs: ["/tmp/Documents", "/Users/frank/workspace"],
+          content_max_file_bytes: 4194304,
+          watcher_enabled: false,
         },
       }),
     );

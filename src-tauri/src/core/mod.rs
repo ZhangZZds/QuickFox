@@ -1,6 +1,12 @@
 pub mod actions;
 pub mod config;
+pub mod content_index;
+pub mod file_matcher;
+pub mod file_query;
 pub mod index;
+pub mod index_entry;
+pub mod index_scanner;
+pub mod index_watcher;
 pub mod platform;
 pub mod providers;
 pub mod search;

@@ -1,0 +1,540 @@
+//! Text content index boundary.
+
+use crate::core::index_entry::{ContentIndexState, IndexedEntry, IndexedEntryKind};
+use crate::core::search::SearchSnippet;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+use tantivy::collector::TopDocs;
+use tantivy::query::QueryParser;
+use tantivy::schema::{Field, Schema, Value, STORED, STRING, TEXT};
+use tantivy::{doc, Index, IndexWriter, TantivyDocument, Term};
+
+pub const DEFAULT_MAX_CONTENT_BYTES: u64 = 2 * 1024 * 1024;
+pub const CONTENT_INDEX_DIR_VERSION: &str = "content-v1";
+
+type ContentResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContentIndexOptions {
+    pub index_dir: PathBuf,
+    pub max_file_bytes: u64,
+}
+
+impl Default for ContentIndexOptions {
+    fn default() -> Self {
+        Self {
+            index_dir: std::env::temp_dir()
+                .join("quickfox")
+                .join(CONTENT_INDEX_DIR_VERSION),
+            max_file_bytes: DEFAULT_MAX_CONTENT_BYTES,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ContentIndex {
+    index: Index,
+    path_field: Field,
+    content_field: Field,
+    documents: HashMap<String, ExtractedDocument>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContentSearchHit {
+    pub path: String,
+    pub score: f32,
+    pub snippet: SearchSnippet,
+}
+
+#[derive(Debug, Clone)]
+struct ExtractedDocument {
+    content: String,
+    lines: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ContentExtractionResult {
+    Text(String),
+    TooLarge,
+    Binary,
+    UnsupportedType,
+    ReadFailed,
+}
+
+pub trait TextExtractor {
+    fn extract(&self, path: &Path, max_bytes: u64) -> ContentExtractionResult;
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PlainTextExtractor;
+
+impl TextExtractor for PlainTextExtractor {
+    fn extract(&self, path: &Path, max_bytes: u64) -> ContentExtractionResult {
+        let metadata = match fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(_) => return ContentExtractionResult::ReadFailed,
+        };
+        if !metadata.is_file() {
+            return ContentExtractionResult::UnsupportedType;
+        }
+        if metadata.len() > max_bytes {
+            return ContentExtractionResult::TooLarge;
+        }
+        if is_unsupported_rich_document(path) {
+            return ContentExtractionResult::UnsupportedType;
+        }
+
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(_) => return ContentExtractionResult::ReadFailed,
+        };
+        if content_inspector::inspect(&bytes).is_binary() {
+            return ContentExtractionResult::Binary;
+        }
+
+        match String::from_utf8(bytes) {
+            Ok(content) => ContentExtractionResult::Text(content),
+            Err(_) => ContentExtractionResult::Binary,
+        }
+    }
+}
+
+impl ContentIndex {
+    pub fn build(
+        entries: &mut [IndexedEntry],
+        options: ContentIndexOptions,
+    ) -> ContentResult<Self> {
+        Self::build_with_extractor(entries, options, &PlainTextExtractor)
+    }
+
+    pub fn build_with_extractor(
+        entries: &mut [IndexedEntry],
+        options: ContentIndexOptions,
+        extractor: &dyn TextExtractor,
+    ) -> ContentResult<Self> {
+        let index_dir = options.index_dir.join(CONTENT_INDEX_DIR_VERSION);
+        if index_dir.exists() {
+            fs::remove_dir_all(&index_dir)?;
+        }
+        fs::create_dir_all(&index_dir)?;
+
+        let schema = content_schema();
+        let path_field = schema.get_field("path")?;
+        let content_field = schema.get_field("content")?;
+        let index = Index::create_in_dir(&index_dir, schema)?;
+        let mut writer: IndexWriter = index.writer(50_000_000)?;
+        let mut documents = HashMap::new();
+
+        for entry in entries {
+            if entry.kind != IndexedEntryKind::File {
+                entry.content_index_state = ContentIndexState::NotIndexed;
+                continue;
+            }
+
+            match extractor.extract(Path::new(&entry.path), options.max_file_bytes) {
+                ContentExtractionResult::Text(content) => {
+                    writer.add_document(doc!(
+                        path_field => entry.path.clone(),
+                        content_field => content.clone(),
+                    ))?;
+                    documents.insert(entry.path.clone(), ExtractedDocument::from_content(content));
+                    entry.content_index_state = ContentIndexState::Indexed;
+                }
+                ContentExtractionResult::TooLarge => {
+                    entry.content_index_state = ContentIndexState::SkippedTooLarge;
+                }
+                ContentExtractionResult::Binary | ContentExtractionResult::UnsupportedType => {
+                    entry.content_index_state = ContentIndexState::SkippedBinary;
+                }
+                ContentExtractionResult::ReadFailed => {
+                    entry.content_index_state = ContentIndexState::ReadFailed;
+                }
+            }
+        }
+
+        writer.commit()?;
+
+        Ok(Self {
+            index,
+            path_field,
+            content_field,
+            documents,
+        })
+    }
+
+    pub fn search(
+        &self,
+        content_query: &str,
+        candidate_paths: Option<&HashSet<String>>,
+        limit: usize,
+    ) -> ContentResult<Vec<ContentSearchHit>> {
+        if limit == 0 || content_query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let reader = self.index.reader()?;
+        let searcher = reader.searcher();
+        let parser = QueryParser::for_index(&self.index, vec![self.content_field]);
+        let query = parser.parse_query(content_query)?;
+        let tantivy_limit = limit.saturating_mul(4).clamp(10, 10_000);
+        let top_docs =
+            searcher.search(&query, &TopDocs::with_limit(tantivy_limit).order_by_score())?;
+        let mut hits = Vec::new();
+
+        for (score, address) in top_docs {
+            let doc = searcher.doc::<TantivyDocument>(address)?;
+            let Some(path) = doc
+                .get_first(self.path_field)
+                .and_then(|value| value.as_str())
+                .map(str::to_owned)
+            else {
+                continue;
+            };
+
+            if candidate_paths.is_some_and(|candidates| !candidates.contains(&path)) {
+                continue;
+            }
+
+            let Some(document) = self.documents.get(&path) else {
+                continue;
+            };
+            let Some(snippet) = document.snippet(content_query) else {
+                continue;
+            };
+
+            hits.push(ContentSearchHit {
+                path,
+                score,
+                snippet,
+            });
+
+            if hits.len() >= limit {
+                break;
+            }
+        }
+
+        Ok(hits)
+    }
+
+    pub fn remove_path(&mut self, path: impl AsRef<Path>) -> ContentResult<()> {
+        let path = path.as_ref().to_string_lossy().to_string();
+        let mut writer: IndexWriter = self.index.writer(50_000_000)?;
+        writer.delete_term(Term::from_field_text(self.path_field, &path));
+        writer.commit()?;
+        self.documents.remove(&path);
+        Ok(())
+    }
+
+    pub fn update_entry(
+        &mut self,
+        entry: &mut IndexedEntry,
+        options: &ContentIndexOptions,
+        extractor: &dyn TextExtractor,
+    ) -> ContentResult<()> {
+        self.remove_path(&entry.path)?;
+        if entry.kind != IndexedEntryKind::File {
+            entry.content_index_state = ContentIndexState::NotIndexed;
+            return Ok(());
+        }
+
+        match extractor.extract(Path::new(&entry.path), options.max_file_bytes) {
+            ContentExtractionResult::Text(content) => {
+                let mut writer: IndexWriter = self.index.writer(50_000_000)?;
+                writer.add_document(doc!(
+                    self.path_field => entry.path.clone(),
+                    self.content_field => content.clone(),
+                ))?;
+                writer.commit()?;
+                self.documents
+                    .insert(entry.path.clone(), ExtractedDocument::from_content(content));
+                entry.content_index_state = ContentIndexState::Indexed;
+            }
+            ContentExtractionResult::TooLarge => {
+                entry.content_index_state = ContentIndexState::SkippedTooLarge;
+            }
+            ContentExtractionResult::Binary | ContentExtractionResult::UnsupportedType => {
+                entry.content_index_state = ContentIndexState::SkippedBinary;
+            }
+            ContentExtractionResult::ReadFailed => {
+                entry.content_index_state = ContentIndexState::ReadFailed;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl ExtractedDocument {
+    fn from_content(content: String) -> Self {
+        let lines = content.lines().map(str::to_owned).collect();
+        Self { content, lines }
+    }
+
+    fn snippet(&self, query: &str) -> Option<SearchSnippet> {
+        let terms = query_highlight_terms(query);
+        let content_lower = self.content.to_ascii_lowercase();
+        let first_term = terms.iter().find(|term| content_lower.contains(&***term))?;
+
+        let hit_line_index =
+            self.lines.iter().enumerate().find_map(|(index, line)| {
+                line.to_ascii_lowercase().find(first_term).map(|_| index)
+            })?;
+        let start_index = hit_line_index.saturating_sub(5);
+        let end_index = (hit_line_index + 6).min(self.lines.len());
+        let start_line = start_index + 1;
+
+        let mut snippet = SearchSnippet {
+            start_line,
+            lines: self.lines[start_index..end_index].to_vec(),
+            highlights: Vec::new(),
+        };
+
+        for term in terms {
+            for (line_offset, line) in snippet.lines.iter().enumerate() {
+                let lower = line.to_ascii_lowercase();
+                let mut search_start = 0;
+                while let Some(relative) = lower[search_start..].find(&term) {
+                    let start = search_start + relative;
+                    let end = start + term.len();
+                    snippet
+                        .highlights
+                        .push(crate::core::search::SearchHighlight {
+                            line: snippet.start_line + line_offset,
+                            start_column: start + 1,
+                            end_column: end + 1,
+                            matched_text: line[start..end].to_owned(),
+                        });
+                    search_start = end;
+                }
+            }
+        }
+
+        Some(snippet)
+    }
+}
+
+fn content_schema() -> Schema {
+    let mut builder = Schema::builder();
+    builder.add_text_field("path", STRING | STORED);
+    builder.add_text_field("content", TEXT | STORED);
+    builder.build()
+}
+
+fn is_unsupported_rich_document(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.to_ascii_lowercase())
+            .as_deref(),
+        Some("pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx")
+    )
+}
+
+fn query_highlight_terms(query: &str) -> Vec<String> {
+    query
+        .split(|character: char| {
+            character.is_whitespace()
+                || matches!(character, '"' | '\'' | ':' | '(' | ')' | '+' | '-')
+        })
+        .map(|term| {
+            term.trim_matches(|character: char| !character.is_alphanumeric() && character != '_')
+                .to_ascii_lowercase()
+        })
+        .filter(|term| !term.is_empty())
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::index::{IndexedEntry, IndexedEntryKind, SearchIndex};
+    use crate::core::index_entry::ContentIndexState;
+    use crate::core::search::QueryParser;
+    use std::fs;
+
+    #[test]
+    fn indexes_text_files_and_searches_content_with_snippets() {
+        let workspace = tempfile::tempdir().unwrap();
+        let file = workspace.path().join("notes.txt");
+        let lines: Vec<_> = (1..=13)
+            .map(|line| {
+                if line == 7 {
+                    "line 07 alpha needle beta".to_owned()
+                } else {
+                    format!("line {line:02}")
+                }
+            })
+            .collect();
+        fs::write(&file, lines.join("\n")).unwrap();
+
+        let mut entries = vec![entry(&file)];
+        let options = ContentIndexOptions {
+            index_dir: workspace.path().join("tantivy-content"),
+            max_file_bytes: DEFAULT_MAX_CONTENT_BYTES,
+        };
+
+        let content_index = ContentIndex::build(&mut entries, options).unwrap();
+
+        assert_eq!(entries[0].content_index_state, ContentIndexState::Indexed);
+
+        let hits = content_index.search("needle", None, 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, file.to_string_lossy());
+        assert_eq!(hits[0].snippet.start_line, 2);
+        assert_eq!(hits[0].snippet.lines.len(), 11);
+        assert_eq!(hits[0].snippet.lines[5], "line 07 alpha needle beta");
+        assert_eq!(hits[0].snippet.highlights.len(), 1);
+        assert_eq!(hits[0].snippet.highlights[0].line, 7);
+        assert_eq!(hits[0].snippet.highlights[0].start_column, 15);
+        assert_eq!(hits[0].snippet.highlights[0].end_column, 21);
+
+        let index = SearchIndex::from_entries_with_content_index(entries, content_index);
+        let parser = QueryParser::new(Default::default());
+        let results = index.search(&parser.parse("content:needle"));
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "notes.txt");
+        assert_eq!(results[0].snippet.as_ref().unwrap().start_line, 2);
+        assert_eq!(
+            results[0].snippet.as_ref().unwrap().highlights[0].matched_text,
+            "needle"
+        );
+    }
+
+    #[test]
+    fn skips_too_large_and_binary_files_but_keeps_name_path_searchable() {
+        let workspace = tempfile::tempdir().unwrap();
+        let big = workspace.path().join("big-report.txt");
+        let binary = workspace.path().join("binary-report.bin");
+        fs::write(&big, "x".repeat(128)).unwrap();
+        fs::write(&binary, [0, 159, 146, 150, 0, 1]).unwrap();
+
+        let mut entries = vec![entry(&big), entry(&binary)];
+        let options = ContentIndexOptions {
+            index_dir: workspace.path().join("tantivy-content"),
+            max_file_bytes: 32,
+        };
+
+        let content_index = ContentIndex::build(&mut entries, options).unwrap();
+
+        assert_eq!(
+            entries[0].content_index_state,
+            ContentIndexState::SkippedTooLarge
+        );
+        assert_eq!(
+            entries[1].content_index_state,
+            ContentIndexState::SkippedBinary
+        );
+        assert!(content_index.search("report", None, 10).unwrap().is_empty());
+
+        let index = SearchIndex::from_entries_with_content_index(entries, content_index);
+        let parser = QueryParser::new(Default::default());
+        let name_results = index.search(&parser.parse("report"));
+        let content_results = index.search(&parser.parse("content:report"));
+
+        assert_eq!(name_results.len(), 2);
+        assert!(content_results.is_empty());
+    }
+
+    #[test]
+    fn applies_candidate_constraints_before_content_results() {
+        let workspace = tempfile::tempdir().unwrap();
+        let docs = workspace.path().join("docs");
+        let archive = workspace.path().join("archive");
+        fs::create_dir_all(&docs).unwrap();
+        fs::create_dir_all(&archive).unwrap();
+        let visible = docs.join("visible.md");
+        let hidden = archive.join("hidden.md");
+        fs::write(&visible, "shared body needle").unwrap();
+        fs::write(&hidden, "shared body needle").unwrap();
+
+        let mut entries = vec![entry(&visible), entry(&hidden)];
+        let content_index = ContentIndex::build(
+            &mut entries,
+            ContentIndexOptions {
+                index_dir: workspace.path().join("tantivy-content"),
+                max_file_bytes: DEFAULT_MAX_CONTENT_BYTES,
+            },
+        )
+        .unwrap();
+        let index = SearchIndex::from_entries_with_content_index(entries, content_index);
+        let parser = QueryParser::new(Default::default());
+
+        let titles: Vec<_> = index
+            .search(&parser.parse("dir:docs content:needle"))
+            .into_iter()
+            .map(|result| result.title)
+            .collect();
+
+        assert_eq!(titles, vec!["visible.md"]);
+    }
+
+    #[test]
+    fn mixed_sort_keeps_ordinary_candidates_and_weights_candidate_content_hits() {
+        let workspace = tempfile::tempdir().unwrap();
+        let name_match = workspace.path().join("needle-title.md");
+        let boosted = workspace.path().join("needle-body.md");
+        let content_only = workspace.path().join("body-only.md");
+        fs::write(&name_match, "ordinary text").unwrap();
+        fs::write(&boosted, "contains needle in the body").unwrap();
+        fs::write(&content_only, "contains needle in the body").unwrap();
+
+        let mut entries = vec![entry(&name_match), entry(&boosted), entry(&content_only)];
+        let content_index = ContentIndex::build(
+            &mut entries,
+            ContentIndexOptions {
+                index_dir: workspace.path().join("tantivy-content"),
+                max_file_bytes: DEFAULT_MAX_CONTENT_BYTES,
+            },
+        )
+        .unwrap();
+        let index = SearchIndex::from_entries_with_content_index(entries, content_index);
+        let parser = QueryParser::new(Default::default());
+
+        let pure_content_titles: Vec<_> = index
+            .search(&parser.parse("content:needle"))
+            .into_iter()
+            .map(|result| result.title)
+            .collect();
+        let mixed_titles: Vec<_> = index
+            .search(&parser.parse("needle content:needle"))
+            .into_iter()
+            .map(|result| result.title)
+            .collect();
+
+        assert_eq!(pure_content_titles, vec!["body-only.md", "needle-body.md"]);
+        assert_eq!(mixed_titles, vec!["needle-body.md", "needle-title.md"]);
+    }
+
+    #[test]
+    fn updates_and_removes_individual_content_documents() {
+        let workspace = tempfile::tempdir().unwrap();
+        let first = workspace.path().join("first.txt");
+        let second = workspace.path().join("second.txt");
+        fs::write(&first, "alpha needle").unwrap();
+        fs::write(&second, "beta haystack").unwrap();
+
+        let mut entries = vec![entry(&first)];
+        let options = ContentIndexOptions {
+            index_dir: workspace.path().join("tantivy-content"),
+            max_file_bytes: DEFAULT_MAX_CONTENT_BYTES,
+        };
+        let mut content_index = ContentIndex::build(&mut entries, options.clone()).unwrap();
+
+        let mut second_entry = entry(&second);
+        content_index
+            .update_entry(&mut second_entry, &options, &PlainTextExtractor)
+            .unwrap();
+        assert_eq!(second_entry.content_index_state, ContentIndexState::Indexed);
+        assert_eq!(content_index.search("haystack", None, 10).unwrap().len(), 1);
+
+        content_index.remove_path(&first).unwrap();
+        assert!(content_index.search("needle", None, 10).unwrap().is_empty());
+    }
+
+    fn entry(path: &std::path::Path) -> IndexedEntry {
+        IndexedEntry::from_path_metadata(path, path.parent().unwrap(), IndexedEntryKind::File)
+    }
+}

@@ -28,6 +28,7 @@ pub struct SearchResult {
     pub score: i64,
     pub main_action: Action,
     pub secondary_actions: Vec<Action>,
+    pub snippet: Option<SearchSnippet>,
 }
 
 impl SearchResult {
@@ -46,6 +47,7 @@ impl SearchResult {
             score: 0,
             main_action,
             secondary_actions: Vec::new(),
+            snippet: None,
         }
     }
 
@@ -63,6 +65,28 @@ impl SearchResult {
         self.secondary_actions.push(action);
         self
     }
+
+    pub fn with_snippet(mut self, snippet: SearchSnippet) -> Self {
+        self.snippet = Some(snippet);
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchSnippet {
+    pub start_line: usize,
+    pub lines: Vec<String>,
+    pub highlights: Vec<SearchHighlight>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchHighlight {
+    pub line: usize,
+    pub start_column: usize,
+    pub end_column: usize,
+    pub matched_text: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -323,6 +347,7 @@ mod tests {
         assert_eq!(result.kind, SearchResultKind::File);
         assert_eq!(result.provider, "files");
         assert_eq!(result.score, 12);
+        assert!(result.snippet.is_none());
         assert_eq!(
             result.main_action,
             Action::OpenPath {

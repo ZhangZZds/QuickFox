@@ -102,10 +102,15 @@ GitHub Actions 会在 `macos-latest` 和 `windows-latest` 上运行 release work
 
 - 打开启动器后直接输入关键字搜索文件或目录
 - 输入 `re:` 前缀进入显式正则搜索，例如 `re:.*\\.md$`
+- 输入字段查询收窄文件结果，例如 `type:pdf`、`name:test`、`dir:**/workspace`
+- 输入 `content:"hello world"` 搜索已配置内容索引范围内的文本文件正文
 - 输入网页前缀，例如 `g tauri v2` 或 `bd tauri v2`
 - 输入 `>` 前缀进入命令模式，例如 `> git status`
 - 按 `Shift` 查看最近输入历史，历史模式里用上下键选择、Enter 回填
 - 右键结果可执行二级动作
+
+字段查询条件使用 AND 语义，可以和普通词组合，例如 `workspace type:md
+content:invoice`。`content:` 只在用户显式输入时搜索文件内容；QuickFox 会读取并在本机索引设置页配置范围内、大小限制内、可识别为文本的文件。超出大小上限或二进制文件不会进入内容索引，但仍可按文件名和路径搜索。
 
 ## 安全说明
 

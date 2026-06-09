@@ -42,7 +42,7 @@ input {
   border: 1px solid #d8d4ca;
   border-radius: 8px;
   box-shadow: 0 18px 48px rgba(27, 31, 35, 0.18);
-  overflow: hidden;
+  overflow: visible;
 }
 
 .panel-toolbar {
@@ -52,7 +52,7 @@ input {
 }
 
 .settings-toolbar {
-  grid-template-columns: 150px minmax(0, 1fr) 150px;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
   border-bottom: 1px solid #dfdbd2;
   background: #f6f4ef;
@@ -276,6 +276,62 @@ input {
   font-size: 13px;
 }
 
+.result-snippet {
+  grid-column: 1 / -1;
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+  overflow: hidden;
+  padding: 2px 0 0 30px;
+  color: #56615a;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.result-snippet--expanded {
+  max-height: 180px;
+}
+
+.result-snippet-summary {
+  display: flex;
+  gap: 10px;
+  min-width: 0;
+  color: #6d776f;
+  font-size: 11px;
+}
+
+.result-snippet-context {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.result-snippet-line {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr);
+  gap: 8px;
+}
+
+.result-snippet-number {
+  color: #8a928d;
+  text-align: right;
+}
+
+.result-snippet-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.result-snippet mark {
+  border-radius: 3px;
+  padding: 0 2px;
+  color: #17201a;
+  background: #fff2a8;
+}
+
 .action-menu {
   position: fixed;
   z-index: 20;
@@ -331,8 +387,12 @@ input {
 }
 
 .settings-panel {
-  width: min(920px, calc(100vw - 48px));
-  height: min(640px, calc(100vh - 48px));
+  width: calc(100vw - 32px);
+  height: calc(100vh - 32px);
+  min-width: min(420px, calc(100vw - 32px));
+  min-height: min(500px, calc(100vh - 32px));
+  max-width: 1440px;
+  max-height: 960px;
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
   padding: 14px;
@@ -431,7 +491,7 @@ input {
 .settings-index-workspace {
   min-height: 0;
   display: grid;
-  grid-template-columns: minmax(0, 1.15fr) minmax(280px, 0.85fr);
+  grid-template-columns: minmax(0, 1.25fr) minmax(320px, 0.75fr);
   gap: 12px;
 }
 
@@ -656,7 +716,63 @@ input {
   font-weight: 600;
 }
 
+.settings-field-title {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.settings-help {
+  position: relative;
+  display: inline-grid;
+  place-items: center;
+}
+
+.settings-help-button {
+  width: 18px;
+  height: 18px;
+  display: inline-grid;
+  place-items: center;
+  border: 1px solid #b8c8bf;
+  border-radius: 50%;
+  padding: 0;
+  background: #f7faf8;
+  color: #4c5750;
+  font-size: 12px;
+  font-weight: 800;
+  cursor: help;
+}
+
+.settings-help-tooltip {
+  position: absolute;
+  z-index: 200;
+  left: 50%;
+  bottom: calc(100% + 8px);
+  width: max-content;
+  max-width: min(380px, 70vw);
+  transform: translateX(-50%);
+  border: 1px solid #cbd8d1;
+  border-radius: 6px;
+  padding: 8px 10px;
+  background: #17201a;
+  color: #ffffff;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.45;
+  opacity: 0;
+  pointer-events: none;
+  white-space: normal;
+  box-shadow: 0 12px 32px rgba(23, 32, 26, 0.22);
+}
+
+.settings-help:hover .settings-help-tooltip,
+.settings-help:focus-within .settings-help-tooltip {
+  opacity: 1;
+}
+
 .settings-form input,
+.settings-form select,
 .settings-form textarea {
   width: 100%;
   border: 1px solid #d8d4ca;
@@ -664,6 +780,10 @@ input {
   padding: 8px 10px;
   color: #17201a;
   background: #ffffff;
+}
+
+.settings-form select {
+  min-height: 36px;
 }
 
 .settings-form textarea {
@@ -676,6 +796,13 @@ input {
   resize: none;
 }
 
+.settings-help-text {
+  margin: 0;
+  color: #657168;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 .settings-form .toggle-row {
   display: flex;
   align-items: center;
@@ -684,6 +811,23 @@ input {
 
 .settings-form .toggle-row input {
   width: auto;
+}
+
+.shortcut-recorder {
+  min-height: 38px;
+  border: 1px solid #cbd5cf;
+  border-radius: 6px;
+  padding: 0 12px;
+  background: #f9fbfa;
+  color: #17201a;
+  text-align: left;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.shortcut-recorder[aria-pressed="true"] {
+  border-color: #587a68;
+  background: #e8f1ed;
 }
 
 .settings-dialog {
@@ -759,6 +903,12 @@ input {
 
   .settings-tabs {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .settings-panel {
+    width: calc(100vw - 24px);
+    height: calc(100vh - 24px);
+    padding: 10px;
   }
 
   .engine-row {

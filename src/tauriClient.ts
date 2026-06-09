@@ -14,8 +14,33 @@ export type FrontendAction =
     }
   | { type: "executeCommand"; command: string; requiresConfirmation: boolean };
 
+export type SearchHighlight = {
+  line: number;
+  startColumn: number;
+  endColumn: number;
+  matchedText: string;
+};
+
+export type SearchSnippet = {
+  startLine: number;
+  lines: string[];
+  highlights: SearchHighlight[];
+};
+
+export type SearchResult = {
+  id: string;
+  title: string;
+  detail?: string | null;
+  kind: "application" | "file" | "directory" | "calculator" | "webSearch" | "command" | "feedback";
+  provider: string;
+  score: number;
+  mainAction: FrontendAction;
+  secondaryActions: FrontendAction[];
+  snippet?: SearchSnippet | null;
+};
+
 export function search(query: string) {
-  return invoke("search", { query });
+  return invoke<SearchResult[]>("search", { query });
 }
 
 export function executeAction(action: FrontendAction) {
@@ -40,10 +65,6 @@ export function globalHotkeyStatus() {
 
 export function openSettingsWindow() {
   return invoke("open_settings_window");
-}
-
-export function returnToLauncherWindow() {
-  return invoke("return_to_launcher_window");
 }
 
 export function currentWindowLabel() {
@@ -108,6 +129,11 @@ export type QuickFoxConfig = {
     include_dirs: string[];
     exclude_dirs: string[];
     exclude_patterns: string[];
+    performance_mode: "fast" | "balanced" | "complete";
+    respect_project_ignores: boolean;
+    content_include_dirs: string[];
+    content_max_file_bytes: number;
+    watcher_enabled: boolean;
   };
   query: {
     regex_prefix: string;
@@ -131,6 +157,9 @@ export type QuickFoxConfig = {
   results: {
     limit: number;
   };
+  hotkey: {
+    wake_shortcut: string;
+  };
 };
 
 export type IndexStatus = {
@@ -139,6 +168,12 @@ export type IndexStatus = {
   message?: string | null;
   generation: number;
   completedAtMs?: number | null;
+  stage?: string;
+  currentRoot?: string | null;
+  scanned?: number;
+  accepted?: number;
+  skipped?: number;
+  failures?: number;
 };
 
 export type AppPaths = {

@@ -819,10 +819,6 @@ mod tests {
     }
 
     fn indexed_entry(path: &str, name: &str, kind: IndexedEntryKind) -> IndexedEntry {
-        IndexedEntry {
-            path: path.to_owned(),
-            name: name.to_owned(),
-            kind,
-        }
+        IndexedEntry::legacy(path, name, kind)
     }
 }
