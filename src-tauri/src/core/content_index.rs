@@ -472,7 +472,7 @@ mod tests {
     }
 
     #[test]
-    fn mixed_sort_keeps_ordinary_candidates_and_weights_candidate_content_hits() {
+    fn mixed_sort_keeps_only_candidate_content_hits() {
         let workspace = tempfile::tempdir().unwrap();
         let name_match = workspace.path().join("needle-title.md");
         let boosted = workspace.path().join("needle-body.md");
@@ -505,7 +505,7 @@ mod tests {
             .collect();
 
         assert_eq!(pure_content_titles, vec!["body-only.md", "needle-body.md"]);
-        assert_eq!(mixed_titles, vec!["needle-body.md", "needle-title.md"]);
+        assert_eq!(mixed_titles, vec!["needle-body.md"]);
     }
 
     #[test]

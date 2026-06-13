@@ -601,6 +601,46 @@ describe("App", () => {
     expect(within(result).getByText("next action")).toBeInTheDocument();
   });
 
+  it("expands line context when arrow keys move onto a snippet result", async () => {
+    vi.mocked(search).mockResolvedValueOnce([fileResults[0], contentSnippetResults[0]]);
+
+    render(<App />);
+    const input = screen.getByLabelText("搜索文件、目录、计算器、网页搜索或命令");
+    fireEvent.change(input, {
+      target: { value: 'content:"hello world"' },
+    });
+
+    await screen.findByRole("option", { name: /Documents/ });
+    const snippetResult = screen.getByRole("option", { name: /report.md/ });
+    expect(within(snippetResult).queryByText("project alpha")).not.toBeInTheDocument();
+
+    fireEvent.keyDown(input, { key: "ArrowDown" });
+
+    expect(snippetResult).toHaveAttribute("aria-selected", "true");
+    expect(within(snippetResult).getByText("project alpha")).toBeInTheDocument();
+    expect(within(snippetResult).getByText("next action")).toBeInTheDocument();
+  });
+
+  it("closes the secondary action menu when arrow keys move the result selection", async () => {
+    vi.mocked(search).mockResolvedValueOnce(typedResults);
+
+    render(<App />);
+    const input = screen.getByLabelText("搜索文件、目录、计算器、网页搜索或命令");
+    fireEvent.change(input, { target: { value: "doc" } });
+
+    const firstResult = await screen.findByRole("option", { name: /report.md/ });
+    fireEvent.contextMenu(firstResult);
+    expect(screen.getByRole("menu")).toBeInTheDocument();
+
+    fireEvent.keyDown(input, { key: "ArrowDown" });
+
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+    expect(screen.getByRole("option", { name: /Documents/ })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+  });
+
   it("moves selection with arrow keys and executes the selected primary action with Enter", async () => {
     const onExecuteAction = vi.fn();
     vi.mocked(search).mockResolvedValueOnce(fileResults);
@@ -965,12 +1005,16 @@ describe("App", () => {
     await waitFor(() => expect(appPaths).toHaveBeenCalledOnce());
     expect(await screen.findByText("配置文件位置")).toBeInTheDocument();
     expect(
-      screen.getByText("/Users/frank/Library/Application Support/QuickFox/config.json"),
+      screen.getAllByText("/Users/frank/Library/Application Support/QuickFox/config.json")[0],
     ).toBeInTheDocument();
     expect(screen.getByText("索引快照位置")).toBeInTheDocument();
     expect(
-      screen.getByText("/Users/frank/Library/Application Support/QuickFox/index.snapshot.json"),
+      screen.getAllByText(
+        "/Users/frank/Library/Application Support/QuickFox/index.snapshot.json",
+      )[0],
     ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "配置文件位置完整路径" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "索引快照位置完整路径" })).toBeInTheDocument();
   });
 
   it("keeps a single save button in the left settings action area across tabs", async () => {
@@ -1046,6 +1090,23 @@ describe("App", () => {
     });
   });
 
+  it("keeps recording the global wake shortcut when keydown lands on the document", async () => {
+    render(<App initialView="settings" />);
+    await screen.findByDisplayValue("/tmp");
+    fireEvent.click(screen.getByRole("tab", { name: "外观" }));
+
+    fireEvent.click(screen.getByRole("button", { name: "Shift+Shift" }));
+    fireEvent.keyDown(document, { key: "k", metaKey: true, shiftKey: true });
+    fireEvent.click(screen.getByRole("button", { name: "保存设置" }));
+
+    expect(saveConfig).toHaveBeenCalledWith({
+      ...appConfig,
+      hotkey: {
+        wake_shortcut: "Command+Shift+K",
+      },
+    });
+  });
+
   it("records double Shift as the default wake shortcut from two Shift presses", async () => {
     vi.mocked(loadConfig).mockResolvedValueOnce({
       ...appConfig,
@@ -1100,6 +1161,24 @@ describe("App", () => {
     expect(screen.getByText(/保存后新按键生效/)).toBeInTheDocument();
   });
 
+  it("exposes full settings values and field guidance for truncated rows", async () => {
+    render(<App initialView="settings" />);
+    await screen.findByDisplayValue("/tmp");
+
+    fireEvent.click(screen.getByRole("tab", { name: "网页搜索" }));
+
+    const googleUrl = screen.getByText("https://www.google.com/search?q={query}");
+    expect(googleUrl).toHaveAttribute("title", "https://www.google.com/search?q={query}");
+
+    fireEvent.click(screen.getByRole("tab", { name: "历史" }));
+    expect(screen.getByRole("button", { name: "输入历史条数说明" })).toBeInTheDocument();
+    expect(screen.getByText(/0 表示不保留/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("tab", { name: "命令安全" }));
+    expect(screen.getByRole("button", { name: "命令执行说明" })).toBeInTheDocument();
+    expect(screen.getByText(/每次执行前仍会要求确认/)).toBeInTheDocument();
+  });
+
   it("shows complete index status details in settings", async () => {
     vi.mocked(indexStatus).mockResolvedValueOnce({
       kind: "ready",
@@ -1136,12 +1215,31 @@ describe("App", () => {
     expect(auxiliaryColumn).toContainElement(screen.getByLabelText("正则前缀"));
     expect(auxiliaryColumn).toContainElement(screen.getByText("配置文件位置"));
     expect(auxiliaryColumn).toContainElement(
-      screen.getByText("/Users/frank/Library/Application Support/QuickFox/config.json"),
+      screen.getAllByText("/Users/frank/Library/Application Support/QuickFox/config.json")[0],
     );
     expect(auxiliaryColumn).toContainElement(screen.getByText("索引快照位置"));
     expect(auxiliaryColumn).toContainElement(
-      screen.getByText("/Users/frank/Library/Application Support/QuickFox/index.snapshot.json"),
+      screen.getAllByText(
+        "/Users/frank/Library/Application Support/QuickFox/index.snapshot.json",
+      )[0],
     );
+  });
+
+  it("renders maintenance paths as selectable full-width text in the auxiliary column", async () => {
+    render(<App initialView="settings" />);
+    await screen.findByDisplayValue("/tmp");
+
+    const configPath = screen.getByLabelText("配置文件位置完整路径文本");
+    expect(configPath).toHaveTextContent(
+      "/Users/frank/Library/Application Support/QuickFox/config.json",
+    );
+    expect(configPath).toHaveClass("settings-full-path-value");
+
+    const snapshotPath = screen.getByLabelText("索引快照位置完整路径文本");
+    expect(snapshotPath).toHaveTextContent(
+      "/Users/frank/Library/Application Support/QuickFox/index.snapshot.json",
+    );
+    expect(snapshotPath).toHaveClass("settings-full-path-value");
   });
 
   it("places refresh index in the index workspace header", async () => {
@@ -1253,6 +1351,30 @@ describe("App", () => {
           content_include_dirs: ["/tmp/Documents", "/Users/frank/workspace"],
           content_max_file_bytes: 4194304,
           watcher_enabled: false,
+        },
+      }),
+    );
+  });
+
+  it("keeps pending blank lines while editing multiline index path fields", async () => {
+    render(<App initialView="settings" />);
+    await screen.findByDisplayValue("/tmp");
+
+    const includeDirs = screen.getByLabelText("索引目录");
+    fireEvent.change(includeDirs, {
+      target: { value: "/tmp\n" },
+    });
+
+    expect(includeDirs).toHaveValue("/tmp\n");
+
+    fireEvent.click(screen.getByRole("button", { name: "保存设置" }));
+
+    await waitFor(() =>
+      expect(saveConfig).toHaveBeenCalledWith({
+        ...appConfig,
+        index: {
+          ...appConfig.index,
+          include_dirs: ["/tmp"],
         },
       }),
     );

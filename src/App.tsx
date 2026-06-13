@@ -1,4 +1,10 @@
-import { type KeyboardEvent, type ReactNode, useEffect, useRef, useState } from "react";
+import {
+  type KeyboardEvent as ReactKeyboardEvent,
+  type ReactNode,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 
 import {
   appPaths,
@@ -124,6 +130,25 @@ type ShortcutRecording = {
   error: string | null;
 };
 
+type IndexTextareaDrafts = {
+  includeDirs: string;
+  excludeDirs: string;
+  excludePatterns: string;
+  contentIncludeDirs: string;
+};
+
+type ShortcutKeyboardEvent = Pick<
+  KeyboardEvent | ReactKeyboardEvent<HTMLElement>,
+  | "altKey"
+  | "ctrlKey"
+  | "key"
+  | "metaKey"
+  | "preventDefault"
+  | "repeat"
+  | "shiftKey"
+  | "stopPropagation"
+>;
+
 function labelForAction(action: LauncherAction, resultKind?: BackendSearchResult["kind"]) {
   switch (action.type) {
     case "openPath":
@@ -185,7 +210,7 @@ function toLauncherResults(results: BackendSearchResult[]): LauncherResult[] {
   }));
 }
 
-function shortcutFromKeyboardEvent(event: KeyboardEvent<HTMLElement>): ShortcutRecording {
+function shortcutFromKeyboardEvent(event: ShortcutKeyboardEvent): ShortcutRecording {
   const key = normalizedShortcutKey(event.key);
   const modifiers = [
     event.metaKey ? "Command" : null,
@@ -250,6 +275,24 @@ function HelpIcon({ label, text }: { label: string; text: string }) {
   );
 }
 
+function FullPathValue({ label, value }: { label: string; value: string }) {
+  return (
+    <span className="settings-full-path">
+      <span aria-label={`${label}完整路径文本`} className="settings-full-path-value" title={value}>
+        {value}
+      </span>
+      <span className="settings-help">
+        <button type="button" aria-label={`${label}完整路径`} className="settings-help-button">
+          ?
+        </button>
+        <span role="tooltip" className="settings-help-tooltip">
+          {value}
+        </span>
+      </span>
+    </span>
+  );
+}
+
 export function App({
   commandEnabled,
   initialView = "launcher",
@@ -258,6 +301,9 @@ export function App({
 }: AppProps) {
   const [view, setView] = useState<"launcher" | "settings">(initialView);
   const [config, setConfig] = useState<QuickFoxConfig>(fallbackConfig);
+  const [indexTextareaDrafts, setIndexTextareaDrafts] = useState<IndexTextareaDrafts>(() =>
+    indexTextareaDraftsFromConfig(fallbackConfig),
+  );
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<LauncherResult[]>([]);
   const [selectedIndex, setSelectedIndex] = useState(0);
@@ -317,7 +363,9 @@ export function App({
     void Promise.all([loadConfig(), recentInputHistory(), indexStatus(), globalHotkeyStatus()])
       .then(([nextConfig, nextHistory, nextIndexStatus, nextHotkeyStatus]) => {
         if (!cancelled) {
-          setConfig(nextConfig as QuickFoxConfig);
+          const loadedConfig = nextConfig as QuickFoxConfig;
+          setConfig(loadedConfig);
+          setIndexTextareaDrafts(indexTextareaDraftsFromConfig(loadedConfig));
           setInputHistory(nextHistory as string[]);
           setCurrentIndexStatus(nextIndexStatus as IndexStatus);
           setCurrentHotkeyStatus(nextHotkeyStatus as GlobalHotkeyStatus);
@@ -468,7 +516,15 @@ export function App({
     }
   };
 
-  const handleKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
+  const selectResultByKeyboard = (nextIndexFor: (currentIndex: number) => number) => {
+    const nextIndex = nextIndexFor(selectedIndex);
+    setMenuResultId(null);
+    setMenuPosition(null);
+    setSelectedIndex(nextIndex);
+    setExpandedSnippetResultId(results[nextIndex]?.snippet ? results[nextIndex].id : null);
+  };
+
+  const handleKeyDown = (event: ReactKeyboardEvent<HTMLInputElement>) => {
     if (event.key === "Shift") {
       if (inputHistory.length > 0) {
         event.preventDefault();
@@ -497,7 +553,7 @@ export function App({
         setHistoryIndex(nextIndex);
         return;
       }
-      setSelectedIndex((index) => Math.min(index + 1, Math.max(results.length - 1, 0)));
+      selectResultByKeyboard((index) => Math.min(index + 1, Math.max(results.length - 1, 0)));
       return;
     }
 
@@ -508,7 +564,7 @@ export function App({
         setHistoryIndex(nextIndex);
         return;
       }
-      setSelectedIndex((index) => Math.max(index - 1, 0));
+      selectResultByKeyboard((index) => Math.max(index - 1, 0));
       return;
     }
 
@@ -588,7 +644,25 @@ export function App({
     setCurrentIndexStatus(nextStatus);
   };
 
-  const recordWakeShortcut = (event: KeyboardEvent<HTMLButtonElement>) => {
+  const updateIndexTextarea = (
+    draftKey: keyof IndexTextareaDrafts,
+    configKey: "include_dirs" | "exclude_dirs" | "exclude_patterns" | "content_include_dirs",
+    value: string,
+  ) => {
+    setIndexTextareaDrafts((current) => ({
+      ...current,
+      [draftKey]: value,
+    }));
+    setConfig((current) => ({
+      ...current,
+      index: {
+        ...current.index,
+        [configKey]: linesFromTextarea(value),
+      },
+    }));
+  };
+
+  const recordWakeShortcut = (event: ShortcutKeyboardEvent) => {
     if (!hotkeyRecording) {
       return;
     }
@@ -634,6 +708,19 @@ export function App({
     }
     setHotkeyError(recording.error);
   };
+
+  useEffect(() => {
+    if (!hotkeyRecording) {
+      return undefined;
+    }
+
+    const handleDocumentKeyDown = (event: KeyboardEvent) => {
+      recordWakeShortcut(event);
+    };
+
+    document.addEventListener("keydown", handleDocumentKeyDown);
+    return () => document.removeEventListener("keydown", handleDocumentKeyDown);
+  }, [hotkeyRecording]);
 
   const openHotkeyPermissionSettings = () => {
     if (!hotkeyPermissionSettingsUrl) {
@@ -727,18 +814,9 @@ export function App({
                       </span>
                       <textarea
                         aria-label="索引目录"
-                        value={config.index.include_dirs.join("\n")}
+                        value={indexTextareaDrafts.includeDirs}
                         onChange={(event) =>
-                          setConfig((current) => ({
-                            ...current,
-                            index: {
-                              ...current.index,
-                              include_dirs: event.target.value
-                                .split("\n")
-                                .map((item) => item.trim())
-                                .filter(Boolean),
-                            },
-                          }))
+                          updateIndexTextarea("includeDirs", "include_dirs", event.target.value)
                         }
                       />
                     </label>
@@ -752,15 +830,9 @@ export function App({
                       </span>
                       <textarea
                         aria-label="排除目录"
-                        value={config.index.exclude_dirs.join("\n")}
+                        value={indexTextareaDrafts.excludeDirs}
                         onChange={(event) =>
-                          setConfig((current) => ({
-                            ...current,
-                            index: {
-                              ...current.index,
-                              exclude_dirs: linesFromTextarea(event.target.value),
-                            },
-                          }))
+                          updateIndexTextarea("excludeDirs", "exclude_dirs", event.target.value)
                         }
                       />
                     </label>
@@ -774,15 +846,13 @@ export function App({
                       </span>
                       <textarea
                         aria-label="排除模式"
-                        value={config.index.exclude_patterns.join("\n")}
+                        value={indexTextareaDrafts.excludePatterns}
                         onChange={(event) =>
-                          setConfig((current) => ({
-                            ...current,
-                            index: {
-                              ...current.index,
-                              exclude_patterns: linesFromTextarea(event.target.value),
-                            },
-                          }))
+                          updateIndexTextarea(
+                            "excludePatterns",
+                            "exclude_patterns",
+                            event.target.value,
+                          )
                         }
                       />
                     </label>
@@ -843,15 +913,13 @@ export function App({
                       </span>
                       <textarea
                         aria-label="内容索引目录"
-                        value={config.index.content_include_dirs.join("\n")}
+                        value={indexTextareaDrafts.contentIncludeDirs}
                         onChange={(event) =>
-                          setConfig((current) => ({
-                            ...current,
-                            index: {
-                              ...current.index,
-                              content_include_dirs: linesFromTextarea(event.target.value),
-                            },
-                          }))
+                          updateIndexTextarea(
+                            "contentIncludeDirs",
+                            "content_include_dirs",
+                            event.target.value,
+                          )
                         }
                       />
                     </label>
@@ -934,9 +1002,9 @@ export function App({
                 <div className="engine-list">
                   {Object.entries(config.web_search.engines).map(([prefix, engine]) => (
                     <div className="engine-row" key={prefix}>
-                      <span>{prefix}</span>
-                      <span>{engine.name}</span>
-                      <span>{engine.url}</span>
+                      <span title={prefix}>{prefix}</span>
+                      <span title={engine.name}>{engine.name}</span>
+                      <span title={engine.url}>{engine.url}</span>
                       <button type="button" onClick={() => removeEngine(prefix)}>
                         删除
                       </button>
@@ -953,9 +1021,16 @@ export function App({
                 }
               >
                 <legend>历史</legend>
-                <label>
-                  输入历史条数
+                <label className="settings-field">
+                  <span className="settings-field-title">
+                    输入历史条数
+                    <HelpIcon
+                      label="输入历史条数"
+                      text="保留最近确认执行过的输入数量；0 表示不保留，15 是默认值。"
+                    />
+                  </span>
                   <input
+                    aria-label="输入历史条数"
                     type="number"
                     value={config.history.input_max_entries}
                     min={0}
@@ -992,7 +1067,13 @@ export function App({
                       }))
                     }
                   />
-                  <span>命令执行</span>
+                  <span className="settings-field-title">
+                    命令执行
+                    <HelpIcon
+                      label="命令执行"
+                      text="关闭后 > 前缀不会提供命令结果；开启后每次执行前仍会要求确认。"
+                    />
+                  </span>
                 </label>
               </fieldset>
               <fieldset
@@ -1252,6 +1333,15 @@ function linesFromTextarea(value: string) {
     .split("\n")
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+function indexTextareaDraftsFromConfig(config: QuickFoxConfig): IndexTextareaDrafts {
+  return {
+    includeDirs: config.index.include_dirs.join("\n"),
+    excludeDirs: config.index.exclude_dirs.join("\n"),
+    excludePatterns: config.index.exclude_patterns.join("\n"),
+    contentIncludeDirs: config.index.content_include_dirs.join("\n"),
+  };
 }
 
 function bytesToMegabytes(value: number) {
@@ -1571,19 +1661,18 @@ function IndexStatusSummary({ status }: { status: IndexStatus }) {
 }
 
 function IndexAuxiliaryDetails({ status, appPaths }: { status: IndexStatus; appPaths: AppPaths }) {
+  const configFilePath = appPaths.configFilePath ?? "未找到";
+  const indexSnapshotPath = appPaths.indexSnapshotPath ?? "尚未创建";
+
   return (
     <div className="settings-auxiliary-list">
       <div className="settings-meta-row">
         <span>配置文件位置</span>
-        <span title={appPaths.configFilePath ?? undefined}>
-          {appPaths.configFilePath ?? "未找到"}
-        </span>
+        <FullPathValue label="配置文件位置" value={configFilePath} />
       </div>
       <div className="settings-meta-row">
         <span>索引快照位置</span>
-        <span title={appPaths.indexSnapshotPath ?? undefined}>
-          {appPaths.indexSnapshotPath ?? "尚未创建"}
-        </span>
+        <FullPathValue label="索引快照位置" value={indexSnapshotPath} />
       </div>
       <div className="settings-meta-row">
         <span>{status.kind === "failed" ? "失败摘要" : "状态摘要"}</span>

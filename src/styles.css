@@ -491,7 +491,7 @@ input {
 .settings-index-workspace {
   min-height: 0;
   display: grid;
-  grid-template-columns: minmax(0, 1.25fr) minmax(320px, 0.75fr);
+  grid-template-columns: minmax(420px, 1fr) minmax(420px, 0.95fr);
   gap: 12px;
 }
 
@@ -652,6 +652,20 @@ input {
 .settings-meta-row span:nth-child(2) {
   min-width: 0;
   color: #17201a;
+}
+
+.settings-full-path {
+  min-width: 0;
+  display: flex;
+  align-items: start;
+  gap: 6px;
+}
+
+.settings-full-path-value {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  user-select: text;
+  white-space: normal;
 }
 
 .settings-meta-row--action {
@@ -842,6 +856,12 @@ input {
 .dialog-actions {
   grid-template-columns: auto auto minmax(0, 1fr);
   justify-content: start;
+}
+
+@media (max-width: 1080px) {
+  .settings-index-workspace {
+    grid-template-columns: 1fr;
+  }
 }
 
 @media (max-width: 520px) {

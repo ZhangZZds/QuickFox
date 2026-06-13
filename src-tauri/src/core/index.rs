@@ -182,16 +182,22 @@ impl SearchIndex {
         }
 
         let matcher = FileMatcher::default();
-        let candidates: Vec<_> = self
-            .entries
-            .iter()
-            .zip(self.search_texts.iter())
-            .filter(|(entry, search_text)| {
-                matcher.matches_with_search_text(&query, entry, search_text)
-            })
-            .take(limit)
-            .map(|(entry, _)| entry)
-            .collect();
+        let matching_entries =
+            self.entries
+                .iter()
+                .zip(self.search_texts.iter())
+                .filter(|(entry, search_text)| {
+                    matcher.matches_with_search_text(&query, entry, search_text)
+                });
+
+        let candidates: Vec<_> = if query.has_content_query() {
+            matching_entries.map(|(entry, _)| entry).collect()
+        } else {
+            matching_entries
+                .take(limit)
+                .map(|(entry, _)| entry)
+                .collect()
+        };
 
         if !query.has_content_query() {
             return candidates.into_iter().map(entry_to_result).collect();
@@ -206,14 +212,12 @@ impl SearchIndex {
             .collect();
         let mut results: Vec<_> = candidates
             .into_iter()
-            .map(|entry| {
-                let mut result = entry_to_result(entry);
-                if let Some(hit) = hit_by_path.get(&entry.path) {
-                    result = result
+            .filter_map(|entry| {
+                hit_by_path.get(&entry.path).map(|hit| {
+                    entry_to_result(entry)
                         .with_snippet(hit.snippet.clone())
-                        .with_score(content_score(hit).saturating_add(10_000));
-                }
-                result
+                        .with_score(content_score(hit).saturating_add(10_000))
+                })
             })
             .collect();
 
@@ -368,6 +372,7 @@ fn entry_to_result(entry: &IndexedEntry) -> SearchResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::content_index::DEFAULT_MAX_CONTENT_BYTES;
     use std::fs;
     use std::time::Instant;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -920,6 +925,51 @@ mod tests {
         let results = index.search(&parser.parse(r#"content:"hello world""#));
 
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn content_field_filters_name_candidates_to_real_content_hits() {
+        let root = temp_dir("content-field-filter");
+        let quickfox = root.join("QuickFox");
+        let cc = root.join("cc");
+        let src = root.join("src");
+        fs::create_dir_all(&quickfox).unwrap();
+        fs::create_dir_all(&cc).unwrap();
+        fs::create_dir_all(&src).unwrap();
+
+        let matching = quickfox.join("AGENTS.md");
+        let name_only = cc.join("AGENTS.md");
+        let other = src.join("agent");
+        fs::write(&matching, "specific openspec guidance").unwrap();
+        fs::write(&name_only, "agent notes without the content term").unwrap();
+        fs::write(&other, "agent helper without the content term").unwrap();
+
+        let mut entries = vec![
+            file_entry(&matching.to_string_lossy()),
+            file_entry(&name_only.to_string_lossy()),
+            file_entry(&other.to_string_lossy()),
+        ];
+        let content_index = ContentIndex::build(
+            &mut entries,
+            ContentIndexOptions {
+                index_dir: root.join("tantivy-content"),
+                max_file_bytes: DEFAULT_MAX_CONTENT_BYTES,
+            },
+        )
+        .unwrap();
+        let index = SearchIndex::from_entries_with_content_index(entries, content_index);
+        let parser = crate::core::search::QueryParser::new(Default::default());
+
+        let results = index.search(&parser.parse("name:Agent content:”openspec”"));
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].detail.as_deref(),
+            Some(matching.to_str().unwrap())
+        );
+        assert!(results[0].snippet.is_some());
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

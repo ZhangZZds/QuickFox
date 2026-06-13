@@ -1177,8 +1177,9 @@ fn build_system_open_with_command(path: &str) -> Result<ProcessCommand, String> 
     {
         let escaped_path = path.replace('\\', "\\\\").replace('"', "\\\"");
         let script = format!(
-            "set chosenApp to choose application with prompt \"选择打开方式\"\n\
-             tell application chosenApp to open POSIX file \"{escaped_path}\""
+            "set chosenApp to choose application with prompt \"选择打开方式\" as alias\n\
+             set chosenAppPath to POSIX path of chosenApp\n\
+             do shell script \"open -a \" & quoted form of chosenAppPath & \" \" & quoted form of \"{escaped_path}\""
         );
         return Ok(ProcessCommand {
             program: "osascript".to_owned(),
@@ -2432,6 +2433,19 @@ mod tests {
 
         assert!(status.enabled);
         assert_eq!(status.message, "Control+Space 全局唤醒可用");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_system_open_with_uses_finder_to_open_with_chosen_application() {
+        let command = build_system_open_with_command("/tmp/report.md").unwrap();
+
+        assert_eq!(command.program, "osascript");
+        assert!(command.args[1].contains("choose application"));
+        assert!(command.args[1].contains("as alias"));
+        assert!(command.args[1].contains("POSIX path of chosenApp"));
+        assert!(command.args[1].contains("open -a"));
+        assert!(command.args[1].contains("quoted form of \"/tmp/report.md\""));
     }
 
     #[test]
