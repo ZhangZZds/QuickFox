@@ -481,6 +481,13 @@ export function App({
     setExpandedSnippetResultId(null);
   };
 
+  const executeResult = async (result: LauncherResult, executedInput = query.trim()) => {
+    await onExecuteAction(result.primaryAction);
+    if (executedInput) {
+      await recordInputHistory(executedInput);
+    }
+  };
+
   const executeSelected = async () => {
     const executedInput = query.trim();
     const webSearchAction = buildWebSearchAction(query, config.web_search.engines);
@@ -509,10 +516,7 @@ export function App({
     }
 
     if (selectedResult) {
-      await onExecuteAction(selectedResult.primaryAction);
-      if (executedInput) {
-        await recordInputHistory(executedInput);
-      }
+      await executeResult(selectedResult, executedInput);
     }
   };
 
@@ -1243,6 +1247,10 @@ export function App({
                         setMenuResultId(result.id);
                         setMenuPosition({ left: event.clientX, top: event.clientY });
                         setSelectedIndex(index);
+                      }}
+                      onClick={() => {
+                        setSelectedIndex(index);
+                        void executeResult(result);
                       }}
                       onMouseEnter={() => {
                         setSelectedIndex(index);

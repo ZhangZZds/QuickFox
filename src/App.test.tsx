@@ -660,6 +660,78 @@ describe("App", () => {
     });
   });
 
+  it("executes the primary action when left-clicking a file result", async () => {
+    const onExecuteAction = vi.fn();
+    vi.mocked(search).mockResolvedValueOnce(typedResults);
+    render(<App onExecuteAction={onExecuteAction} />);
+
+    fireEvent.change(screen.getByLabelText("搜索文件、目录、计算器、网页搜索或命令"), {
+      target: { value: "typed" },
+    });
+
+    fireEvent.click(await screen.findByRole("option", { name: /report\.md/ }));
+
+    expect(onExecuteAction).toHaveBeenCalledWith({
+      type: "openPath",
+      path: "/tmp/report.md",
+    });
+  });
+
+  it("executes type-specific primary actions when left-clicking directories and applications", async () => {
+    const onExecuteAction = vi.fn();
+    vi.mocked(search).mockResolvedValueOnce(typedResults);
+    render(<App onExecuteAction={onExecuteAction} />);
+
+    fireEvent.change(screen.getByLabelText("搜索文件、目录、计算器、网页搜索或命令"), {
+      target: { value: "typed" },
+    });
+
+    fireEvent.click(await screen.findByRole("option", { name: /Codex\.app/ }));
+    fireEvent.click(screen.getByRole("option", { name: /Documents/ }));
+
+    expect(onExecuteAction).toHaveBeenNthCalledWith(1, {
+      type: "openPath",
+      path: "/Applications/Codex.app",
+    });
+    expect(onExecuteAction).toHaveBeenNthCalledWith(2, {
+      type: "openPath",
+      path: "/tmp/Documents",
+    });
+  });
+
+  it("uses the same primary action for Enter and left-click on the same result", async () => {
+    const keyboardExecuteAction = vi.fn();
+    vi.mocked(search).mockResolvedValueOnce(fileResults);
+    const { unmount } = render(<App onExecuteAction={keyboardExecuteAction} />);
+    const input = screen.getByLabelText("搜索文件、目录、计算器、网页搜索或命令");
+
+    fireEvent.change(input, { target: { value: "do" } });
+    await screen.findByText("Documents");
+    fireEvent.keyDown(input, { key: "ArrowDown" });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    expect(keyboardExecuteAction).toHaveBeenCalledWith({
+      type: "openPath",
+      path: "/tmp/Downloads",
+    });
+
+    unmount();
+
+    const clickExecuteAction = vi.fn();
+    vi.mocked(search).mockResolvedValueOnce(fileResults);
+    render(<App onExecuteAction={clickExecuteAction} />);
+
+    fireEvent.change(screen.getByLabelText("搜索文件、目录、计算器、网页搜索或命令"), {
+      target: { value: "do" },
+    });
+    fireEvent.click(await screen.findByRole("option", { name: /Downloads/ }));
+
+    expect(clickExecuteAction).toHaveBeenCalledWith({
+      type: "openPath",
+      path: "/tmp/Downloads",
+    });
+  });
+
   it("scrolls the selected search result into view when moving with arrow keys", async () => {
     const scrollIntoView = vi.fn();
     Element.prototype.scrollIntoView = scrollIntoView;
