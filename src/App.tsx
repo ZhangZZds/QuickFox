@@ -520,6 +520,38 @@ export function App({
     }
   };
 
+  const handleEscapeKey = (event?: Pick<Event, "preventDefault">) => {
+    event?.preventDefault();
+
+    if (hotkeyRecording) {
+      setHotkeyRecording(false);
+      setHotkeyError(null);
+      hotkeyShiftPressAtRef.current = null;
+      return;
+    }
+
+    if (menuResultId) {
+      setMenuResultId(null);
+      setMenuPosition(null);
+      return;
+    }
+
+    if (historyMode) {
+      setHistoryMode(false);
+      setHistoryIndex(null);
+      return;
+    }
+
+    if (view === "settings") {
+      if (engineWizardOpen) {
+        setEngineWizardOpen(false);
+      }
+      return;
+    }
+
+    onClose();
+  };
+
   const selectResultByKeyboard = (nextIndexFor: (currentIndex: number) => number) => {
     const nextIndex = nextIndexFor(selectedIndex);
     setMenuResultId(null);
@@ -539,13 +571,7 @@ export function App({
     }
 
     if (event.key === "Escape") {
-      event.preventDefault();
-      if (historyMode) {
-        setHistoryMode(false);
-        setHistoryIndex(null);
-        return;
-      }
-      onClose();
+      handleEscapeKey(event);
       return;
     }
 
@@ -670,6 +696,16 @@ export function App({
     if (!hotkeyRecording) {
       return;
     }
+
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      setHotkeyRecording(false);
+      setHotkeyError(null);
+      hotkeyShiftPressAtRef.current = null;
+      return;
+    }
+
     event.preventDefault();
     event.stopPropagation();
     if (
@@ -725,6 +761,19 @@ export function App({
     document.addEventListener("keydown", handleDocumentKeyDown);
     return () => document.removeEventListener("keydown", handleDocumentKeyDown);
   }, [hotkeyRecording]);
+
+  useEffect(() => {
+    const handleDocumentEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.defaultPrevented || event.key !== "Escape") {
+        return;
+      }
+
+      handleEscapeKey(event);
+    };
+
+    document.addEventListener("keydown", handleDocumentEscape);
+    return () => document.removeEventListener("keydown", handleDocumentEscape);
+  }, [engineWizardOpen, historyMode, hotkeyRecording, menuResultId, view]);
 
   const openHotkeyPermissionSettings = () => {
     if (!hotkeyPermissionSettingsUrl) {

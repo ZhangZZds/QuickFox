@@ -30,7 +30,9 @@ TBD - created by archiving change build-quickfox-launcher. Update Purpose after 
 
 #### Scenario: Esc 关闭启动器
 
-- **WHEN** QuickFox 启动窗口已显示且用户按下 Esc
+- **WHEN** QuickFox 启动窗口已显示
+- **AND** 没有动作菜单、历史模式或其它局部状态打开
+- **AND** 用户按下 Esc
 - **THEN** QuickFox 关闭启动窗口且不执行当前结果
 
 ### Requirement: Compact 启动窗口
@@ -101,6 +103,64 @@ TBD - created by archiving change build-quickfox-launcher. Update Purpose after 
 
 - **WHEN** 用户在动作菜单中选择“复制路径”
 - **THEN** 系统复制该结果对应路径
+
+### Requirement: Esc 键逐层退出
+
+系统 SHALL 在启动器和设置页中为 Esc 键提供逐层退出行为。当多个局部状态同时存在时，系统 MUST 先退出最局部的状态；只有普通启动器状态下才关闭启动器。
+
+#### Scenario: 焦点离开输入框时 Esc 关闭启动器
+
+- **WHEN** QuickFox 启动器已显示
+- **AND** 焦点位于搜索输入框以外的启动器元素
+- **AND** 没有动作菜单、历史模式或其它局部状态打开
+- **THEN** 用户按下 Esc 时 QuickFox 关闭启动器
+- **AND** 不执行当前结果
+- **AND** 不记录输入历史
+
+#### Scenario: 动作菜单打开时 Esc 只关闭菜单
+
+- **WHEN** 搜索结果动作菜单已打开
+- **AND** 用户按下 Esc
+- **THEN** QuickFox 关闭动作菜单
+- **AND** 保持启动器打开
+- **AND** 不执行当前结果
+
+#### Scenario: 历史模式打开时 Esc 只退出历史模式
+
+- **WHEN** 输入历史模式已打开
+- **AND** 用户按下 Esc
+- **THEN** QuickFox 退出历史模式
+- **AND** 保持启动器打开
+- **AND** 保留当前搜索输入
+
+#### Scenario: 命令预览中 Esc 关闭启动器
+
+- **WHEN** 命令预览已显示
+- **AND** 用户按下 Esc
+- **THEN** QuickFox 关闭启动器
+- **AND** 不执行命令
+- **AND** 不记录输入历史
+
+#### Scenario: 快捷键录制中 Esc 取消录制
+
+- **WHEN** 设置页正在录制全局唤醒快捷键
+- **AND** 用户按下 Esc
+- **THEN** QuickFox 取消录制状态
+- **AND** 保留原快捷键配置
+- **AND** 保持设置页打开
+
+#### Scenario: 设置页弹层打开时 Esc 关闭弹层
+
+- **WHEN** 设置页轻量弹层已打开
+- **AND** 用户按下 Esc
+- **THEN** QuickFox 关闭该弹层
+- **AND** 保持设置页打开
+
+#### Scenario: 设置页常态 Esc 不关闭设置页
+
+- **WHEN** 设置页没有快捷键录制或弹层状态
+- **AND** 用户按下 Esc
+- **THEN** QuickFox 保持设置页打开
 
 ### Requirement: 搜索结果主动作激活
 

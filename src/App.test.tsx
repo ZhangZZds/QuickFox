@@ -855,6 +855,44 @@ describe("App", () => {
     expect(onExecuteAction).not.toHaveBeenCalled();
   });
 
+  it("closes the launcher with Esc when focus is on a result", async () => {
+    const onClose = vi.fn();
+    const onExecuteAction = vi.fn();
+    vi.mocked(search).mockResolvedValueOnce(fileResults);
+    render(<App onClose={onClose} onExecuteAction={onExecuteAction} />);
+
+    fireEvent.change(screen.getByLabelText("搜索文件、目录、计算器、网页搜索或命令"), {
+      target: { value: "doc" },
+    });
+    const result = await screen.findByRole("option", { name: /Documents/ });
+
+    fireEvent.keyDown(result, { key: "Escape" });
+
+    expect(onClose).toHaveBeenCalledOnce();
+    expect(onExecuteAction).not.toHaveBeenCalled();
+    expect(recordInputHistory).not.toHaveBeenCalled();
+  });
+
+  it("closes the action menu with Esc without closing the launcher", async () => {
+    const onClose = vi.fn();
+    const onExecuteAction = vi.fn();
+    vi.mocked(search).mockResolvedValueOnce(fileResults);
+    render(<App onClose={onClose} onExecuteAction={onExecuteAction} />);
+
+    fireEvent.change(screen.getByLabelText("搜索文件、目录、计算器、网页搜索或命令"), {
+      target: { value: "doc" },
+    });
+    fireEvent.contextMenu(await screen.findByRole("option", { name: /Documents/ }));
+
+    expect(screen.getByRole("menu")).toBeInTheDocument();
+
+    fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
+
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+    expect(onClose).not.toHaveBeenCalled();
+    expect(onExecuteAction).not.toHaveBeenCalled();
+  });
+
   it("opens the action menu from context menu and executes secondary actions", async () => {
     const onExecuteAction = vi.fn();
     vi.mocked(search).mockResolvedValueOnce(fileResults);
@@ -1179,6 +1217,26 @@ describe("App", () => {
     });
   });
 
+  it("cancels global wake shortcut recording with Esc without changing the saved shortcut", async () => {
+    render(<App initialView="settings" />);
+    await screen.findByDisplayValue("/tmp");
+    fireEvent.click(screen.getByRole("tab", { name: "外观" }));
+
+    fireEvent.click(screen.getByRole("button", { name: "Shift+Shift" }));
+    expect(screen.getByRole("button", { name: "正在录制..." })).toBeInTheDocument();
+
+    fireEvent.keyDown(document, { key: "Escape" });
+    fireEvent.click(screen.getByRole("button", { name: "保存设置" }));
+
+    expect(screen.queryByRole("button", { name: "正在录制..." })).not.toBeInTheDocument();
+    expect(saveConfig).toHaveBeenCalledWith({
+      ...appConfig,
+      hotkey: {
+        wake_shortcut: "Shift+Shift",
+      },
+    });
+  });
+
   it("records double Shift as the default wake shortcut from two Shift presses", async () => {
     vi.mocked(loadConfig).mockResolvedValueOnce({
       ...appConfig,
@@ -1249,6 +1307,29 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("tab", { name: "命令安全" }));
     expect(screen.getByRole("button", { name: "命令执行说明" })).toBeInTheDocument();
     expect(screen.getByText(/每次执行前仍会要求确认/)).toBeInTheDocument();
+  });
+
+  it("closes the web search engine wizard with Esc without closing settings", async () => {
+    render(<App initialView="settings" />);
+    await screen.findByDisplayValue("/tmp");
+
+    fireEvent.click(screen.getByRole("tab", { name: "网页搜索" }));
+    fireEvent.click(screen.getByRole("button", { name: "新增搜索引擎" }));
+    expect(screen.getByRole("dialog", { name: "新增搜索引擎" })).toBeInTheDocument();
+
+    fireEvent.keyDown(document, { key: "Escape" });
+
+    expect(screen.queryByRole("dialog", { name: "新增搜索引擎" })).not.toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "设置" })).toBeInTheDocument();
+  });
+
+  it("keeps settings open when Esc is pressed without a local settings state", async () => {
+    render(<App initialView="settings" />);
+    await screen.findByDisplayValue("/tmp");
+
+    fireEvent.keyDown(document, { key: "Escape" });
+
+    expect(screen.getByRole("heading", { name: "设置" })).toBeInTheDocument();
   });
 
   it("shows complete index status details in settings", async () => {
