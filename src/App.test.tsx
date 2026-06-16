@@ -6,6 +6,7 @@ import {
   appPaths,
   executeAction,
   globalHotkeyStatus,
+  hideCurrentWindow,
   listenGlobalHotkeyStatus,
   listenIndexStatus,
   indexStatus,
@@ -25,6 +26,7 @@ vi.mock("./tauriClient", () => ({
   appPaths: vi.fn(),
   executeAction: vi.fn(),
   globalHotkeyStatus: vi.fn(),
+  hideCurrentWindow: vi.fn(),
   listenGlobalHotkeyStatus: vi.fn(),
   listenIndexStatus: vi.fn(),
   indexStatus: vi.fn(),
@@ -256,6 +258,7 @@ describe("App", () => {
     vi.mocked(search).mockReset();
     vi.mocked(executeAction).mockReset();
     vi.mocked(globalHotkeyStatus).mockReset();
+    vi.mocked(hideCurrentWindow).mockReset();
     vi.mocked(listenGlobalHotkeyStatus).mockReset();
     vi.mocked(listenIndexStatus).mockReset();
     vi.mocked(indexStatus).mockReset();
@@ -853,6 +856,18 @@ describe("App", () => {
 
     expect(onClose).toHaveBeenCalledOnce();
     expect(onExecuteAction).not.toHaveBeenCalled();
+  });
+
+  it("hides the Tauri launcher window by default when Esc closes the launcher", () => {
+    render(<App />);
+
+    fireEvent.keyDown(screen.getByLabelText("搜索文件、目录、计算器、网页搜索或命令"), {
+      key: "Escape",
+    });
+
+    expect(hideCurrentWindow).toHaveBeenCalledOnce();
+    expect(executeAction).not.toHaveBeenCalled();
+    expect(recordInputHistory).not.toHaveBeenCalled();
   });
 
   it("closes the launcher with Esc when focus is on a result", async () => {

@@ -75,6 +75,14 @@ export function currentWindowLabel() {
   }
 }
 
+export async function hideCurrentWindow() {
+  try {
+    await getCurrentWindow().hide();
+  } catch {
+    return undefined;
+  }
+}
+
 export function loadConfig() {
   return invoke("load_config");
 }

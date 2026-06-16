@@ -10,6 +10,7 @@ import {
   appPaths,
   executeAction,
   globalHotkeyStatus,
+  hideCurrentWindow,
   listenGlobalHotkeyStatus,
   indexStatus,
   listenIndexStatus,
@@ -296,7 +297,7 @@ function FullPathValue({ label, value }: { label: string; value: string }) {
 export function App({
   commandEnabled,
   initialView = "launcher",
-  onClose = () => undefined,
+  onClose = hideCurrentWindow,
   onExecuteAction = executeAction,
 }: AppProps) {
   const [view, setView] = useState<"launcher" | "settings">(initialView);

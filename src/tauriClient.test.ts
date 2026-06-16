@@ -9,6 +9,7 @@ import {
   currentWindowLabel,
   executeAction,
   globalHotkeyStatus,
+  hideCurrentWindow,
   indexStatus,
   listenGlobalHotkeyStatus,
   listenIndexStatus,
@@ -103,6 +104,17 @@ describe("tauriClient", () => {
     });
 
     expect(currentWindowLabel()).toBeNull();
+  });
+
+  it("hides the current Tauri window when available", async () => {
+    const hide = vi.fn().mockResolvedValueOnce(undefined);
+    getCurrentWindowMock.mockReturnValueOnce({ label: "main", hide } as unknown as ReturnType<
+      typeof getCurrentWindow
+    >);
+
+    await hideCurrentWindow();
+
+    expect(hide).toHaveBeenCalledOnce();
   });
 
   it("listens for the tray settings event", async () => {

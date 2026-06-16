@@ -34,6 +34,7 @@ TBD - created by archiving change build-quickfox-launcher. Update Purpose after 
 - **AND** 没有动作菜单、历史模式或其它局部状态打开
 - **AND** 用户按下 Esc
 - **THEN** QuickFox 关闭启动窗口且不执行当前结果
+- **AND** Tauri 运行时隐藏当前 launcher 窗口
 
 ### Requirement: Compact 启动窗口
 
