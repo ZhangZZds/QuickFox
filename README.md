@@ -15,7 +15,9 @@ QuickFox 是一个基于 Tauri 的跨平台快速启动器，灵感来自 Listar
 - 计算器结果
 - 显式网页搜索前缀，例如 `g 关键词` 和 `bd 关键词`
 - 命令模式预览与安全检查
-- 文件/目录打开、打开所在目录、复制路径、用开发工具打开
+- 文件、目录、应用、网页搜索和命令结果支持 Enter 与鼠标左键主动作激活
+- 文件/目录打开、打开所在目录、复制路径、选择打开方式、用开发工具打开
+- Esc 分层退出：优先关闭局部菜单或模式，搜索栏有输入时先清空搜索，空搜索栏时关闭启动器
 - macOS 菜单栏图标与启动窗口
 
 ## 环境要求
@@ -91,8 +93,8 @@ npm run tauri build
 tag workflow 触发：
 
 ```bash
-git tag v1.1.0
-git push origin v1.1.0
+git tag v1.3.1
+git push origin v1.3.1
 ```
 
 GitHub Actions 会在 `macos-latest` 和 `windows-latest` 上运行 release workflow，
@@ -107,7 +109,9 @@ GitHub Actions 会在 `macos-latest` 和 `windows-latest` 上运行 release work
 - 输入网页前缀，例如 `g tauri v2` 或 `bd tauri v2`
 - 输入 `>` 前缀进入命令模式，例如 `> git status`
 - 按 `Shift` 查看最近输入历史，历史模式里用上下键选择、Enter 回填
-- 右键结果可执行二级动作
+- 按 `Enter` 或鼠标左键点击结果执行主动作：目录打开文件夹，文件使用系统默认工具打开
+- 右键结果可执行二级动作，例如打开所在目录、复制路径、选择打开方式
+- 按 `Esc` 逐层退出；搜索栏有内容时第一下会清空搜索，搜索栏为空时关闭启动器
 
 字段查询条件使用 AND 语义，可以和普通词组合，例如 `workspace type:md
 content:invoice`。`content:` 只在用户显式输入时搜索文件内容；QuickFox 会读取并在本机索引设置页配置范围内、大小限制内、可识别为文本的文件。超出大小上限或二进制文件不会进入内容索引，但仍可按文件名和路径搜索。
