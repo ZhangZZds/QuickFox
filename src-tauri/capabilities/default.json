@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "Default permissions for the QuickFox launcher window.",
   "windows": ["main", "settings"],
-  "permissions": ["core:default", "opener:default"]
+  "permissions": ["core:default", "core:window:allow-hide", "opener:default"]
 }

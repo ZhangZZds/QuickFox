@@ -1819,6 +1819,23 @@ mod tests {
     }
 
     #[test]
+    fn default_capability_allows_launcher_window_hide() {
+        let capability: serde_json::Value =
+            serde_json::from_str(include_str!("../capabilities/default.json"))
+                .expect("valid default capability");
+        let permissions = capability["permissions"]
+            .as_array()
+            .expect("default capability permissions array");
+
+        assert!(
+            permissions
+                .iter()
+                .any(|permission| permission == "core:window:allow-hide"),
+            "launcher Escape handling needs permission to hide the current Tauri window"
+        );
+    }
+
+    #[test]
     fn tray_menu_routes_show_and_settings_to_separate_windows() {
         assert_eq!(tray_window_target("show"), Some(TrayWindowTarget::Launcher));
         assert_eq!(
