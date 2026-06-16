@@ -107,15 +107,37 @@ TBD - created by archiving change build-quickfox-launcher. Update Purpose after 
 
 ### Requirement: Esc 键逐层退出
 
-系统 SHALL 在启动器和设置页中为 Esc 键提供逐层退出行为。当多个局部状态同时存在时，系统 MUST 先退出最局部的状态；只有普通启动器状态下才关闭启动器。
+系统 SHALL 在启动器和设置页中为 Esc 键提供逐层退出行为。当多个局部状态同时存在时，系统 MUST 先退出最局部的状态；启动器搜索栏非空时 MUST 先清空搜索栏和当前结果；只有搜索栏为空的普通启动器状态下才关闭启动器。
 
 #### Scenario: 焦点离开输入框时 Esc 关闭启动器
 
 - **WHEN** QuickFox 启动器已显示
 - **AND** 焦点位于搜索输入框以外的启动器元素
 - **AND** 没有动作菜单、历史模式或其它局部状态打开
+- **AND** 搜索输入为空
 - **THEN** 用户按下 Esc 时 QuickFox 关闭启动器
 - **AND** 不执行当前结果
+- **AND** 不记录输入历史
+
+#### Scenario: 搜索栏有输入和结果时 Esc 清空搜索
+
+- **WHEN** QuickFox 启动器已显示
+- **AND** 搜索输入非空
+- **AND** 搜索结果已显示
+- **AND** 用户按下 Esc
+- **THEN** QuickFox 清空搜索输入和当前结果
+- **AND** 保持启动器打开
+- **AND** 不执行当前结果
+- **AND** 不记录输入历史
+
+#### Scenario: 搜索栏有输入但无结果时 Esc 清空搜索
+
+- **WHEN** QuickFox 启动器已显示
+- **AND** 搜索输入非空
+- **AND** 未找到结果提示已显示
+- **AND** 用户按下 Esc
+- **THEN** QuickFox 清空搜索输入和未找到结果提示
+- **AND** 保持启动器打开
 - **AND** 不记录输入历史
 
 #### Scenario: 动作菜单打开时 Esc 只关闭菜单
@@ -134,11 +156,12 @@ TBD - created by archiving change build-quickfox-launcher. Update Purpose after 
 - **AND** 保持启动器打开
 - **AND** 保留当前搜索输入
 
-#### Scenario: 命令预览中 Esc 关闭启动器
+#### Scenario: 命令预览中 Esc 清空搜索
 
 - **WHEN** 命令预览已显示
 - **AND** 用户按下 Esc
-- **THEN** QuickFox 关闭启动器
+- **THEN** QuickFox 清空搜索输入和命令预览
+- **AND** 保持启动器打开
 - **AND** 不执行命令
 - **AND** 不记录输入历史
 

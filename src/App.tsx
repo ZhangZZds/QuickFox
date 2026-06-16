@@ -550,6 +550,12 @@ export function App({
       return;
     }
 
+    if (query.length > 0) {
+      updateQuery("");
+      setResults([]);
+      return;
+    }
+
     onClose();
   };
 
@@ -774,7 +780,7 @@ export function App({
 
     document.addEventListener("keydown", handleDocumentEscape);
     return () => document.removeEventListener("keydown", handleDocumentEscape);
-  }, [engineWizardOpen, historyMode, hotkeyRecording, menuResultId, view]);
+  }, [engineWizardOpen, historyMode, hotkeyRecording, menuResultId, query, view]);
 
   const openHotkeyPermissionSettings = () => {
     if (!hotkeyPermissionSettingsUrl) {

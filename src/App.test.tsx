@@ -870,21 +870,56 @@ describe("App", () => {
     expect(recordInputHistory).not.toHaveBeenCalled();
   });
 
-  it("closes the launcher with Esc when focus is on a result", async () => {
+  it("clears the search input with Esc when focus is on a result", async () => {
     const onClose = vi.fn();
     const onExecuteAction = vi.fn();
     vi.mocked(search).mockResolvedValueOnce(fileResults);
     render(<App onClose={onClose} onExecuteAction={onExecuteAction} />);
+    const input = screen.getByLabelText("搜索文件、目录、计算器、网页搜索或命令");
 
-    fireEvent.change(screen.getByLabelText("搜索文件、目录、计算器、网页搜索或命令"), {
-      target: { value: "doc" },
-    });
+    fireEvent.change(input, { target: { value: "doc" } });
     const result = await screen.findByRole("option", { name: /Documents/ });
 
     fireEvent.keyDown(result, { key: "Escape" });
 
-    expect(onClose).toHaveBeenCalledOnce();
+    expect(input).toHaveValue("");
+    expect(screen.queryByRole("option", { name: /Documents/ })).not.toBeInTheDocument();
+    expect(onClose).not.toHaveBeenCalled();
     expect(onExecuteAction).not.toHaveBeenCalled();
+    expect(recordInputHistory).not.toHaveBeenCalled();
+  });
+
+  it("clears the search input with Esc when results are visible", async () => {
+    const onClose = vi.fn();
+    vi.mocked(search).mockResolvedValueOnce(fileResults);
+    render(<App onClose={onClose} />);
+    const input = screen.getByLabelText("搜索文件、目录、计算器、网页搜索或命令");
+
+    fireEvent.change(input, { target: { value: "doc" } });
+    expect(await screen.findByRole("option", { name: /Documents/ })).toBeInTheDocument();
+
+    fireEvent.keyDown(input, { key: "Escape" });
+
+    expect(input).toHaveValue("");
+    expect(screen.queryByRole("option", { name: /Documents/ })).not.toBeInTheDocument();
+    expect(onClose).not.toHaveBeenCalled();
+    expect(recordInputHistory).not.toHaveBeenCalled();
+  });
+
+  it("clears the search input with Esc when no results are visible", async () => {
+    const onClose = vi.fn();
+    vi.mocked(search).mockResolvedValueOnce([]);
+    render(<App onClose={onClose} />);
+    const input = screen.getByLabelText("搜索文件、目录、计算器、网页搜索或命令");
+
+    fireEvent.change(input, { target: { value: "does-not-exist" } });
+    expect(await screen.findByText("未找到结果")).toBeInTheDocument();
+
+    fireEvent.keyDown(input, { key: "Escape" });
+
+    expect(input).toHaveValue("");
+    expect(screen.queryByText("未找到结果")).not.toBeInTheDocument();
+    expect(onClose).not.toHaveBeenCalled();
     expect(recordInputHistory).not.toHaveBeenCalled();
   });
 
@@ -1655,7 +1690,7 @@ describe("App", () => {
     await waitFor(() => expect(recordInputHistory).toHaveBeenCalledWith("doc"));
   });
 
-  it("does not record input history when Esc closes without executing", () => {
+  it("does not record input history when Esc clears without executing", () => {
     const onClose = vi.fn();
     render(<App onClose={onClose} />);
     const input = screen.getByLabelText("搜索文件、目录、计算器、网页搜索或命令");
@@ -1663,7 +1698,8 @@ describe("App", () => {
     fireEvent.change(input, { target: { value: "notes" } });
     fireEvent.keyDown(input, { key: "Escape" });
 
-    expect(onClose).toHaveBeenCalledOnce();
+    expect(input).toHaveValue("");
+    expect(onClose).not.toHaveBeenCalled();
     expect(recordInputHistory).not.toHaveBeenCalled();
   });
 
