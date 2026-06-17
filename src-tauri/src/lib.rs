@@ -1,7 +1,7 @@
 pub mod core;
 
 use crate::core::actions::{Action, OpenApplication};
-use crate::core::config::{ConfigStore, QuickFoxConfig};
+use crate::core::config::{ConfigStore, IndexPerformanceMode, QuickFoxConfig};
 use crate::core::content_index::{ContentIndex, ContentIndexOptions};
 use crate::core::index::{
     IndexLifecycle, IndexReport, IndexScanOptions, IndexScanner, IndexStatus, SearchIndex,
@@ -423,6 +423,7 @@ fn build_scan_options(config: &QuickFoxConfig) -> IndexScanOptions {
 fn build_scan_plans(config: &QuickFoxConfig) -> Vec<IndexScanPlan> {
     let options = build_scan_options(config);
     let mut plans = Vec::new();
+    let mode = config.index.performance_mode;
 
     let applications = existing_paths(application_index_roots());
     if !applications.is_empty() {
@@ -448,7 +449,7 @@ fn build_scan_plans(config: &QuickFoxConfig) -> Vec<IndexScanPlan> {
         ));
     }
 
-    if !configured_roots.is_empty() {
+    if mode != IndexPerformanceMode::Fast && !configured_roots.is_empty() {
         plans.push(scan_plan_for_stage(
             "configured-roots",
             30,
@@ -457,7 +458,11 @@ fn build_scan_plans(config: &QuickFoxConfig) -> Vec<IndexScanPlan> {
         ));
     }
 
-    let remaining_drives = remaining_drive_roots(&configured_roots);
+    let remaining_drives = if mode == IndexPerformanceMode::Complete {
+        remaining_drive_roots(&configured_roots)
+    } else {
+        Vec::new()
+    };
     if !remaining_drives.is_empty() {
         plans.push(scan_plan_for_stage(
             "remaining-drives",
@@ -467,7 +472,7 @@ fn build_scan_plans(config: &QuickFoxConfig) -> Vec<IndexScanPlan> {
         ));
     }
 
-    if plans.is_empty() {
+    if plans.is_empty() && mode != IndexPerformanceMode::Fast {
         plans.push(scan_plan_for_stage(
             "configured-roots",
             30,
@@ -641,13 +646,13 @@ fn build_query_parser_config(config: &QuickFoxConfig) -> QueryParserConfig {
     }
 }
 
-fn build_provider_registry(
+fn build_provider_registry<'a>(
     config: &QuickFoxConfig,
-    index: SearchIndex,
+    index: &'a SearchIndex,
     index_status: &IndexStatus,
-) -> ProviderRegistry {
+) -> ProviderRegistry<'a> {
     let mut registry = ProviderRegistry::default();
-    if file_index_is_available(&index, index_status) {
+    if file_index_is_available(index, index_status) {
         registry.register(FileProvider::with_candidate_limit(
             index,
             config.results.limit.max(1).saturating_mul(4),
@@ -700,7 +705,7 @@ fn perform_search_with_index_status(
         return Vec::new();
     }
 
-    let registry = build_provider_registry(config, index.clone(), index_status);
+    let registry = build_provider_registry(config, index, index_status);
     let results = registry.search(&request);
     let mut ranked = Ranker::default().rank(&request.text, results, &HistoryScores::default());
     ranked.truncate(config.results.limit.max(1));
@@ -772,11 +777,13 @@ fn start_background_index_refresh<R: tauri::Runtime>(
                             &mut entries_by_path,
                             stage_report,
                         );
-                        if let Some(storage) = storage_store() {
-                            let _ = storage.save_completed_index_batch(
-                                completed_at_ms,
-                                &aggregate_report.entries,
-                            );
+                        if should_persist_index_checkpoint(&stage_name, false) {
+                            if let Some(storage) = storage_store() {
+                                let _ = storage.save_completed_index_batch(
+                                    completed_at_ms,
+                                    &aggregate_report.entries,
+                                );
+                            }
                         }
                         let progress_report = aggregate_report.clone();
                         let current_root =
@@ -819,6 +826,9 @@ fn start_background_index_refresh<R: tauri::Runtime>(
                 let completed_at_ms = current_time_ms();
                 let app_for_update = app.clone();
                 let final_report = aggregate_report;
+                let content_entries = final_report.entries.clone();
+                let should_build_content_index =
+                    should_build_content_index_for_config(&config, &content_entries);
                 update_result = {
                     if let Some(storage) = storage_store() {
                         let _ = storage
@@ -837,6 +847,65 @@ fn start_background_index_refresh<R: tauri::Runtime>(
                         }
                     })
                 };
+
+                if update_result.is_ok() && should_build_content_index {
+                    let content_progress_report = IndexReport {
+                        entries: content_entries.clone(),
+                        failures: Vec::new(),
+                        scan_stats: IndexScanStats {
+                            scanned: content_entries.len(),
+                            accepted: content_entries.len(),
+                            skipped: 0,
+                            failures: 0,
+                        },
+                        scan_events: Vec::new(),
+                    };
+                    let app_for_update = app.clone();
+                    let app_for_state = app_for_update.clone();
+                    update_result = app_for_update.run_on_main_thread(move || {
+                        let state = app_for_state.state::<QuickFoxAppState>();
+                        if let Some(status) = apply_index_refresh_progress(
+                            &state,
+                            generation,
+                            "content-index".to_owned(),
+                            None,
+                            content_progress_report,
+                        ) {
+                            let _ = app_for_state.emit("quickfox://index-status", status);
+                        }
+                    });
+
+                    if update_result.is_ok() {
+                        let content_completed_at_ms = current_time_ms();
+                        let content_index =
+                            build_search_index_with_content_for_config(&config, content_entries);
+                        let content_report = IndexReport {
+                            entries: content_index.entries().to_vec(),
+                            failures: Vec::new(),
+                            ..Default::default()
+                        };
+                        if let Some(storage) = storage_store() {
+                            let _ = storage.save_completed_index_batch(
+                                content_completed_at_ms,
+                                &content_report.entries,
+                            );
+                        }
+                        let app_for_update = app.clone();
+                        let app_for_state = app_for_update.clone();
+                        update_result = app_for_update.run_on_main_thread(move || {
+                            let state = app_for_state.state::<QuickFoxAppState>();
+                            if let Some(status) = apply_completed_content_index_refresh(
+                                &state,
+                                generation,
+                                content_index,
+                                content_report,
+                                content_completed_at_ms,
+                            ) {
+                                let _ = app_for_state.emit("quickfox://index-status", status);
+                            }
+                        });
+                    }
+                }
             }
 
             if let Err(error) = update_result {
@@ -872,6 +941,28 @@ fn apply_completed_index_refresh(
             let _ = record_watcher_failure(&mut runtime, failure);
         }
     }
+    Some(runtime.index_status())
+}
+
+fn apply_completed_content_index_refresh(
+    state: &QuickFoxAppState,
+    generation: u64,
+    content_index: SearchIndex,
+    report: IndexReport,
+    completed_at_ms: i64,
+) -> Option<IndexStatus> {
+    let mut runtime = state
+        .runtime
+        .lock()
+        .expect("quickfox runtime lock poisoned");
+    if !runtime
+        .index_lifecycle
+        .complete_refresh(generation, report.entries.len(), completed_at_ms)
+    {
+        return None;
+    }
+    runtime.index = content_index;
+    runtime.last_report = report;
     Some(runtime.index_status())
 }
 
@@ -994,6 +1085,10 @@ fn last_finished_root_for_stage(report: &IndexReport, stage: &str) -> Option<Str
         })
 }
 
+fn should_persist_index_checkpoint(stage: &str, is_final: bool) -> bool {
+    is_final || stage == "user-hot-paths"
+}
+
 fn build_runtime() -> QuickFoxRuntime {
     let config = load_startup_config();
     build_runtime_from_snapshot(config, load_latest_index_snapshot())
@@ -1035,6 +1130,14 @@ fn build_runtime_from_snapshot(
 
 fn build_search_index_for_config(
     config: &QuickFoxConfig,
+    entries: Vec<IndexedEntry>,
+) -> SearchIndex {
+    let _ = config;
+    SearchIndex::from_entries(entries)
+}
+
+fn build_search_index_with_content_for_config(
+    config: &QuickFoxConfig,
     mut entries: Vec<IndexedEntry>,
 ) -> SearchIndex {
     let content_roots = content_index_roots(config);
@@ -1070,6 +1173,17 @@ fn build_search_index_for_config(
             SearchIndex::from_entries(entries)
         }
     }
+}
+
+fn should_build_content_index_for_config(
+    config: &QuickFoxConfig,
+    entries: &[IndexedEntry],
+) -> bool {
+    let content_roots = content_index_roots(config);
+    !content_roots.is_empty()
+        && entries
+            .iter()
+            .any(|entry| entry_is_under_content_root(entry, &content_roots))
 }
 
 fn content_index_roots(config: &QuickFoxConfig) -> Vec<PathBuf> {
@@ -1936,7 +2050,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_index_refresh_wires_configured_content_index_into_search() {
+    fn completed_index_refresh_delays_configured_content_index() {
         let root = tempfile::tempdir().unwrap();
         let file = root.path().join("AGENTS.md");
         fs::write(
@@ -1982,20 +2096,27 @@ mod tests {
         .expect("fresh completion emits status");
 
         let runtime = state.runtime.lock().unwrap();
-        let results = perform_search_with_index_status(
+        let name_results = perform_search_with_index_status(
             &runtime.config,
             &runtime.index,
             &runtime.index_status(),
-            "name:AGENTS content:”openspec”",
+            "AGENTS",
+        );
+        let content_results = perform_search_with_index_status(
+            &runtime.config,
+            &runtime.index,
+            &runtime.index_status(),
+            "content:openspec",
         );
 
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].title, "AGENTS.md");
-        let snippet = results[0].snippet.as_ref().expect("content snippet");
-        assert!(snippet.lines.iter().any(|line| line.contains("openspec")));
+        assert_eq!(name_results.len(), 1);
+        assert_eq!(name_results[0].title, "AGENTS.md");
+        assert!(content_results
+            .iter()
+            .any(|result| result.title.contains("内容索引")));
         assert_eq!(
             runtime.index.entries()[0].content_index_state,
-            ContentIndexState::Indexed
+            ContentIndexState::NotIndexed
         );
     }
 
@@ -2053,6 +2174,109 @@ mod tests {
             state.runtime.lock().unwrap().index.entries()[0].name,
             "notes.md"
         );
+    }
+
+    #[test]
+    fn quick_index_progress_is_searchable_before_background_completion() {
+        let state = QuickFoxAppState {
+            runtime: Mutex::new(QuickFoxRuntime {
+                config: QuickFoxConfig::default_with_index_dirs(vec!["/tmp".to_owned()]),
+                index: SearchIndex::default(),
+                last_report: IndexReport::default(),
+                index_lifecycle: IndexLifecycle::default(),
+                index_watcher: None,
+                watcher_failure_summary: None,
+            }),
+            window_state: Mutex::new(LauncherWindowState::default()),
+            global_hotkey_status: Mutex::new(pending_global_hotkey_status()),
+        };
+        let generation = {
+            let mut runtime = state.runtime.lock().unwrap();
+            runtime.index_lifecycle.start_refresh(false)
+        };
+
+        let status = apply_index_refresh_progress(
+            &state,
+            generation,
+            "user-hot-paths".to_owned(),
+            Some("/tmp".to_owned()),
+            IndexReport {
+                entries: vec![crate::core::index::IndexedEntry::legacy(
+                    "/tmp/notes.md",
+                    "notes.md",
+                    crate::core::index::IndexedEntryKind::File,
+                )],
+                failures: Vec::new(),
+                ..Default::default()
+            },
+        )
+        .expect("fresh progress emits status");
+
+        let runtime = state.runtime.lock().unwrap();
+        let results =
+            perform_search_with_index_status(&runtime.config, &runtime.index, &status, "notes");
+
+        assert_eq!(
+            status.availability,
+            crate::core::index::IndexAvailability::QuickAvailable
+        );
+        assert!(results.iter().any(|result| result.title == "notes.md"));
+    }
+
+    #[test]
+    fn failed_background_completion_keeps_quick_index_entries() {
+        let state = QuickFoxAppState {
+            runtime: Mutex::new(QuickFoxRuntime {
+                config: QuickFoxConfig::default_with_index_dirs(vec!["/tmp".to_owned()]),
+                index: SearchIndex::from_entries(vec![crate::core::index::IndexedEntry::legacy(
+                    "/tmp/notes.md",
+                    "notes.md",
+                    crate::core::index::IndexedEntryKind::File,
+                )]),
+                last_report: IndexReport::default(),
+                index_lifecycle: IndexLifecycle::default(),
+                index_watcher: None,
+                watcher_failure_summary: None,
+            }),
+            window_state: Mutex::new(LauncherWindowState::default()),
+            global_hotkey_status: Mutex::new(pending_global_hotkey_status()),
+        };
+        let generation = {
+            let mut runtime = state.runtime.lock().unwrap();
+            let generation = runtime.index_lifecycle.start_refresh(false);
+            runtime.index_lifecycle.update_progress(
+                generation,
+                "user-hot-paths",
+                None,
+                IndexScanStats {
+                    scanned: 1,
+                    accepted: 1,
+                    skipped: 0,
+                    failures: 0,
+                },
+                1,
+            );
+            generation
+        };
+
+        let status = apply_failed_index_refresh(&state, generation, "权限不足".to_owned())
+            .expect("fresh failure emits status");
+
+        let runtime = state.runtime.lock().unwrap();
+        assert_eq!(runtime.index.entries().len(), 1);
+        assert_eq!(runtime.index.entries()[0].name, "notes.md");
+        assert_eq!(
+            status.availability,
+            crate::core::index::IndexAvailability::QuickAvailable
+        );
+    }
+
+    #[test]
+    fn snapshot_checkpoint_policy_skips_background_completion_stages() {
+        assert!(should_persist_index_checkpoint("user-hot-paths", false));
+        assert!(should_persist_index_checkpoint("configured-roots", true));
+        assert!(!should_persist_index_checkpoint("configured-roots", false));
+        assert!(!should_persist_index_checkpoint("remaining-drives", false));
     }
 
     #[test]
@@ -2203,6 +2427,7 @@ mod tests {
         let index = SearchIndex::default();
         let unavailable_status = crate::core::index::IndexStatus {
             kind: crate::core::index::IndexStatusKind::Building,
+            availability: crate::core::index::IndexAvailability::Unavailable,
             entry_count: 0,
             message: None,
             generation: 1,
@@ -2266,6 +2491,27 @@ mod tests {
     }
 
     #[test]
+    fn perform_search_does_not_clone_search_index() {
+        let config = QuickFoxConfig::default_with_index_dirs(vec!["/tmp".to_owned()]);
+        let entries: Vec<_> = (0..100)
+            .map(|index| {
+                crate::core::index::IndexedEntry::legacy(
+                    format!("/tmp/project-{index}.md"),
+                    format!("project-{index}.md"),
+                    crate::core::index::IndexedEntryKind::File,
+                )
+            })
+            .collect();
+        let index = SearchIndex::from_entries(entries);
+        SearchIndex::reset_clone_count();
+
+        let results = perform_search(&config, &index, "project");
+
+        assert!(!results.is_empty());
+        assert_eq!(SearchIndex::clone_count(), 0);
+    }
+
+    #[test]
     fn build_scan_options_adds_hidden_exclude_pattern() {
         let config = QuickFoxConfig::default_with_index_dirs(vec!["/tmp".to_owned()]);
 
@@ -2287,6 +2533,85 @@ mod tests {
         let plans = build_scan_plans(&config);
 
         assert!(plans.iter().any(|plan| !plan.respect_project_ignores));
+    }
+
+    #[test]
+    fn fast_scan_plan_skips_configured_roots() {
+        let configured_root = tempfile::tempdir().unwrap();
+        let mut config = QuickFoxConfig::default_with_index_dirs(vec![configured_root
+            .path()
+            .to_string_lossy()
+            .to_string()]);
+        config.index.performance_mode = crate::core::config::IndexPerformanceMode::Fast;
+
+        let plans = build_scan_plans(&config);
+
+        assert!(plans.iter().all(|plan| {
+            plan.stage.as_ref().map(|stage| stage.name.as_str()) != Some("configured-roots")
+        }));
+        assert!(plans.iter().all(|plan| !plan
+            .include_roots
+            .contains(&configured_root.path().to_path_buf())));
+    }
+
+    #[test]
+    fn balanced_scan_plan_defers_configured_roots_after_quick_stages() {
+        let configured_root = tempfile::tempdir().unwrap();
+        let mut config = QuickFoxConfig::default_with_index_dirs(vec![configured_root
+            .path()
+            .to_string_lossy()
+            .to_string()]);
+        config.index.performance_mode = crate::core::config::IndexPerformanceMode::Balanced;
+
+        let plans = build_scan_plans(&config);
+        let configured_plan_position = plans
+            .iter()
+            .position(|plan| {
+                plan.stage.as_ref().map(|stage| stage.name.as_str()) == Some("configured-roots")
+            })
+            .expect("balanced mode should include configured roots");
+
+        assert!(plans[configured_plan_position]
+            .include_roots
+            .contains(&configured_root.path().to_path_buf()));
+        assert!(plans[..configured_plan_position].iter().all(|plan| plan
+            .stage
+            .as_ref()
+            .map(|stage| stage.root_priority)
+            .unwrap_or(0)
+            < 30));
+    }
+
+    #[test]
+    fn complete_scan_plan_keeps_configured_roots_and_exclusions() {
+        let configured_root = tempfile::tempdir().unwrap();
+        let excluded_root = configured_root.path().join("target");
+        let mut config = QuickFoxConfig::default_with_index_dirs(vec![configured_root
+            .path()
+            .to_string_lossy()
+            .to_string()]);
+        config.index.performance_mode = crate::core::config::IndexPerformanceMode::Complete;
+        config.index.exclude_dirs = vec![excluded_root.to_string_lossy().to_string()];
+        config.index.exclude_patterns = vec!["*.tmp".to_owned()];
+
+        let plans = build_scan_plans(&config);
+        let configured_plan = plans
+            .iter()
+            .find(|plan| {
+                plan.stage.as_ref().map(|stage| stage.name.as_str()) == Some("configured-roots")
+            })
+            .expect("complete mode should include configured roots");
+
+        assert!(configured_plan
+            .include_roots
+            .contains(&configured_root.path().to_path_buf()));
+        assert!(configured_plan.exclude_dirs.contains(&excluded_root));
+        assert!(configured_plan
+            .exclude_patterns
+            .contains(&"*.tmp".to_owned()));
+        assert!(configured_plan
+            .exclude_patterns
+            .contains(&".git".to_owned()));
     }
 
     #[test]

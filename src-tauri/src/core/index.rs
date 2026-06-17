@@ -7,13 +7,19 @@ use crate::core::content_index::{
 use crate::core::file_matcher::FileMatcher;
 use crate::core::file_query::FileQuery;
 pub use crate::core::index_entry::{
-    ContentIndexState, IndexFailure, IndexLifecycle, IndexReport, IndexScanOptions, IndexStatus,
-    IndexStatusKind, IndexedEntry, IndexedEntryKind,
+    ContentIndexState, IndexAvailability, IndexFailure, IndexLifecycle, IndexReport,
+    IndexScanOptions, IndexStatus, IndexStatusKind, IndexedEntry, IndexedEntryKind,
 };
 use crate::core::index_scanner::{FileSystemScanner, IgnoreScanner, IndexScanPlan};
 use crate::core::search::{QueryRequest, SearchMode, SearchResult, SearchResultKind};
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
+
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+#[cfg(test)]
+static SEARCH_INDEX_CLONE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug, Clone, Default)]
 pub struct IndexScanner;
@@ -34,11 +40,24 @@ impl IndexScanner {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub struct SearchIndex {
     entries: Vec<IndexedEntry>,
     search_texts: Vec<String>,
     content_index: Option<ContentIndex>,
+}
+
+impl Clone for SearchIndex {
+    fn clone(&self) -> Self {
+        #[cfg(test)]
+        SEARCH_INDEX_CLONE_COUNT.fetch_add(1, Ordering::Relaxed);
+
+        Self {
+            entries: self.entries.clone(),
+            search_texts: self.search_texts.clone(),
+            content_index: self.content_index.clone(),
+        }
+    }
 }
 
 impl SearchIndex {
@@ -65,6 +84,16 @@ impl SearchIndex {
 
     pub fn entries(&self) -> &[IndexedEntry] {
         &self.entries
+    }
+
+    #[cfg(test)]
+    pub fn reset_clone_count() {
+        SEARCH_INDEX_CLONE_COUNT.store(0, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub fn clone_count() -> usize {
+        SEARCH_INDEX_CLONE_COUNT.load(Ordering::Relaxed)
     }
 
     pub fn refresh_with_scanner(
@@ -175,6 +204,19 @@ impl SearchIndex {
         let query = FileQuery::parse(query);
         if limit == 0 || (!query.has_name_path_constraints() && !query.has_content_query()) {
             return Vec::new();
+        }
+
+        if query.has_content_query() && self.content_index.is_none() {
+            return vec![SearchResult::new(
+                "feedback:content-index-unavailable",
+                "内容索引仍在准备",
+                SearchResultKind::Feedback,
+                Action::CopyText {
+                    text: "内容索引仍在准备，普通文件名和路径搜索可先使用。".to_owned(),
+                },
+            )
+            .with_detail("普通文件名和路径搜索已可用；content: 查询需要等待内容索引。".to_owned())
+            .with_score(100)];
         }
 
         if query.has_content_query() && !query.has_name_path_constraints() {
@@ -356,17 +398,44 @@ fn entry_to_result(entry: &IndexedEntry) -> SearchResult {
             result = result.with_secondary_action(Action::OpenContainingFolder {
                 path: entry.path.clone(),
             });
+            if let Some(parent) = parent_path_text(&entry.path) {
+                result = result
+                    .with_secondary_action(Action::CopyText {
+                        text: parent.clone(),
+                    })
+                    .with_secondary_action(Action::OpenPath { path: parent });
+            }
         }
         IndexedEntryKind::Directory => {
             result = result.with_secondary_action(Action::OpenPath {
                 path: entry.path.clone(),
             });
+            if let Some(parent) = parent_path_text(&entry.path) {
+                result = result
+                    .with_secondary_action(Action::CopyText {
+                        text: parent.clone(),
+                    })
+                    .with_secondary_action(Action::OpenPath { path: parent });
+            }
         }
     }
 
     result.with_secondary_action(Action::CopyText {
         text: entry.path.clone(),
     })
+}
+
+fn parent_path_text(path: &str) -> Option<String> {
+    let trimmed = path.trim_end_matches(['/', '\\']);
+    let separator_index = trimmed.rfind(['/', '\\'])?;
+    if separator_index == 0 {
+        return Some(trimmed[..=separator_index].to_owned());
+    }
+    let parent = &trimmed[..separator_index];
+    if parent.ends_with(':') {
+        return Some(format!("{parent}\\"));
+    }
+    (!parent.is_empty()).then(|| parent.to_owned())
 }
 
 #[cfg(test)]
@@ -918,13 +987,15 @@ mod tests {
     }
 
     #[test]
-    fn content_only_query_returns_no_name_path_results_before_content_indexing() {
+    fn content_only_query_returns_feedback_before_content_indexing() {
         let index = SearchIndex::from_entries(vec![file_entry("/Users/frank/workspace/hello.md")]);
         let parser = crate::core::search::QueryParser::new(Default::default());
 
         let results = index.search(&parser.parse(r#"content:"hello world""#));
 
-        assert!(results.is_empty());
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].kind, SearchResultKind::Feedback);
+        assert!(results[0].title.contains("内容索引"));
     }
 
     #[test]
@@ -1126,18 +1197,20 @@ mod tests {
         let index = SearchIndex::from_entries(report.entries.clone());
         let parser = crate::core::search::QueryParser::new(Default::default());
 
+        SearchIndex::reset_clone_count();
         let query_started = Instant::now();
         let ordinary_results = index.search(&parser.parse("report"));
         let query_duration = query_started.elapsed();
         let content_results = index.search(&parser.parse("content:needle-from-file-content-only"));
 
         println!(
-            "QUICKFOX_INDEX_BASELINE scan_ms={} entries={} failures={} ordinary_query_us={} ordinary_results={} content_query_results={}",
+            "QUICKFOX_INDEX_BASELINE scan_ms={} entries={} failures={} ordinary_query_us={} ordinary_results={} search_index_clones={} content_query_results={}",
             scan_duration.as_millis(),
             report.entries.len(),
             report.failures.len(),
             query_duration.as_micros(),
             ordinary_results.len(),
+            SearchIndex::clone_count(),
             content_results.len()
         );
 
@@ -1159,7 +1232,7 @@ mod tests {
             .iter()
             .any(|entry| entry.name == "ignored.js"));
         assert!(!ordinary_results.is_empty());
-        assert!(content_results.is_empty());
+        assert_eq!(content_results[0].kind, SearchResultKind::Feedback);
 
         let _ = fs::remove_dir_all(root);
     }

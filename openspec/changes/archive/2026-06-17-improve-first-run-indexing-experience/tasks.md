@@ -1,0 +1,39 @@
+## Implementation Tasks
+
+- [x] 1. 索引计划与性能模式
+  - [x] 1.1 为 `build_scan_plans` 或等价计划构建函数补测试，覆盖 `fast`、`balanced`、`complete`
+  - [x] 1.2 实现 `fast` 只扫描应用入口和热路径，不自动补扫配置大根
+  - [x] 1.3 实现 `balanced` 先快速阶段、再后台补全用户配置目录
+  - [x] 1.4 实现 `complete` 覆盖完整配置范围，并保持现有排除规则
+- [x] 2. 首次快速可用与后台补全
+  - [x] 2.1 补测试证明快速阶段完成后文件 Provider 可用，后台补全仍可继续
+  - [x] 2.2 增加索引状态阶段语义，区分快速可用、后台补全和完整可用
+  - [x] 2.3 确保补全失败时保留快速阶段或最近成功快照
+- [x] 3. 阶段边界轻量化
+  - [x] 3.1 补测试证明中间阶段不会无条件写完整聚合 SQLite batch
+  - [x] 3.2 将完整快照写入节流到快速可用检查点和最终完成检查点
+  - [x] 3.3 避免阶段边界重复执行内容索引构建
+- [x] 4. 内容索引延后
+  - [x] 4.1 补测试证明 name/path 可用不等待内容索引
+  - [x] 4.2 将内容索引作为低优先级后续阶段或可独立触发任务
+  - [x] 4.3 为 `content:` 查询在内容索引准备中或未启用时返回明确反馈
+- [x] 5. 前端体验
+  - [x] 5.1 补前端测试覆盖“部分可用，正在补全”的启动器状态
+  - [x] 5.2 设置页说明 `fast`、`balanced`、`complete` 的真实行为差异
+  - [x] 5.3 设置页显示当前模式、阶段、当前 root 和扫描统计
+- [x] 6. 索引已建立后的输入搜索体验
+  - [x] 6.1 补 Rust 测试或基准，证明每次搜索不 clone 完整 `SearchIndex`
+  - [x] 6.2 调整搜索路径，让 FileProvider 使用轻量共享/借用索引引用
+  - [x] 6.3 补大索引连续查询测试，覆盖候选上限和 bounded work
+  - [x] 6.4 补前端测试，覆盖连续输入时过期搜索结果不会覆盖最新查询
+  - [x] 6.5 实现文件搜索短延迟/合并请求，同时保持计算器、网页搜索和命令反馈及时
+- [x] 7. 文档与验收
+  - [x] 7.1 更新 Windows 手工 QA，覆盖 `C:\Users` + `D:\` 大目录首次启动
+  - [x] 7.2 更新 Windows 手工 QA，覆盖索引已建立后快速输入文件名不卡顿
+  - [x] 7.3 记录短期方案不接 Everything/USN/MFT 的边界和后续扩展方向
+  - [x] 7.4 增加或更新索引基准，记录快速阶段耗时、补全阶段耗时、阶段边界写入次数和大索引查询耗时
+- [x] 8. Verification
+  - [x] 8.1 Run targeted Rust tests for scan plans, lifecycle, snapshot throttling, content delay, and large-index query responsiveness
+  - [x] 8.2 Run targeted frontend tests for index status UX and continuous query input
+  - [x] 8.3 Run `npm run check`
+  - [x] 8.4 Run `openspec validate improve-first-run-indexing-experience --strict`

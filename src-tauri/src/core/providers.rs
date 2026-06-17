@@ -10,14 +10,14 @@ pub trait Provider {
 }
 
 #[derive(Default)]
-pub struct ProviderRegistry {
-    providers: Vec<Box<dyn Provider>>,
+pub struct ProviderRegistry<'a> {
+    providers: Vec<Box<dyn Provider + 'a>>,
 }
 
-impl ProviderRegistry {
+impl<'a> ProviderRegistry<'a> {
     pub fn register<P>(&mut self, provider: P)
     where
-        P: Provider + 'static,
+        P: Provider + 'a,
     {
         self.providers.push(Box::new(provider));
     }
@@ -44,27 +44,30 @@ impl ProviderRegistry {
     }
 }
 
-pub struct FileProvider {
-    index: FileProviderIndex,
+pub struct FileProvider<'a> {
+    index: FileProviderIndex<'a>,
     candidate_limit: usize,
 }
 
-enum FileProviderIndex {
-    Available(SearchIndex),
+enum FileProviderIndex<'a> {
+    Borrowed(&'a SearchIndex),
+    Owned(SearchIndex),
     Unavailable(String),
 }
 
-impl FileProvider {
+impl FileProvider<'static> {
     pub fn new(index: SearchIndex) -> Self {
         Self {
-            index: FileProviderIndex::Available(index),
+            index: FileProviderIndex::Owned(index),
             candidate_limit: usize::MAX,
         }
     }
+}
 
-    pub fn with_candidate_limit(index: SearchIndex, candidate_limit: usize) -> Self {
+impl<'a> FileProvider<'a> {
+    pub fn with_candidate_limit(index: &'a SearchIndex, candidate_limit: usize) -> Self {
         Self {
-            index: FileProviderIndex::Available(index),
+            index: FileProviderIndex::Borrowed(index),
             candidate_limit,
         }
     }
@@ -77,16 +80,17 @@ impl FileProvider {
     }
 }
 
-impl Provider for FileProvider {
+impl Provider for FileProvider<'_> {
     fn id(&self) -> &'static str {
         "files"
     }
 
     fn search(&self, query: &QueryRequest) -> Vec<SearchResult> {
         let results = match &self.index {
-            FileProviderIndex::Available(index) => {
+            FileProviderIndex::Borrowed(index) => {
                 index.search_with_limit(query, self.candidate_limit)
             }
+            FileProviderIndex::Owned(index) => index.search_with_limit(query, self.candidate_limit),
             FileProviderIndex::Unavailable(message) => {
                 if matches!(query.mode, SearchMode::Normal) && !query.text.trim().is_empty() {
                     let mut result = SearchResult::new(
@@ -574,6 +578,12 @@ mod tests {
                     path: "/home/frank/Documents/readme.md".to_owned(),
                 },
                 Action::CopyText {
+                    text: "/home/frank/Documents".to_owned(),
+                },
+                Action::OpenPath {
+                    path: "/home/frank/Documents".to_owned(),
+                },
+                Action::CopyText {
                     text: "/home/frank/Documents/readme.md".to_owned(),
                 },
                 Action::OpenWithApplication {
@@ -593,6 +603,12 @@ mod tests {
             vec![
                 Action::OpenPath {
                     path: "/home/frank/Documents".to_owned(),
+                },
+                Action::CopyText {
+                    text: "/home/frank".to_owned(),
+                },
+                Action::OpenPath {
+                    path: "/home/frank".to_owned(),
                 },
                 Action::CopyText {
                     text: "/home/frank/Documents".to_owned(),

@@ -187,7 +187,7 @@ TBD - created by archiving change build-quickfox-launcher. Update Purpose after 
 
 ### Requirement: 索引性能配置
 
-系统 SHALL 提供内部可扩展的索引性能配置边界，用于控制扫描阶段、项目忽略规则、内容索引范围和运行期文件监听策略。
+系统 SHALL 提供内部可扩展的索引性能配置边界，用于控制扫描阶段、项目忽略规则、内容索引范围和运行期文件监听策略。系统 MUST 让 `fast`、`balanced` 和 `complete` 三种索引性能模式产生可观察、可测试的扫描计划差异。
 
 #### Scenario: 配置是否尊重项目忽略文件
 
@@ -200,10 +200,31 @@ TBD - created by archiving change build-quickfox-launcher. Update Purpose after 
 - **WHEN** 配置关闭尊重项目忽略规则
 - **THEN** 扫描器只使用 QuickFox 用户排除规则和系统强制排除规则
 
-#### Scenario: 配置索引性能模式
+#### Scenario: fast 模式只索引高价值快速范围
 
-- **WHEN** 配置选择快速、均衡或完整索引模式
-- **THEN** 系统按对应模式调整索引阶段和默认扫描范围
+- **WHEN** 配置选择 `fast` 索引性能模式
+- **THEN** 系统扫描应用入口和用户热路径
+- **AND** 系统不自动补扫 `D:\` 等配置大根目录
+- **AND** 设置页说明该模式优先首次可用但结果范围更窄
+
+#### Scenario: balanced 模式先快速可用再后台补全配置范围
+
+- **WHEN** 配置选择 `balanced` 索引性能模式
+- **THEN** 系统先扫描应用入口和用户热路径
+- **AND** 系统随后在后台补全用户配置的索引目录
+- **AND** 该模式作为默认模式
+
+#### Scenario: complete 模式覆盖完整配置范围
+
+- **WHEN** 配置选择 `complete` 索引性能模式
+- **THEN** 系统扫描应用入口、用户热路径和完整用户配置范围
+- **AND** 设置页说明该模式首次索引更慢但结果覆盖更完整
+
+#### Scenario: 保存性能模式触发索引计划更新
+
+- **WHEN** 用户在设置页修改索引性能模式并保存设置
+- **THEN** 系统保存该模式
+- **AND** 后续后台索引按新模式生成扫描计划
 
 #### Scenario: 配置内容索引大小限制
 

@@ -172,6 +172,7 @@ export type QuickFoxConfig = {
 
 export type IndexStatus = {
   kind: "unbuilt" | "building" | "ready" | "refreshing" | "failed";
+  availability?: "unavailable" | "quickAvailable" | "completing" | "contentIndexing" | "complete";
   entryCount: number;
   message?: string | null;
   generation: number;

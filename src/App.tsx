@@ -150,19 +150,56 @@ type ShortcutKeyboardEvent = Pick<
   | "stopPropagation"
 >;
 
-function labelForAction(action: LauncherAction, resultKind?: BackendSearchResult["kind"]) {
+function resultPath(result: BackendSearchResult) {
+  if (result.detail) {
+    return result.detail;
+  }
+  if ("path" in result.mainAction) {
+    return result.mainAction.path;
+  }
+  return null;
+}
+
+function parentPath(path: string | null | undefined) {
+  if (!path) {
+    return null;
+  }
+  const trimmed = path.replace(/[\\/]+$/u, "");
+  const separatorIndex = Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\"));
+  if (separatorIndex < 0) {
+    return null;
+  }
+  if (separatorIndex === 0) {
+    return trimmed.slice(0, 1);
+  }
+  const parent = trimmed.slice(0, separatorIndex);
+  if (parent.endsWith(":")) {
+    return `${parent}\\`;
+  }
+  return parent || null;
+}
+
+function labelForAction(action: LauncherAction, result: BackendSearchResult) {
+  const path = resultPath(result);
+  const parent = parentPath(path);
   switch (action.type) {
     case "openPath":
-      if (resultKind === "application") {
+      if (action.path === parent) {
+        return "打开所在文件夹";
+      }
+      if (result.kind === "application") {
         return "打开应用";
       }
-      if (resultKind === "directory") {
+      if (result.kind === "directory") {
         return "打开文件夹";
       }
       return "打开";
     case "openContainingFolder":
       return "打开所在目录";
     case "copyText":
+      if (action.text === parent) {
+        return "复制所在文件夹路径";
+      }
       return "复制路径";
     case "openUrl":
       return "打开链接";
@@ -196,6 +233,19 @@ function buildWebSearchAction(
   };
 }
 
+function shouldSearchImmediately(query: string, engines: QuickFoxConfig["web_search"]["engines"]) {
+  const trimmed = query.trim();
+  if (!trimmed) {
+    return true;
+  }
+
+  if (buildWebSearchAction(trimmed, engines)) {
+    return true;
+  }
+
+  return /^(?:\d|\s|[+\-*/^().%])+$/u.test(trimmed) && /\d/.test(trimmed);
+}
+
 function toLauncherResults(results: BackendSearchResult[]): LauncherResult[] {
   return results.map((result) => ({
     id: result.id,
@@ -204,7 +254,7 @@ function toLauncherResults(results: BackendSearchResult[]): LauncherResult[] {
     kind: result.kind,
     primaryAction: result.mainAction,
     secondaryActions: result.secondaryActions.map((action) => ({
-      label: labelForAction(action, result.kind),
+      label: labelForAction(action, result),
       action,
     })),
     snippet: result.snippet,
@@ -228,7 +278,12 @@ function shortcutFromKeyboardEvent(event: ShortcutKeyboardEvent): ShortcutRecord
     return { value: null, error: "唤醒键需要包含 Control、Command、Alt 或 Shift。" };
   }
 
-  return { value: [...modifiers, key].join("+"), error: null };
+  const value = [...modifiers, key].join("+");
+  if (value === "Alt+Space") {
+    return { value: null, error: "Alt+Space 可能被系统或当前窗口占用，请换一个组合键。" };
+  }
+
+  return { value, error: null };
 }
 
 function normalizedShortcutKey(key: string) {
@@ -317,6 +372,7 @@ export function App({
   const [refreshStatus, setRefreshStatus] = useState<string | null>(null);
   const [currentIndexStatus, setCurrentIndexStatus] = useState<IndexStatus>({
     kind: "unbuilt",
+    availability: "unavailable",
     entryCount: 0,
     message: null,
     generation: 0,
@@ -343,6 +399,8 @@ export function App({
   const historyRefs = useRef<Array<HTMLLIElement | null>>([]);
   const settingsContentRef = useRef<HTMLDivElement | null>(null);
   const hotkeyShiftPressAtRef = useRef<number | null>(null);
+  const webSearchEnginesRef = useRef(config.web_search.engines);
+  webSearchEnginesRef.current = config.web_search.engines;
   const effectiveCommandEnabled = commandEnabled ?? config.command.enabled;
   const hotkeyPermissionSettingsUrl = currentHotkeyStatus.permissionSettingsUrl;
 
@@ -436,20 +494,32 @@ export function App({
     }
 
     let cancelled = false;
-    void searchResults(query)
-      .then((nextResults) => {
-        if (!cancelled) {
-          setResults(toLauncherResults(nextResults as BackendSearchResult[]));
-        }
-      })
-      .catch(() => {
-        if (!cancelled) {
-          setResults([]);
-        }
-      });
+    const runSearch = () => {
+      void searchResults(query)
+        .then((nextResults) => {
+          if (!cancelled) {
+            setResults(toLauncherResults(nextResults as BackendSearchResult[]));
+          }
+        })
+        .catch(() => {
+          if (!cancelled) {
+            setResults([]);
+          }
+        });
+    };
+
+    if (indexSearchRevision > 0 || shouldSearchImmediately(query, webSearchEnginesRef.current)) {
+      runSearch();
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    const timeout = window.setTimeout(runSearch, 80);
 
     return () => {
       cancelled = true;
+      window.clearTimeout(timeout);
     };
   }, [indexSearchRevision, isCommandQuery, query]);
 
@@ -921,7 +991,7 @@ export function App({
                         索引性能模式
                         <HelpIcon
                           label="索引性能模式"
-                          text="fast 优先缩短首次扫描；balanced 适合日常使用；complete 会覆盖更多路径但首次索引更慢。"
+                          text="fast 只扫应用入口和热路径；balanced 先快速可用再后台补全配置目录；complete 覆盖完整配置范围和可用盘符，首次索引更慢。"
                         />
                       </span>
                       <select
@@ -1049,7 +1119,11 @@ export function App({
                         }
                       />
                     </label>
-                    <IndexAuxiliaryDetails status={currentIndexStatus} appPaths={currentAppPaths} />
+                    <IndexAuxiliaryDetails
+                      config={config}
+                      status={currentIndexStatus}
+                      appPaths={currentAppPaths}
+                    />
                   </section>
                 </div>
               </fieldset>
@@ -1371,9 +1445,9 @@ export function App({
                 : undefined
             }
           >
-            {menuResult.secondaryActions.map((item) => (
+            {menuResult.secondaryActions.map((item, index) => (
               <button
-                key={item.label}
+                key={`${item.label}:${index}`}
                 role="menuitem"
                 type="button"
                 onClick={() => {
@@ -1481,6 +1555,24 @@ function buildLauncherPresentation({
 }
 
 function launcherStatusForIndex(status: IndexStatus): LauncherStatusFeedback {
+  if (status.availability === "completing") {
+    return {
+      title: "文件搜索已部分可用",
+      message: "后台仍在补全索引；未找到结果时，可能仍在索引相关范围。",
+      detail: indexProgressSummary(status),
+      actions: ["openSettings"],
+    };
+  }
+
+  if (status.availability === "contentIndexing") {
+    return {
+      title: "内容索引正在准备",
+      message: "普通文件名和路径搜索已可用，content: 查询稍后可用。",
+      detail: indexProgressSummary(status),
+      actions: ["openSettings"],
+    };
+  }
+
   switch (status.kind) {
     case "unbuilt":
       return {
@@ -1724,12 +1816,37 @@ function IndexStatusSummary({ status }: { status: IndexStatus }) {
   );
 }
 
-function IndexAuxiliaryDetails({ status, appPaths }: { status: IndexStatus; appPaths: AppPaths }) {
+function IndexAuxiliaryDetails({
+  config,
+  status,
+  appPaths,
+}: {
+  config: QuickFoxConfig;
+  status: IndexStatus;
+  appPaths: AppPaths;
+}) {
   const configFilePath = appPaths.configFilePath ?? "未找到";
   const indexSnapshotPath = appPaths.indexSnapshotPath ?? "尚未创建";
+  const progressSummary = indexProgressSummary(status);
 
   return (
     <div className="settings-auxiliary-list">
+      <div className="settings-meta-row">
+        <span>当前模式</span>
+        <span>{config.index.performance_mode}</span>
+      </div>
+      <div className="settings-meta-row">
+        <span>当前阶段</span>
+        <span>{status.stage || indexStatusLabel(status)}</span>
+      </div>
+      <div className="settings-meta-row">
+        <span>当前 root</span>
+        <span>{status.currentRoot ?? "暂无"}</span>
+      </div>
+      <div className="settings-meta-row">
+        <span>扫描统计</span>
+        <span>{progressSummary ?? "暂无统计"}</span>
+      </div>
       <div className="settings-meta-row">
         <span>配置文件位置</span>
         <FullPathValue label="配置文件位置" value={configFilePath} />

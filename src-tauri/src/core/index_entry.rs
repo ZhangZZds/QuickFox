@@ -175,10 +175,22 @@ pub enum IndexStatusKind {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum IndexAvailability {
+    Unavailable,
+    QuickAvailable,
+    Completing,
+    ContentIndexing,
+    Complete,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IndexStatus {
     pub kind: IndexStatusKind,
+    #[serde(default = "default_index_availability")]
+    pub availability: IndexAvailability,
     pub entry_count: usize,
     pub message: Option<String>,
     pub generation: u64,
@@ -197,6 +209,10 @@ pub struct IndexStatus {
     pub failures: usize,
 }
 
+fn default_index_availability() -> IndexAvailability {
+    IndexAvailability::Unavailable
+}
+
 #[derive(Debug, Clone)]
 pub struct IndexLifecycle {
     generation: u64,
@@ -209,6 +225,7 @@ impl Default for IndexLifecycle {
             generation: 0,
             status: IndexStatus {
                 kind: IndexStatusKind::Unbuilt,
+                availability: IndexAvailability::Unavailable,
                 entry_count: 0,
                 message: None,
                 generation: 0,
@@ -230,6 +247,7 @@ impl IndexLifecycle {
             generation: 0,
             status: IndexStatus {
                 kind: IndexStatusKind::Ready,
+                availability: IndexAvailability::Complete,
                 entry_count,
                 message: None,
                 generation: 0,
@@ -255,6 +273,11 @@ impl IndexLifecycle {
         } else {
             IndexStatusKind::Building
         };
+        self.status.availability = if has_existing_index {
+            IndexAvailability::Complete
+        } else {
+            IndexAvailability::Unavailable
+        };
         self.status.message = None;
         self.status.generation = self.generation;
         self.status.stage.clear();
@@ -278,7 +301,9 @@ impl IndexLifecycle {
             return false;
         }
 
-        self.status.stage = stage.into();
+        let stage = stage.into();
+        self.status.availability = availability_for_progress_stage(&stage, entry_count);
+        self.status.stage = stage;
         self.status.current_root = current_root;
         self.status.scanned = stats.scanned;
         self.status.accepted = stats.accepted;
@@ -300,6 +325,7 @@ impl IndexLifecycle {
 
         self.status = IndexStatus {
             kind: IndexStatusKind::Ready,
+            availability: IndexAvailability::Complete,
             entry_count,
             message: None,
             generation,
@@ -320,9 +346,24 @@ impl IndexLifecycle {
         }
 
         self.status.kind = IndexStatusKind::Failed;
+        if self.status.entry_count == 0 {
+            self.status.availability = IndexAvailability::Unavailable;
+        }
         self.status.message = Some(message);
         self.status.generation = generation;
         true
+    }
+}
+
+fn availability_for_progress_stage(stage: &str, entry_count: usize) -> IndexAvailability {
+    if entry_count == 0 {
+        return IndexAvailability::Unavailable;
+    }
+
+    match stage {
+        "configured-roots" | "remaining-drives" => IndexAvailability::Completing,
+        "content-index" => IndexAvailability::ContentIndexing,
+        _ => IndexAvailability::QuickAvailable,
     }
 }
 
@@ -404,6 +445,7 @@ mod tests {
     fn index_status_serializes_stage_progress_payload() {
         let status = IndexStatus {
             kind: IndexStatusKind::Refreshing,
+            availability: IndexAvailability::Completing,
             entry_count: 7,
             message: None,
             generation: 2,
@@ -424,6 +466,76 @@ mod tests {
         assert_eq!(value["accepted"], 7);
         assert_eq!(value["skipped"], 3);
         assert_eq!(value["failures"], 1);
+    }
+
+    #[test]
+    fn index_lifecycle_marks_quick_available_before_background_completion() {
+        let mut lifecycle = IndexLifecycle::default();
+        let generation = lifecycle.start_refresh(false);
+
+        assert!(lifecycle.update_progress(
+            generation,
+            "user-hot-paths",
+            Some("/Users/frank/Downloads".to_owned()),
+            IndexScanStats {
+                scanned: 12,
+                accepted: 3,
+                skipped: 1,
+                failures: 0,
+            },
+            3,
+        ));
+
+        assert_eq!(lifecycle.status().kind, IndexStatusKind::Building);
+        assert_eq!(
+            lifecycle.status().availability,
+            IndexAvailability::QuickAvailable
+        );
+
+        assert!(lifecycle.update_progress(
+            generation,
+            "configured-roots",
+            Some("/Volumes/Data".to_owned()),
+            IndexScanStats {
+                scanned: 120,
+                accepted: 40,
+                skipped: 10,
+                failures: 1,
+            },
+            40,
+        ));
+
+        assert_eq!(
+            lifecycle.status().availability,
+            IndexAvailability::Completing
+        );
+    }
+
+    #[test]
+    fn failed_refresh_keeps_available_entry_count() {
+        let mut lifecycle = IndexLifecycle::default();
+        let generation = lifecycle.start_refresh(false);
+        lifecycle.update_progress(
+            generation,
+            "user-hot-paths",
+            None,
+            IndexScanStats {
+                scanned: 4,
+                accepted: 2,
+                skipped: 0,
+                failures: 0,
+            },
+            2,
+        );
+
+        lifecycle.fail_refresh(generation, "permission denied".to_owned());
+
+        assert_eq!(lifecycle.status().kind, IndexStatusKind::Failed);
+        assert_eq!(lifecycle.status().entry_count, 2);
+        assert_eq!(
+            lifecycle.status().availability,
+            IndexAvailability::QuickAvailable
+        );
     }
 
     fn temp_dir(label: &str) -> std::path::PathBuf {

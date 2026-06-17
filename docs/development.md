@@ -67,9 +67,27 @@ url = "https://duckduckgo.com/?q={query}"
 ## 索引开发注意事项
 
 - 文件索引不应在启动路径同步扫描大目录；启动时先加载 SQLite 中最近完成的索引快照
+- `fast` / `balanced` / `complete` 必须产生可测试的扫描计划差异：`fast` 只扫应用入口和热路径，`balanced` 先快速可用再后台补全配置目录，`complete` 覆盖完整配置范围和可用盘符
+- 阶段边界只在快速可用检查点和最终完成检查点写完整 SQLite 快照；中间补全阶段只更新内存索引和状态，避免反复写不断增长的聚合 batch
+- 内容索引必须晚于基础 name/path 索引；`content:` 在内容索引准备中应返回明确反馈，不能伪装成 name/path 命中
 - 后台刷新完成后用新批次替换内存索引，旧 generation 的刷新结果不能覆盖新请求
+- 搜索路径不得为每次查询 clone 完整 `SearchIndex`；FileProvider 应借用或共享运行时索引，并保持大索引查询候选数有上限
 - 文件 Provider 必须在索引不可用时降级为反馈，不影响计算器、网页搜索和命令 Provider
 - 新增索引字段、状态或存储迁移时，需要同时补 Rust storage/index 测试和设置页状态测试
+
+短期索引性能边界：
+
+- QuickFox 当前不接入 Everything、Windows Search、NTFS USN Journal 或 MFT 读取；这些能力需要后续独立 OpenSpec 变更评估权限、平台差异和 fallback 语义
+- 当前目标是让首次体验先快速可用，并让大目录补全可见、可控；不承诺 `C:\Users`、`D:\` 等大根目录瞬时完整索引
+- 内容索引只处理配置范围内、大小限制内、可识别为文本的文件；PDF/Office 等专用 extractor 仍属于后续扩展
+
+索引基准可用被忽略的 Rust 测试按需手动运行：
+
+```bash
+cargo test --manifest-path src-tauri/Cargo.toml indexing_baseline_fixture_reports_current_scanner_characteristics -- --ignored --nocapture
+```
+
+输出行 `QUICKFOX_INDEX_BASELINE` 包含 `scan_ms`、`entries`、`ordinary_query_us`、`search_index_clones` 和 `content_query_results`，用于记录快速阶段耗时、补全阶段耗时、阶段边界写入次数和大索引查询耗时的本机基线。真实 Windows 大目录仍以 `docs/windows-manual-qa.md` 的手工验收为准。
 
 ## 新增 Action 的方法
 
@@ -84,6 +102,16 @@ url = "https://duckduckgo.com/?q={query}"
 2. 把平台特有逻辑限制在 Adapter 内
 3. 不要让 Provider 或前端直接依赖平台命令细节
 4. 为 Windows / Linux / macOS 分支分别验证
+
+## 桌面交互主动探索
+
+全局快捷键、窗口焦点和系统菜单这类桌面交互不能只靠 macOS 日常使用推断。新增或修改相关逻辑时，按三层探索：
+
+1. Rust core 先写事件序列表格测试，覆盖有效序列、释放事件丢失、超时、被普通输入打断、重复主键和配置切换。
+2. 前端用 Testing Library 模拟 `keydown`，覆盖录制成功、Esc 取消、裸修饰键、已知系统保留组合键提示。
+3. Windows/Linux 本机 QA 覆盖真实系统抢键和窗口行为；发现无法自动化的差异后，先记录到对应 manual QA，再尽量补回纯状态机或前端回归测试。
+
+`Alt+Space` 这类组合通常会被 Windows 窗口系统菜单占用，jsdom 和 macOS CI 不能证明它在 Windows 可录制；需要在录制器中给出明确提示，并在 Windows 验收清单中保留检查项。
 
 ## 前端开发约定
 

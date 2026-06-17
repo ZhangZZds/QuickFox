@@ -386,7 +386,8 @@ pub struct HotkeyState {
     shortcut: WakeShortcut,
     last_shift_at_ms: Option<u64>,
     double_shift_window_ms: u64,
-    pressed_modifiers: Vec<HotkeyModifier>,
+    chord_window_ms: u64,
+    pressed_modifiers: Vec<(HotkeyModifier, u64)>,
 }
 
 impl Default for HotkeyState {
@@ -395,6 +396,7 @@ impl Default for HotkeyState {
             shortcut: WakeShortcut::default(),
             last_shift_at_ms: None,
             double_shift_window_ms: 500,
+            chord_window_ms: 500,
             pressed_modifiers: Vec::new(),
         }
     }
@@ -422,7 +424,7 @@ impl HotkeyState {
             WakeShortcut::Chord {
                 modifiers,
                 key: wake_key,
-            } => self.register_chord(key, &modifiers, wake_key),
+            } => self.register_chord(key, timestamp_ms, &modifiers, wake_key),
         }
     }
 
@@ -446,28 +448,43 @@ impl HotkeyState {
     fn register_chord(
         &mut self,
         key: KeyPress,
+        timestamp_ms: u64,
         modifiers: &[HotkeyModifier],
         wake_key: HotkeyKey,
     ) -> bool {
         match key {
             KeyPress::KeyDown(pressed_key) => {
                 if let Some(modifier) = modifier_for_key(pressed_key) {
-                    if !self.pressed_modifiers.contains(&modifier) {
-                        self.pressed_modifiers.push(modifier);
+                    if let Some((_, pressed_at)) = self
+                        .pressed_modifiers
+                        .iter_mut()
+                        .find(|(current, _)| *current == modifier)
+                    {
+                        *pressed_at = timestamp_ms;
+                    } else {
+                        self.pressed_modifiers.push((modifier, timestamp_ms));
                     }
                     false
                 } else if pressed_key == wake_key {
-                    modifiers
-                        .iter()
-                        .all(|modifier| self.pressed_modifiers.contains(modifier))
+                    let should_show = modifiers.iter().all(|modifier| {
+                        self.pressed_modifiers
+                            .iter()
+                            .find(|(current, _)| current == modifier)
+                            .is_some_and(|(_, pressed_at)| {
+                                timestamp_ms.saturating_sub(*pressed_at) <= self.chord_window_ms
+                            })
+                    });
+                    self.pressed_modifiers.clear();
+                    should_show
                 } else {
+                    self.pressed_modifiers.clear();
                     false
                 }
             }
             KeyPress::KeyUp(released_key) => {
                 if let Some(modifier) = modifier_for_key(released_key) {
                     self.pressed_modifiers
-                        .retain(|current| *current != modifier);
+                        .retain(|(current, _)| *current != modifier);
                 }
                 false
             }
@@ -869,6 +886,41 @@ mod tests {
         assert!(state.register_key_press(KeyPress::KeyDown(HotkeyKey::Space), 1_010));
         assert!(!state.register_key_press(KeyPress::KeyUp(HotkeyKey::Control), 1_020));
         assert!(!state.register_key_press(KeyPress::KeyDown(HotkeyKey::Space), 1_030));
+    }
+
+    #[test]
+    fn hotkey_state_ignores_chord_after_modifier_timeout() {
+        let mut state = HotkeyState::with_shortcut(WakeShortcut::Chord {
+            modifiers: vec![HotkeyModifier::Shift],
+            key: HotkeyKey::Space,
+        });
+
+        assert!(!state.register_key_press(KeyPress::KeyDown(HotkeyKey::Shift), 1_000));
+        assert!(!state.register_key_press(KeyPress::KeyDown(HotkeyKey::Space), 1_700));
+    }
+
+    #[test]
+    fn hotkey_state_clears_chord_after_interrupted_typing() {
+        let mut state = HotkeyState::with_shortcut(WakeShortcut::Chord {
+            modifiers: vec![HotkeyModifier::Shift],
+            key: HotkeyKey::Space,
+        });
+
+        assert!(!state.register_key_press(KeyPress::KeyDown(HotkeyKey::Shift), 1_000));
+        assert!(!state.register_key_press(KeyPress::KeyDown(HotkeyKey::Character('A')), 1_010));
+        assert!(!state.register_key_press(KeyPress::KeyDown(HotkeyKey::Space), 1_020));
+    }
+
+    #[test]
+    fn hotkey_state_consumes_chord_after_trigger() {
+        let mut state = HotkeyState::with_shortcut(WakeShortcut::Chord {
+            modifiers: vec![HotkeyModifier::Shift],
+            key: HotkeyKey::Space,
+        });
+
+        assert!(!state.register_key_press(KeyPress::KeyDown(HotkeyKey::Shift), 1_000));
+        assert!(state.register_key_press(KeyPress::KeyDown(HotkeyKey::Space), 1_010));
+        assert!(!state.register_key_press(KeyPress::KeyDown(HotkeyKey::Space), 1_020));
     }
 
     #[test]

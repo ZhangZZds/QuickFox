@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { App } from "./App";
@@ -476,6 +476,7 @@ describe("App", () => {
       target: { value: "doc" },
     });
     expect(await screen.findByText("文件索引正在建立")).toBeInTheDocument();
+    await waitFor(() => expect(search).toHaveBeenCalledTimes(1));
 
     indexStatusHandler?.({
       kind: "ready",
@@ -580,6 +581,106 @@ describe("App", () => {
     expect(status).toHaveTextContent("收录 90");
     expect(status).toHaveTextContent("跳过 20");
     expect(status).toHaveTextContent("失败 1");
+  });
+
+  it("shows partial availability while background completion is running", async () => {
+    vi.mocked(indexStatus).mockResolvedValueOnce({
+      kind: "building",
+      availability: "completing",
+      entryCount: 90,
+      message: null,
+      generation: 2,
+      completedAtMs: null,
+      stage: "configured-roots",
+      currentRoot: "D:\\",
+      scanned: 120,
+      accepted: 90,
+      skipped: 20,
+      failures: 1,
+    });
+    vi.mocked(search).mockResolvedValueOnce([]);
+
+    render(<App />);
+    fireEvent.change(screen.getByLabelText("搜索文件、目录、计算器、网页搜索或命令"), {
+      target: { value: "notes" },
+    });
+
+    const status = await screen.findByRole("region", { name: "启动器状态" });
+    expect(status).toHaveTextContent("文件搜索已部分可用");
+    expect(status).toHaveTextContent("可能仍在索引相关范围");
+    expect(status).toHaveTextContent("D:\\");
+  });
+
+  it("debounces ordinary file searches during continuous typing", async () => {
+    vi.useFakeTimers();
+    vi.mocked(search).mockResolvedValueOnce(fileResults);
+
+    try {
+      render(<App />);
+      fireEvent.change(screen.getByLabelText("搜索文件、目录、计算器、网页搜索或命令"), {
+        target: { value: "doc" },
+      });
+
+      expect(search).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(90);
+
+      expect(search).toHaveBeenCalledWith("doc");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("ignores stale search results that return after the latest query", async () => {
+    vi.useFakeTimers();
+    let resolveFirst: ((results: SearchResult[]) => void) | undefined;
+    let resolveSecond: ((results: SearchResult[]) => void) | undefined;
+    vi.mocked(search)
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveFirst = resolve;
+          }),
+      )
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveSecond = resolve;
+          }),
+      );
+
+    try {
+      render(<App />);
+      fireEvent.change(screen.getByLabelText("搜索文件、目录、计算器、网页搜索或命令"), {
+        target: { value: "doc" },
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(90);
+      });
+      expect(search).toHaveBeenCalledWith("doc");
+
+      fireEvent.change(screen.getByLabelText("搜索文件、目录、计算器、网页搜索或命令"), {
+        target: { value: "down" },
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(90);
+      });
+      expect(search).toHaveBeenCalledWith("down");
+
+      await act(async () => {
+        resolveSecond?.([fileResults[1]]);
+      });
+      expect(screen.getByRole("option", { name: /Downloads/ })).toBeInTheDocument();
+
+      await act(async () => {
+        resolveFirst?.([fileResults[0]]);
+      });
+
+      expect(screen.getByRole("option", { name: /Downloads/ })).toBeInTheDocument();
+      expect(screen.queryByRole("option", { name: /Documents/ })).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("renders content snippets collapsed and expands line context on hover", async () => {
@@ -960,6 +1061,37 @@ describe("App", () => {
     });
   });
 
+  it("labels and executes parent folder context actions", async () => {
+    const onExecuteAction = vi.fn();
+    vi.mocked(search).mockResolvedValueOnce([
+      {
+        ...fileResults[0],
+        secondaryActions: [
+          { type: "openPath", path: "/tmp/Documents" },
+          { type: "copyText", text: "/tmp" },
+          { type: "openPath", path: "/tmp" },
+          { type: "copyText", text: "/tmp/Documents" },
+        ],
+      },
+    ]);
+    render(<App onExecuteAction={onExecuteAction} />);
+    fireEvent.change(screen.getByLabelText("搜索文件、目录、计算器、网页搜索或命令"), {
+      target: { value: "doc" },
+    });
+
+    fireEvent.contextMenu(await screen.findByRole("option", { name: /Documents/ }));
+
+    expect(screen.getByRole("menuitem", { name: "复制所在文件夹路径" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "打开所在文件夹" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("menuitem", { name: "复制所在文件夹路径" }));
+
+    expect(onExecuteAction).toHaveBeenCalledWith({
+      type: "copyText",
+      text: "/tmp",
+    });
+  });
+
   it("offers a development open action from the result context menu", async () => {
     const onExecuteAction = vi.fn();
     vi.mocked(search).mockResolvedValueOnce([
@@ -1326,6 +1458,27 @@ describe("App", () => {
     expect(saveConfig).not.toHaveBeenCalled();
   });
 
+  it("rejects Alt+Space while recording the global wake shortcut", async () => {
+    render(<App initialView="settings" />);
+    await screen.findByDisplayValue("/tmp");
+    fireEvent.click(screen.getByRole("tab", { name: "外观" }));
+
+    const recorder = screen.getByRole("button", { name: "Shift+Shift" });
+    fireEvent.click(recorder);
+    fireEvent.keyDown(recorder, { key: " ", altKey: true });
+    fireEvent.click(screen.getByRole("button", { name: "保存设置" }));
+
+    expect(
+      screen.getByText("Alt+Space 可能被系统或当前窗口占用，请换一个组合键。"),
+    ).toBeInTheDocument();
+    expect(saveConfig).toHaveBeenCalledWith({
+      ...appConfig,
+      hotkey: {
+        wake_shortcut: "Shift+Shift",
+      },
+    });
+  });
+
   it("shows help icons for configurable settings fields", async () => {
     render(<App initialView="settings" />);
     await screen.findByDisplayValue("/tmp");
@@ -1393,11 +1546,41 @@ describe("App", () => {
 
     render(<App initialView="settings" />);
 
-    expect(await screen.findByText("文件索引可用")).toBeInTheDocument();
+    await waitFor(() => expect(screen.getAllByText("文件索引可用").length).toBeGreaterThan(0));
     expect(screen.getByText("240 项")).toBeInTheDocument();
     expect(screen.getByText("第 7 代")).toBeInTheDocument();
     expect(screen.getByText(/最近完成:/)).toBeInTheDocument();
     expect(screen.getAllByText("索引完成").length).toBeGreaterThan(0);
+  });
+
+  it("shows index mode and completion progress details in settings", async () => {
+    vi.mocked(indexStatus).mockResolvedValueOnce({
+      kind: "building",
+      availability: "completing",
+      entryCount: 90,
+      message: null,
+      generation: 3,
+      completedAtMs: null,
+      stage: "configured-roots",
+      currentRoot: "D:\\",
+      scanned: 120,
+      accepted: 90,
+      skipped: 20,
+      failures: 1,
+    });
+
+    render(<App initialView="settings" />);
+    await screen.findByDisplayValue("/tmp");
+
+    const indexSection = screen.getByRole("group", { name: "索引" });
+    expect(indexSection).toHaveTextContent("当前模式");
+    expect(indexSection).toHaveTextContent("balanced");
+    expect(indexSection).toHaveTextContent("configured-roots");
+    expect(indexSection).toHaveTextContent("D:\\");
+    expect(indexSection).toHaveTextContent("已扫描 120");
+    expect(indexSection).toHaveTextContent("收录 90");
+    expect(indexSection).toHaveTextContent("跳过 20");
+    expect(indexSection).toHaveTextContent("失败 1");
   });
 
   it("shows the index settings as a layered workspace", async () => {
