@@ -448,7 +448,8 @@ describe("App", () => {
     expect(screen.queryByText("文件索引构建失败")).not.toBeInTheDocument();
   });
 
-  it("refreshes the current query when an index status event reports ready", async () => {
+  it("refreshes the current query through the same debounce path when an index status event reports ready", async () => {
+    vi.useFakeTimers();
     let indexStatusHandler:
       | ((status: {
           kind: "ready";
@@ -471,23 +472,43 @@ describe("App", () => {
     });
     vi.mocked(search).mockResolvedValueOnce([]).mockResolvedValueOnce(fileResults);
 
-    render(<App />);
-    fireEvent.change(screen.getByLabelText("搜索文件、目录、计算器、网页搜索或命令"), {
-      target: { value: "doc" },
-    });
-    expect(await screen.findByText("文件索引正在建立")).toBeInTheDocument();
-    await waitFor(() => expect(search).toHaveBeenCalledTimes(1));
+    try {
+      render(<App />);
+      await act(async () => {
+        await Promise.resolve();
+      });
+      fireEvent.change(screen.getByLabelText("搜索文件、目录、计算器、网页搜索或命令"), {
+        target: { value: "doc" },
+      });
+      expect(screen.getByText("文件索引正在建立")).toBeInTheDocument();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(90);
+      });
+      expect(search).toHaveBeenCalledTimes(1);
 
-    indexStatusHandler?.({
-      kind: "ready",
-      entryCount: 12,
-      message: null,
-      generation: 3,
-      completedAtMs: 300,
-    });
+      await act(async () => {
+        indexStatusHandler?.({
+          kind: "ready",
+          entryCount: 12,
+          message: null,
+          generation: 3,
+          completedAtMs: 300,
+        });
+      });
 
-    expect(await screen.findByRole("option", { name: /Documents/ })).toBeInTheDocument();
-    expect(search).toHaveBeenCalledTimes(2);
+      expect(search).toHaveBeenCalledTimes(1);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(90);
+      });
+      await act(async () => {
+        await Promise.resolve();
+      });
+
+      expect(screen.getByRole("option", { name: /Documents/ })).toBeInTheDocument();
+      expect(search).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("keeps web search results visible when the file index is unavailable", async () => {

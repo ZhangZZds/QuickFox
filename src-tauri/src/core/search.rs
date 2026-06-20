@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::core::actions::Action;
 
@@ -112,6 +113,30 @@ impl QueryRequest {
             text,
             mode,
         }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct SearchRequestTracker {
+    latest_generation: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchRequestTicket {
+    generation: u64,
+}
+
+impl SearchRequestTracker {
+    pub fn begin(&self) -> SearchRequestTicket {
+        let generation = self
+            .latest_generation
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        SearchRequestTicket { generation }
+    }
+
+    pub fn is_latest(&self, ticket: SearchRequestTicket) -> bool {
+        self.latest_generation.load(Ordering::Relaxed) == ticket.generation
     }
 }
 
@@ -440,6 +465,18 @@ mod tests {
 
         assert_eq!(request.text, "git status");
         assert_eq!(request.mode, SearchMode::Command);
+    }
+
+    #[test]
+    fn search_request_tracker_marks_older_requests_stale() {
+        let tracker = SearchRequestTracker::default();
+
+        let first = tracker.begin();
+        assert!(tracker.is_latest(first));
+
+        let second = tracker.begin();
+        assert!(!tracker.is_latest(first));
+        assert!(tracker.is_latest(second));
     }
 
     #[test]

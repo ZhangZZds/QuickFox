@@ -530,7 +530,8 @@ fn snapshot_needs_full_refresh(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::index::{IndexedEntry, IndexedEntryKind};
+    use crate::core::index::{IndexedEntry, IndexedEntryKind, SearchIndex};
+    use crate::core::search::QueryParser;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -694,6 +695,52 @@ mod tests {
             crate::core::index_entry::ContentIndexState::NotIndexed
         );
         assert!(snapshot.needs_full_refresh);
+
+        drop(storage);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn legacy_index_snapshot_builds_searchable_compact_index() {
+        let path = temp_db_path("index-snapshot-legacy-compact");
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute_batch(
+                    r#"
+                    CREATE TABLE index_batches (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        completed_at_ms INTEGER NOT NULL,
+                        entry_count INTEGER NOT NULL
+                    );
+                    CREATE TABLE index_entries (
+                        batch_id INTEGER NOT NULL,
+                        path TEXT NOT NULL,
+                        name TEXT NOT NULL,
+                        kind TEXT NOT NULL,
+                        search_text TEXT NOT NULL,
+                        updated_at_ms INTEGER NOT NULL,
+                        PRIMARY KEY (batch_id, path)
+                    );
+                    INSERT INTO index_batches (completed_at_ms, entry_count)
+                    VALUES (600, 1);
+                    INSERT INTO index_entries
+                        (batch_id, path, name, kind, search_text, updated_at_ms)
+                    VALUES
+                        (1, 'D:\workspace\QuickFox\AGENTS.md', 'AGENTS.md', 'file', 'agents.md d:\workspace\quickfox\agents.md', 600);
+                    "#,
+                )
+                .unwrap();
+        }
+
+        let storage = SqliteStorage::open(path.clone()).unwrap();
+        let snapshot = storage.latest_index_snapshot().unwrap().unwrap();
+        let index = SearchIndex::from_entries(snapshot.entries);
+        let parser = QueryParser::new(Default::default());
+        let results = index.search(&parser.parse("type:md agents"));
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "AGENTS.md");
 
         drop(storage);
         let _ = fs::remove_file(path);

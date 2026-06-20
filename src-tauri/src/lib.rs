@@ -51,6 +51,84 @@ struct QuickFoxAppState {
     global_hotkey_status: Mutex<GlobalHotkeyStatus>,
 }
 
+#[derive(Debug, Default)]
+struct IndexRefreshAccumulator {
+    entries_by_path: std::collections::BTreeMap<String, IndexedEntry>,
+    summary: IndexReport,
+}
+
+#[derive(Debug)]
+struct IndexRefreshPayload {
+    entries: Vec<IndexedEntry>,
+    summary: IndexReport,
+}
+
+impl From<IndexReport> for IndexRefreshPayload {
+    fn from(mut report: IndexReport) -> Self {
+        let entries = std::mem::take(&mut report.entries);
+        Self {
+            entries,
+            summary: report,
+        }
+    }
+}
+
+impl IndexRefreshAccumulator {
+    fn merge(&mut self, stage_report: IndexReport) {
+        self.summary.failures.extend(stage_report.failures);
+        self.summary.scan_events.extend(stage_report.scan_events);
+        self.summary.scan_stats = IndexScanStats {
+            scanned: self
+                .summary
+                .scan_stats
+                .scanned
+                .saturating_add(stage_report.scan_stats.scanned),
+            accepted: self
+                .summary
+                .scan_stats
+                .accepted
+                .saturating_add(stage_report.scan_stats.accepted),
+            skipped: self
+                .summary
+                .scan_stats
+                .skipped
+                .saturating_add(stage_report.scan_stats.skipped),
+            failures: self
+                .summary
+                .scan_stats
+                .failures
+                .saturating_add(stage_report.scan_stats.failures),
+        };
+
+        for entry in stage_report.entries {
+            self.entries_by_path.insert(entry.path.clone(), entry);
+        }
+    }
+
+    fn progress_payload(&self) -> IndexRefreshPayload {
+        IndexRefreshPayload {
+            entries: self.entries(),
+            summary: self.summary.clone(),
+        }
+    }
+
+    fn final_payload(self) -> IndexRefreshPayload {
+        IndexRefreshPayload {
+            entries: self.entries_by_path.into_values().collect(),
+            summary: self.summary,
+        }
+    }
+
+    fn entries(&self) -> Vec<IndexedEntry> {
+        self.entries_by_path.values().cloned().collect()
+    }
+
+    #[cfg(test)]
+    fn entry_count(&self) -> usize {
+        self.entries_by_path.len()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TrayWindowTarget {
     Launcher,
@@ -757,8 +835,7 @@ fn start_background_index_refresh<R: tauri::Runtime>(
         .name("quickfox-index-refresh".to_owned())
         .spawn(move || {
             let scanner = IndexScanner;
-            let mut aggregate_report = IndexReport::default();
-            let mut entries_by_path = std::collections::BTreeMap::new();
+            let mut accumulator = IndexRefreshAccumulator::default();
             let mut update_result = Ok(());
 
             for plan in build_scan_plans(&config) {
@@ -772,22 +849,19 @@ fn start_background_index_refresh<R: tauri::Runtime>(
                 let app_for_update = app.clone();
                 match scan_result {
                     Ok(stage_report) => {
-                        merge_index_report(
-                            &mut aggregate_report,
-                            &mut entries_by_path,
-                            stage_report,
-                        );
+                        accumulator.merge(stage_report);
                         if should_persist_index_checkpoint(&stage_name, false) {
                             if let Some(storage) = storage_store() {
+                                let checkpoint_entries = accumulator.entries();
                                 let _ = storage.save_completed_index_batch(
                                     completed_at_ms,
-                                    &aggregate_report.entries,
+                                    &checkpoint_entries,
                                 );
                             }
                         }
-                        let progress_report = aggregate_report.clone();
+                        let progress_payload = accumulator.progress_payload();
                         let current_root =
-                            last_finished_root_for_stage(&progress_report, &stage_name);
+                            last_finished_root_for_stage(&progress_payload.summary, &stage_name);
                         let app_for_state = app_for_update.clone();
                         update_result = app_for_update.run_on_main_thread(move || {
                             let state = app_for_state.state::<QuickFoxAppState>();
@@ -796,7 +870,7 @@ fn start_background_index_refresh<R: tauri::Runtime>(
                                 generation,
                                 stage_name,
                                 current_root,
-                                progress_report,
+                                progress_payload,
                             ) {
                                 let _ = app_for_state.emit("quickfox://index-status", status);
                             }
@@ -825,14 +899,14 @@ fn start_background_index_refresh<R: tauri::Runtime>(
             if update_result.is_ok() {
                 let completed_at_ms = current_time_ms();
                 let app_for_update = app.clone();
-                let final_report = aggregate_report;
-                let content_entries = final_report.entries.clone();
+                let final_payload = accumulator.final_payload();
+                let content_entries = final_payload.entries.clone();
                 let should_build_content_index =
                     should_build_content_index_for_config(&config, &content_entries);
                 update_result = {
                     if let Some(storage) = storage_store() {
                         let _ = storage
-                            .save_completed_index_batch(completed_at_ms, &final_report.entries);
+                            .save_completed_index_batch(completed_at_ms, &final_payload.entries);
                     }
                     let app_for_state = app_for_update.clone();
                     app_for_update.run_on_main_thread(move || {
@@ -840,7 +914,7 @@ fn start_background_index_refresh<R: tauri::Runtime>(
                         if let Some(status) = apply_completed_index_refresh(
                             &state,
                             generation,
-                            final_report,
+                            final_payload,
                             completed_at_ms,
                         ) {
                             let _ = app_for_state.emit("quickfox://index-status", status);
@@ -850,7 +924,6 @@ fn start_background_index_refresh<R: tauri::Runtime>(
 
                 if update_result.is_ok() && should_build_content_index {
                     let content_progress_report = IndexReport {
-                        entries: content_entries.clone(),
                         failures: Vec::new(),
                         scan_stats: IndexScanStats {
                             scanned: content_entries.len(),
@@ -859,6 +932,11 @@ fn start_background_index_refresh<R: tauri::Runtime>(
                             failures: 0,
                         },
                         scan_events: Vec::new(),
+                        ..Default::default()
+                    };
+                    let content_progress_payload = IndexRefreshPayload {
+                        entries: content_entries.clone(),
+                        summary: content_progress_report,
                     };
                     let app_for_update = app.clone();
                     let app_for_state = app_for_update.clone();
@@ -869,7 +947,7 @@ fn start_background_index_refresh<R: tauri::Runtime>(
                             generation,
                             "content-index".to_owned(),
                             None,
-                            content_progress_report,
+                            content_progress_payload,
                         ) {
                             let _ = app_for_state.emit("quickfox://index-status", status);
                         }
@@ -879,17 +957,21 @@ fn start_background_index_refresh<R: tauri::Runtime>(
                         let content_completed_at_ms = current_time_ms();
                         let content_index =
                             build_search_index_with_content_for_config(&config, content_entries);
+                        let content_entries = content_index.entries().to_vec();
                         let content_report = IndexReport {
-                            entries: content_index.entries().to_vec(),
                             failures: Vec::new(),
                             ..Default::default()
                         };
                         if let Some(storage) = storage_store() {
                             let _ = storage.save_completed_index_batch(
                                 content_completed_at_ms,
-                                &content_report.entries,
+                                &content_entries,
                             );
                         }
+                        let content_payload = IndexRefreshPayload {
+                            entries: content_entries,
+                            summary: content_report,
+                        };
                         let app_for_update = app.clone();
                         let app_for_state = app_for_update.clone();
                         update_result = app_for_update.run_on_main_thread(move || {
@@ -898,7 +980,7 @@ fn start_background_index_refresh<R: tauri::Runtime>(
                                 &state,
                                 generation,
                                 content_index,
-                                content_report,
+                                content_payload,
                                 content_completed_at_ms,
                             ) {
                                 let _ = app_for_state.emit("quickfox://index-status", status);
@@ -920,21 +1002,23 @@ fn start_background_index_refresh<R: tauri::Runtime>(
 fn apply_completed_index_refresh(
     state: &QuickFoxAppState,
     generation: u64,
-    report: IndexReport,
+    payload: impl Into<IndexRefreshPayload>,
     completed_at_ms: i64,
 ) -> Option<IndexStatus> {
+    let payload = payload.into();
     let mut runtime = state
         .runtime
         .lock()
         .expect("quickfox runtime lock poisoned");
+    let entry_count = payload.entries.len();
     if !runtime
         .index_lifecycle
-        .complete_refresh(generation, report.entries.len(), completed_at_ms)
+        .complete_refresh(generation, entry_count, completed_at_ms)
     {
         return None;
     }
-    runtime.index = build_search_index_for_config(&runtime.config, report.entries.clone());
-    runtime.last_report = report;
+    runtime.index = build_search_index_for_config(&runtime.config, payload.entries);
+    runtime.last_report = payload.summary;
     match start_runtime_index_watcher(&mut runtime) {
         Ok(()) => {}
         Err(failure) => {
@@ -948,21 +1032,23 @@ fn apply_completed_content_index_refresh(
     state: &QuickFoxAppState,
     generation: u64,
     content_index: SearchIndex,
-    report: IndexReport,
+    payload: impl Into<IndexRefreshPayload>,
     completed_at_ms: i64,
 ) -> Option<IndexStatus> {
+    let payload = payload.into();
     let mut runtime = state
         .runtime
         .lock()
         .expect("quickfox runtime lock poisoned");
+    let entry_count = payload.entries.len();
     if !runtime
         .index_lifecycle
-        .complete_refresh(generation, report.entries.len(), completed_at_ms)
+        .complete_refresh(generation, entry_count, completed_at_ms)
     {
         return None;
     }
     runtime.index = content_index;
-    runtime.last_report = report;
+    runtime.last_report = payload.summary;
     Some(runtime.index_status())
 }
 
@@ -997,23 +1083,25 @@ fn apply_index_refresh_progress(
     generation: u64,
     stage: String,
     current_root: Option<String>,
-    report: IndexReport,
+    payload: impl Into<IndexRefreshPayload>,
 ) -> Option<IndexStatus> {
+    let payload = payload.into();
     let mut runtime = state
         .runtime
         .lock()
         .expect("quickfox runtime lock poisoned");
+    let entry_count = payload.entries.len();
     if !runtime.index_lifecycle.update_progress(
         generation,
         stage,
         current_root,
-        report.scan_stats.clone(),
-        report.entries.len(),
+        payload.summary.scan_stats.clone(),
+        entry_count,
     ) {
         return None;
     }
-    runtime.index = SearchIndex::from_entries(report.entries.clone());
-    runtime.last_report = report;
+    runtime.index = SearchIndex::from_entries(payload.entries);
+    runtime.last_report = payload.summary;
     Some(runtime.index_status())
 }
 
@@ -1031,39 +1119,6 @@ fn apply_failed_index_refresh(
     } else {
         None
     }
-}
-
-fn merge_index_report(
-    aggregate_report: &mut IndexReport,
-    entries_by_path: &mut std::collections::BTreeMap<String, crate::core::index::IndexedEntry>,
-    stage_report: IndexReport,
-) {
-    aggregate_report.failures.extend(stage_report.failures);
-    aggregate_report
-        .scan_events
-        .extend(stage_report.scan_events);
-    aggregate_report.scan_stats = IndexScanStats {
-        scanned: aggregate_report
-            .scan_stats
-            .scanned
-            .saturating_add(stage_report.scan_stats.scanned),
-        accepted: aggregate_report
-            .scan_stats
-            .accepted
-            .saturating_add(stage_report.scan_stats.accepted),
-        skipped: aggregate_report
-            .scan_stats
-            .skipped
-            .saturating_add(stage_report.scan_stats.skipped),
-        failures: aggregate_report
-            .scan_stats
-            .failures
-            .saturating_add(stage_report.scan_stats.failures),
-    };
-    for entry in stage_report.entries {
-        entries_by_path.insert(entry.path.clone(), entry);
-    }
-    aggregate_report.entries = entries_by_path.values().cloned().collect();
 }
 
 fn last_finished_root_for_stage(report: &IndexReport, stage: &str) -> Option<String> {
@@ -1102,22 +1157,21 @@ fn build_runtime_from_snapshot(
     config: QuickFoxConfig,
     snapshot: Option<crate::core::storage::IndexSnapshot>,
 ) -> QuickFoxRuntime {
-    let entries = snapshot
-        .as_ref()
-        .map(|snapshot| snapshot.entries.clone())
-        .unwrap_or_default();
-    let index_lifecycle = snapshot
-        .as_ref()
-        .map(|snapshot| {
-            IndexLifecycle::from_ready(snapshot.entries.len(), snapshot.completed_at_ms)
-        })
-        .unwrap_or_default();
-    let report = IndexReport {
-        entries: entries.clone(),
-        failures: Vec::new(),
-        ..Default::default()
+    let (index, index_lifecycle, report) = if let Some(snapshot) = snapshot {
+        let entry_count = snapshot.entries.len();
+        let completed_at_ms = snapshot.completed_at_ms;
+        (
+            build_search_index_for_config(&config, snapshot.entries),
+            IndexLifecycle::from_ready(entry_count, completed_at_ms),
+            IndexReport::default(),
+        )
+    } else {
+        (
+            build_search_index_for_config(&config, Vec::new()),
+            IndexLifecycle::default(),
+            IndexReport::default(),
+        )
     };
-    let index = build_search_index_for_config(&config, entries.clone());
     QuickFoxRuntime {
         config,
         index,
@@ -2002,6 +2056,10 @@ mod tests {
         );
         assert_eq!(runtime.index_status().entry_count, 1);
         assert_eq!(runtime.index.entries()[0].name, "notes.md");
+        assert!(
+            runtime.last_report.entries.is_empty(),
+            "snapshot startup must not keep a duplicate full entry report resident"
+        );
     }
 
     #[test]
@@ -2174,6 +2232,124 @@ mod tests {
             state.runtime.lock().unwrap().index.entries()[0].name,
             "notes.md"
         );
+    }
+
+    #[test]
+    fn runtime_reports_do_not_retain_duplicate_entries_after_index_updates() {
+        let state = QuickFoxAppState {
+            runtime: Mutex::new(QuickFoxRuntime {
+                config: QuickFoxConfig::default_with_index_dirs(vec!["/tmp".to_owned()]),
+                index: SearchIndex::default(),
+                last_report: IndexReport::default(),
+                index_lifecycle: IndexLifecycle::default(),
+                index_watcher: None,
+                watcher_failure_summary: None,
+            }),
+            window_state: Mutex::new(LauncherWindowState::default()),
+            global_hotkey_status: Mutex::new(pending_global_hotkey_status()),
+        };
+        let generation = {
+            let mut runtime = state.runtime.lock().unwrap();
+            runtime.index_lifecycle.start_refresh(false)
+        };
+
+        apply_index_refresh_progress(
+            &state,
+            generation,
+            "user-hot-paths".to_owned(),
+            Some("/tmp".to_owned()),
+            IndexReport {
+                entries: vec![crate::core::index::IndexedEntry::legacy(
+                    "/tmp/notes.md",
+                    "notes.md",
+                    crate::core::index::IndexedEntryKind::File,
+                )],
+                failures: Vec::new(),
+                scan_stats: IndexScanStats {
+                    scanned: 1,
+                    accepted: 1,
+                    skipped: 0,
+                    failures: 0,
+                },
+                scan_events: Vec::new(),
+            },
+        )
+        .expect("fresh progress emits status");
+
+        {
+            let runtime = state.runtime.lock().unwrap();
+            assert_eq!(runtime.index.entries().len(), 1);
+            assert!(runtime.last_report.entries.is_empty());
+            assert_eq!(runtime.last_report.scan_stats.accepted, 1);
+        }
+
+        apply_completed_index_refresh(
+            &state,
+            generation,
+            IndexReport {
+                entries: vec![crate::core::index::IndexedEntry::legacy(
+                    "/tmp/done.md",
+                    "done.md",
+                    crate::core::index::IndexedEntryKind::File,
+                )],
+                failures: Vec::new(),
+                scan_stats: IndexScanStats {
+                    scanned: 2,
+                    accepted: 1,
+                    skipped: 1,
+                    failures: 0,
+                },
+                scan_events: Vec::new(),
+            },
+            456,
+        )
+        .expect("fresh completion emits status");
+
+        let runtime = state.runtime.lock().unwrap();
+        assert_eq!(runtime.index.entries().len(), 1);
+        assert_eq!(runtime.index.entries()[0].name, "done.md");
+        assert!(runtime.last_report.entries.is_empty());
+        assert_eq!(runtime.last_report.scan_stats.scanned, 2);
+    }
+
+    #[test]
+    fn index_refresh_accumulator_builds_progress_payload_without_entry_report_clone() {
+        let mut accumulator = IndexRefreshAccumulator::default();
+        accumulator.merge(IndexReport {
+            entries: vec![crate::core::index::IndexedEntry::legacy(
+                "/tmp/notes.md",
+                "notes.md",
+                crate::core::index::IndexedEntryKind::File,
+            )],
+            failures: Vec::new(),
+            scan_stats: IndexScanStats {
+                scanned: 3,
+                accepted: 1,
+                skipped: 2,
+                failures: 0,
+            },
+            scan_events: vec![ScanEvent::RootFinished {
+                root: "/tmp".to_owned(),
+                stage: Some("user-hot-paths".to_owned()),
+                stats: IndexScanStats {
+                    scanned: 3,
+                    accepted: 1,
+                    skipped: 2,
+                    failures: 0,
+                },
+            }],
+        });
+
+        let progress = accumulator.progress_payload();
+
+        assert_eq!(progress.entries.len(), 1);
+        assert_eq!(progress.summary.entries.len(), 0);
+        assert_eq!(progress.summary.scan_stats.accepted, 1);
+        assert_eq!(
+            last_finished_root_for_stage(&progress.summary, "user-hot-paths").as_deref(),
+            Some("/tmp")
+        );
+        assert_eq!(accumulator.entry_count(), 1);
     }
 
     #[test]

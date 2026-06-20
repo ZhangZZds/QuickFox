@@ -54,6 +54,15 @@
 - GitHub Actions 使用标准 GitHub-hosted runner，不使用 larger runner。
 - 普通 push/PR 只跑检查和构建验证，不默认发布安装包。
 - 发布打包应通过手动 workflow 或 tag release workflow 触发。
+- 包含 OpenSpec 变更的发布归档流程：
+  1. 确认 OpenSpec tasks 全部完成，并运行 `openspec validate <change> --strict`。
+  2. 将 delta specs 同步到 `openspec/specs/` 后，把变更目录移动到
+     `openspec/changes/archive/YYYY-MM-DD-<change>/`。
+  3. 运行完整本地检查，例如 `npm run check`，必要时补跑 release/ignored
+     benchmark 和平台手工验收记录。
+  4. 在 `main` 上提交归档、实现、文档和验证记录，推送到 GitHub。
+  5. 使用 tag 或手动 release workflow 生成安装包，并在 GitHub Release notes
+     中记录功能变化、验证结果、平台验收和已知风险。
 
 ## 安全与隐私
 

@@ -1,6 +1,7 @@
 //! File and directory indexing will live here.
 
 use crate::core::actions::Action;
+use crate::core::compact_index::CompactCandidateIndex;
 use crate::core::content_index::{
     ContentIndex, ContentIndexOptions, ContentSearchHit, PlainTextExtractor,
 };
@@ -44,7 +45,16 @@ impl IndexScanner {
 pub struct SearchIndex {
     entries: Vec<IndexedEntry>,
     search_texts: Vec<String>,
+    compact_candidates: CompactCandidateIndex,
     content_index: Option<ContentIndex>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchIndexMemoryEstimate {
+    pub entry_count: usize,
+    pub entry_struct_bytes: usize,
+    pub entry_string_bytes: usize,
+    pub cached_search_text_bytes: usize,
 }
 
 impl Clone for SearchIndex {
@@ -55,6 +65,7 @@ impl Clone for SearchIndex {
         Self {
             entries: self.entries.clone(),
             search_texts: self.search_texts.clone(),
+            compact_candidates: self.compact_candidates.clone(),
             content_index: self.content_index.clone(),
         }
     }
@@ -63,9 +74,11 @@ impl Clone for SearchIndex {
 impl SearchIndex {
     pub fn from_entries(entries: Vec<IndexedEntry>) -> Self {
         let search_texts = entries.iter().map(searchable_text).collect();
+        let compact_candidates = CompactCandidateIndex::from_entries(entries.clone());
         Self {
             entries,
             search_texts,
+            compact_candidates,
             content_index: None,
         }
     }
@@ -75,15 +88,29 @@ impl SearchIndex {
         content_index: ContentIndex,
     ) -> Self {
         let search_texts = entries.iter().map(searchable_text).collect();
+        let compact_candidates = CompactCandidateIndex::from_entries(entries.clone());
         Self {
             entries,
             search_texts,
+            compact_candidates,
             content_index: Some(content_index),
         }
     }
 
     pub fn entries(&self) -> &[IndexedEntry] {
         &self.entries
+    }
+
+    pub fn memory_estimate(&self) -> SearchIndexMemoryEstimate {
+        SearchIndexMemoryEstimate {
+            entry_count: self.entries.len(),
+            entry_struct_bytes: self
+                .entries
+                .len()
+                .saturating_mul(std::mem::size_of::<IndexedEntry>()),
+            entry_string_bytes: self.entries.iter().map(indexed_entry_string_bytes).sum(),
+            cached_search_text_bytes: self.search_texts.iter().map(String::len).sum(),
+        }
     }
 
     #[cfg(test)]
@@ -184,30 +211,53 @@ impl SearchIndex {
                 .then_with(|| left.name.cmp(&right.name))
         });
         self.search_texts = self.entries.iter().map(searchable_text).collect();
+        self.compact_candidates = CompactCandidateIndex::from_entries(self.entries.clone());
     }
 
     pub fn search_with_limit(&self, query: &QueryRequest, limit: usize) -> Vec<SearchResult> {
+        self.search_with_limit_cancellable(query, limit, || false)
+            .unwrap_or_default()
+    }
+
+    pub fn search_with_limit_cancellable(
+        &self,
+        query: &QueryRequest,
+        limit: usize,
+        is_cancelled: impl Fn() -> bool,
+    ) -> Option<Vec<SearchResult>> {
+        if is_cancelled() {
+            return None;
+        }
+
         match &query.mode {
-            SearchMode::Normal => self.search_normal(&query.text, limit),
-            SearchMode::Regex => self.search_regex(&query.text, limit),
-            SearchMode::WebSearch { .. } | SearchMode::Command => Vec::new(),
+            SearchMode::Normal => self.search_normal(&query.text, limit, &is_cancelled),
+            SearchMode::Regex => self.search_regex(&query.text, limit, &is_cancelled),
+            SearchMode::WebSearch { .. } | SearchMode::Command => Some(Vec::new()),
         }
     }
 
     fn replace_entries(&mut self, entries: Vec<IndexedEntry>) {
         self.search_texts = entries.iter().map(searchable_text).collect();
+        self.compact_candidates = CompactCandidateIndex::from_entries(entries.clone());
         self.entries = entries;
         self.content_index = None;
     }
 
-    fn search_normal(&self, query: &str, limit: usize) -> Vec<SearchResult> {
-        let query = FileQuery::parse(query);
-        if limit == 0 || (!query.has_name_path_constraints() && !query.has_content_query()) {
-            return Vec::new();
+    fn search_normal(
+        &self,
+        query: &str,
+        limit: usize,
+        is_cancelled: &impl Fn() -> bool,
+    ) -> Option<Vec<SearchResult>> {
+        let parsed_query = FileQuery::parse(query);
+        if limit == 0
+            || (!parsed_query.has_name_path_constraints() && !parsed_query.has_content_query())
+        {
+            return Some(Vec::new());
         }
 
-        if query.has_content_query() && self.content_index.is_none() {
-            return vec![SearchResult::new(
+        if parsed_query.has_content_query() && self.content_index.is_none() {
+            return Some(vec![SearchResult::new(
                 "feedback:content-index-unavailable",
                 "内容索引仍在准备",
                 SearchResultKind::Feedback,
@@ -216,38 +266,49 @@ impl SearchIndex {
                 },
             )
             .with_detail("普通文件名和路径搜索已可用；content: 查询需要等待内容索引。".to_owned())
-            .with_score(100)];
+            .with_score(100)]);
         }
 
-        if query.has_content_query() && !query.has_name_path_constraints() {
-            return self.search_content_only(&query, limit);
+        if parsed_query.has_content_query() && !parsed_query.has_name_path_constraints() {
+            return Some(self.search_content_only(&parsed_query, limit));
         }
 
         let matcher = FileMatcher::default();
-        let matching_entries =
-            self.entries
-                .iter()
-                .zip(self.search_texts.iter())
-                .filter(|(entry, search_text)| {
-                    matcher.matches_with_search_text(&query, entry, search_text)
-                });
+        let candidate_ids = self.compact_candidates.retrieve_query(query).candidates;
+        if is_cancelled() {
+            return None;
+        }
 
-        let candidates: Vec<_> = if query.has_content_query() {
-            matching_entries.map(|(entry, _)| entry).collect()
-        } else {
-            matching_entries
-                .take(limit)
-                .map(|(entry, _)| entry)
-                .collect()
-        };
+        let mut candidates = Vec::new();
+        for (candidate_index, id) in candidate_ids.into_iter().enumerate() {
+            if candidate_index % 1024 == 0 && is_cancelled() {
+                return None;
+            }
+            let index = id.as_usize();
+            let Some(entry) = self.entries.get(index) else {
+                continue;
+            };
+            let Some(search_text) = self.search_texts.get(index) else {
+                continue;
+            };
+            if matcher.matches_with_search_text(&parsed_query, entry, search_text) {
+                candidates.push(entry);
+                if !parsed_query.has_content_query() && candidates.len() >= limit {
+                    break;
+                }
+            }
+        }
 
-        if !query.has_content_query() {
-            return candidates.into_iter().map(entry_to_result).collect();
+        if !parsed_query.has_content_query() {
+            return Some(candidates.into_iter().map(entry_to_result).collect());
         }
 
         let candidate_paths: HashSet<_> =
             candidates.iter().map(|entry| entry.path.clone()).collect();
-        let content_hits = self.search_content_hits(&query, Some(&candidate_paths), limit);
+        if is_cancelled() {
+            return None;
+        }
+        let content_hits = self.search_content_hits(&parsed_query, Some(&candidate_paths), limit);
         let hit_by_path: HashMap<_, _> = content_hits
             .into_iter()
             .map(|hit| (hit.path.clone(), hit))
@@ -271,7 +332,7 @@ impl SearchIndex {
                 .then_with(|| left.id.cmp(&right.id))
         });
         results.truncate(limit);
-        results
+        Some(results)
     }
 
     fn search_content_only(&self, query: &FileQuery, limit: usize) -> Vec<SearchResult> {
@@ -318,27 +379,39 @@ impl SearchIndex {
             .unwrap_or_default()
     }
 
-    fn search_regex(&self, pattern: &str, limit: usize) -> Vec<SearchResult> {
+    fn search_regex(
+        &self,
+        pattern: &str,
+        limit: usize,
+        is_cancelled: &impl Fn() -> bool,
+    ) -> Option<Vec<SearchResult>> {
         let regex = match Regex::new(pattern) {
             Ok(regex) => regex,
             Err(error) => {
-                return vec![SearchResult::new(
+                return Some(vec![SearchResult::new(
                     "feedback:invalid-regex",
                     format!("无效正则: {error}"),
                     SearchResultKind::Feedback,
                     Action::CopyText {
                         text: error.to_string(),
                     },
-                )];
+                )]);
             }
         };
 
-        self.entries
-            .iter()
-            .filter(|entry| regex.is_match(&entry.name) || regex.is_match(&entry.path))
-            .take(limit)
-            .map(entry_to_result)
-            .collect()
+        let mut results = Vec::new();
+        for (index, entry) in self.entries.iter().enumerate() {
+            if index % 1024 == 0 && is_cancelled() {
+                return None;
+            }
+            if regex.is_match(&entry.name) || regex.is_match(&entry.path) {
+                results.push(entry_to_result(entry));
+                if results.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Some(results)
     }
 }
 
@@ -352,6 +425,19 @@ fn searchable_text(entry: &IndexedEntry) -> String {
     } else {
         entry.search_text.clone()
     }
+}
+
+fn indexed_entry_string_bytes(entry: &IndexedEntry) -> usize {
+    entry.path.len()
+        + entry.name.len()
+        + entry.parent.len()
+        + entry
+            .extension
+            .as_ref()
+            .map(String::len)
+            .unwrap_or_default()
+        + entry.root.len()
+        + entry.search_text.len()
 }
 
 fn snapshot_metadata_matches(previous: &IndexedEntry, scanned: &IndexedEntry) -> bool {
@@ -935,6 +1021,23 @@ mod tests {
     }
 
     #[test]
+    fn search_preserves_name_substring_matches_when_candidates_miss() {
+        let index = SearchIndex::from_entries(vec![
+            file_entry("/Users/frank/workspace/reports/report.md"),
+            file_entry("/Users/frank/workspace/reports/notes.md"),
+        ]);
+        let parser = crate::core::search::QueryParser::new(Default::default());
+
+        let titles: Vec<_> = index
+            .search(&parser.parse("port"))
+            .into_iter()
+            .map(|result| result.title)
+            .collect();
+
+        assert_eq!(titles, vec!["report.md"]);
+    }
+
+    #[test]
     fn search_with_limit_bounds_constructed_results() {
         let index = SearchIndex::from_entries(vec![
             file_entry("/tmp/project-alpha.md"),
@@ -967,6 +1070,54 @@ mod tests {
             .collect();
 
         assert_eq!(titles, vec!["budget.PDF"]);
+    }
+
+    #[test]
+    fn structured_file_query_preserves_name_substring_matches() {
+        let index = SearchIndex::from_entries(vec![
+            file_entry("/Users/frank/workspace/reports/report.md"),
+            file_entry("/Users/frank/workspace/reports/notes.md"),
+        ]);
+        let parser = crate::core::search::QueryParser::new(Default::default());
+
+        let titles: Vec<_> = index
+            .search(&parser.parse("name:port"))
+            .into_iter()
+            .map(|result| result.title)
+            .collect();
+
+        assert_eq!(titles, vec!["report.md"]);
+    }
+
+    #[test]
+    fn structured_file_query_filters_over_recalled_name_candidates() {
+        let index = SearchIndex::from_entries(vec![
+            file_entry("/Users/frank/workspace/QuickFox/AGENTS.md"),
+            file_entry("/Users/frank/workspace/QuickFox/AGENTS.txt"),
+        ]);
+        let parser = crate::core::search::QueryParser::new(Default::default());
+
+        let results = index.search(&parser.parse("name:agents.txt type:md"));
+
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn structured_file_query_preserves_dir_glob_matches() {
+        let index = SearchIndex::from_entries(vec![
+            file_entry("/Users/frank/workspace/QuickFox/budget.PDF"),
+            file_entry("/Users/frank/workspace/Other/budget.PDF"),
+            file_entry("/Users/frank/downloads/QuickFox/budget.PDF"),
+        ]);
+        let parser = crate::core::search::QueryParser::new(Default::default());
+
+        let titles: Vec<_> = index
+            .search(&parser.parse("budget type:pdf dir:**/workspace/QuickFox"))
+            .into_iter()
+            .map(|result| result.detail.unwrap_or_default())
+            .collect();
+
+        assert_eq!(titles, vec!["/Users/frank/workspace/QuickFox/budget.PDF"]);
     }
 
     #[test]
@@ -1060,6 +1211,251 @@ mod tests {
             elapsed.as_millis() < 500,
             "large index query took {elapsed:?}, expected bounded candidate work"
         );
+    }
+
+    #[test]
+    fn synthetic_large_index_fixture_places_agents_target_late_and_defines_queries() {
+        let fixture = SyntheticLargeIndexFixture::new(10_000);
+        let queries = large_index_benchmark_queries();
+
+        assert_eq!(fixture.entries.len(), 10_000);
+        assert_eq!(
+            fixture.agents_path,
+            "D:\\workspace\\QuickFox\\docs\\AGENTS.md"
+        );
+        assert!(fixture
+            .entries
+            .iter()
+            .position(|entry| entry.path == fixture.agents_path)
+            .is_some_and(|position| position > 9_000));
+        assert!(queries.iter().any(|query| query.name == "agents-exact"));
+        assert!(queries.iter().any(|query| query.query == "agents.m"));
+        assert!(queries.iter().any(|query| query.query == "type:md agents"));
+        assert!(queries
+            .iter()
+            .any(|query| query.query == "dir:workspace agents"));
+        assert!(queries
+            .iter()
+            .any(|query| query.kind == BenchmarkQueryKind::LowHit));
+        assert!(queries
+            .iter()
+            .any(|query| query.kind == BenchmarkQueryKind::HighHit));
+    }
+
+    #[test]
+    fn synthetic_large_index_oracle_keeps_agents_queries_in_top_five() {
+        let fixture = SyntheticLargeIndexFixture::new(10_000);
+        let parser = crate::core::search::QueryParser::new(Default::default());
+        let search_index = SearchIndex::from_entries(fixture.entries.clone());
+
+        for query in large_index_benchmark_queries()
+            .into_iter()
+            .filter(|query| query.expected_agents_top_five)
+        {
+            let results = search_index.search_with_limit(&parser.parse(query.query), 20);
+            let target_position = results
+                .iter()
+                .position(|result| result.detail.as_deref() == Some(fixture.agents_path.as_str()));
+            assert!(
+                target_position.is_some_and(|position| position < 5),
+                "query {} did not keep {} in top five; got {:?}",
+                query.name,
+                fixture.agents_path,
+                results
+                    .iter()
+                    .map(|result| result.detail.as_deref().unwrap_or_default())
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn search_index_memory_estimate_reports_duplicate_search_text_storage() {
+        let fixture = SyntheticLargeIndexFixture::new(1_000);
+        let search_index = SearchIndex::from_entries(fixture.entries);
+        let estimate = search_index.memory_estimate();
+
+        assert_eq!(estimate.entry_count, 1_000);
+        assert!(estimate.entry_string_bytes > 0);
+        assert!(estimate.cached_search_text_bytes > 0);
+        assert!(
+            estimate.cached_search_text_bytes >= estimate.entry_string_bytes / 4,
+            "cached search text should be visible in memory estimates: {estimate:?}"
+        );
+    }
+
+    #[test]
+    fn compact_candidate_retriever_covers_linear_search_oracle_results() {
+        let fixture = SyntheticLargeIndexFixture::new(10_000);
+        let parser = crate::core::search::QueryParser::new(Default::default());
+        let linear_index = SearchIndex::from_entries(fixture.entries.clone());
+        let compact_index = crate::core::compact_index::CompactCandidateIndex::from_entries(
+            fixture.entries.clone(),
+        );
+
+        for query in [
+            "agents",
+            "agents.m",
+            "type:md agents",
+            "dir:workspace agents",
+        ] {
+            let linear_paths: Vec<_> = linear_index
+                .search_with_limit(&parser.parse(query), 5)
+                .into_iter()
+                .filter_map(|result| result.detail)
+                .collect();
+            let candidate_paths = compact_index.retrieve_query_paths(query);
+
+            for path in linear_paths {
+                assert!(
+                    candidate_paths.contains(&path),
+                    "compact candidates for {query:?} should include linear oracle path {path:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn low_hit_large_index_search_uses_bounded_candidate_retrieval() {
+        let fixture = SyntheticLargeIndexFixture::new(100_000);
+        let parser = crate::core::search::QueryParser::new(Default::default());
+        let search_index = SearchIndex::from_entries(fixture.entries);
+
+        let started = Instant::now();
+        let results =
+            search_index.search_with_limit(&parser.parse("needle-not-present-987654321"), 20);
+        let elapsed = started.elapsed();
+
+        assert!(results.is_empty());
+        assert!(
+            elapsed.as_millis() < 100,
+            "low-hit query should use bounded candidate retrieval, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn cancellable_search_stops_before_returning_stale_results() {
+        let fixture = SyntheticLargeIndexFixture::new(10_000);
+        let parser = crate::core::search::QueryParser::new(Default::default());
+        let search_index = SearchIndex::from_entries(fixture.entries);
+        let checks = AtomicUsize::new(0);
+
+        let results =
+            search_index.search_with_limit_cancellable(&parser.parse("project"), 20, || {
+                checks.fetch_add(1, Ordering::Relaxed) >= 2
+            });
+
+        assert!(results.is_none());
+        assert!(checks.load(Ordering::Relaxed) >= 3);
+    }
+
+    #[test]
+    fn ci_scale_large_index_search_stays_within_latency_budget() {
+        let fixture = SyntheticLargeIndexFixture::new(100_000);
+        let parser = crate::core::search::QueryParser::new(Default::default());
+        let search_index = SearchIndex::from_entries(fixture.entries);
+
+        for query in large_index_benchmark_queries().into_iter().filter(|query| {
+            matches!(
+                query.kind,
+                BenchmarkQueryKind::Exact
+                    | BenchmarkQueryKind::Prefix
+                    | BenchmarkQueryKind::FieldFiltered
+                    | BenchmarkQueryKind::LowHit
+            )
+        }) {
+            let started = Instant::now();
+            let results = search_index.search_with_limit(&parser.parse(query.query), 20);
+            let elapsed = started.elapsed();
+
+            assert!(
+                elapsed.as_millis() < 150,
+                "CI-scale query {} took {elapsed:?}, expected compact candidate budget",
+                query.name
+            );
+            if query.expected_agents_top_five {
+                assert!(
+                    results.iter().take(5).any(|result| {
+                        result.detail.as_deref() == Some(fixture.agents_path.as_str())
+                    }),
+                    "query {} should keep AGENTS.md in top five",
+                    query.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "2,000,000 entry performance threshold for local release-build and Windows validation"]
+    fn two_million_entry_search_stays_within_latency_budget() {
+        let fixture = SyntheticLargeIndexFixture::new(2_000_000);
+        let parser = crate::core::search::QueryParser::new(Default::default());
+        let search_index = SearchIndex::from_entries(fixture.entries);
+
+        for query in large_index_benchmark_queries().into_iter().filter(|query| {
+            matches!(
+                query.kind,
+                BenchmarkQueryKind::Exact
+                    | BenchmarkQueryKind::Prefix
+                    | BenchmarkQueryKind::FieldFiltered
+                    | BenchmarkQueryKind::LowHit
+            )
+        }) {
+            let started = Instant::now();
+            let results = search_index.search_with_limit(&parser.parse(query.query), 20);
+            let elapsed = started.elapsed();
+
+            println!(
+                "QUICKFOX_LARGE_INDEX_THRESHOLD scale=2000000 query={} kind={:?} elapsed_us={} results={}",
+                query.name,
+                query.kind,
+                elapsed.as_micros(),
+                results.len()
+            );
+            assert!(
+                elapsed.as_millis() < 250,
+                "2,000,000-entry query {} took {elapsed:?}, expected compact candidate budget",
+                query.name
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "prints machine-dependent large-index baseline timings; set QUICKFOX_LARGE_INDEX_SCALE=2000000 for the full target scale"]
+    fn synthetic_large_index_baseline_reports_current_linear_search_characteristics() {
+        let scale = std::env::var("QUICKFOX_LARGE_INDEX_SCALE")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(100_000);
+        let fixture = SyntheticLargeIndexFixture::new(scale);
+        let parser = crate::core::search::QueryParser::new(Default::default());
+        let search_index = SearchIndex::from_entries(fixture.entries);
+        let memory_estimate = search_index.memory_estimate();
+
+        for query in large_index_benchmark_queries() {
+            let started = Instant::now();
+            let results = search_index.search_with_limit(&parser.parse(query.query), 20);
+            let elapsed = started.elapsed();
+            let target_position = results
+                .iter()
+                .position(|result| result.detail.as_deref() == Some(fixture.agents_path.as_str()))
+                .map(|position| position as i64)
+                .unwrap_or(-1);
+
+            println!(
+                "QUICKFOX_LARGE_INDEX_BASELINE scale={} query={} kind={:?} elapsed_us={} results={} target_position={} linear_entries={} entry_struct_bytes={} entry_string_bytes={} cached_search_text_bytes={}",
+                scale,
+                query.name,
+                query.kind,
+                elapsed.as_micros(),
+                results.len(),
+                target_position,
+                search_index.entries().len(),
+                memory_estimate.entry_struct_bytes,
+                memory_estimate.entry_string_bytes,
+                memory_estimate.cached_search_text_bytes
+            );
+        }
     }
 
     #[test]
@@ -1243,6 +1639,163 @@ mod tests {
             path.rsplit('/').next().unwrap().to_owned(),
             IndexedEntryKind::File,
         )
+    }
+
+    #[derive(Debug, Clone)]
+    struct SyntheticLargeIndexFixture {
+        entries: Vec<IndexedEntry>,
+        agents_path: String,
+    }
+
+    impl SyntheticLargeIndexFixture {
+        fn new(entry_count: usize) -> Self {
+            assert!(entry_count >= 128);
+            let agents_path = "D:\\workspace\\QuickFox\\docs\\AGENTS.md".to_owned();
+            let agents_index = (entry_count.saturating_mul(95) / 100).min(entry_count - 1);
+            let mut entries = Vec::with_capacity(entry_count);
+
+            for index in 0..entry_count {
+                if index == agents_index {
+                    entries.push(synthetic_file_entry(&agents_path));
+                    continue;
+                }
+
+                let drive = if index % 2 == 0 { "C:" } else { "D:" };
+                let area = match index % 8 {
+                    0 => "Users\\Frank\\Documents",
+                    1 => "Users\\Frank\\Downloads",
+                    2 => "workspace\\ProjectAlpha",
+                    3 => "workspace\\ProjectBeta",
+                    4 => "src\\packages",
+                    5 => "logs\\archive",
+                    6 => "media\\assets",
+                    _ => "tools\\cache",
+                };
+                let extension = match index % 7 {
+                    0 => "md",
+                    1 => "txt",
+                    2 => "rs",
+                    3 => "tsx",
+                    4 => "json",
+                    5 => "pdf",
+                    _ => "log",
+                };
+                let stem = match index % 11 {
+                    0 => "project",
+                    1 => "report",
+                    2 => "notes",
+                    3 => "readme",
+                    4 => "index",
+                    5 => "cache",
+                    6 => "module",
+                    7 => "config",
+                    8 => "asset",
+                    9 => "summary",
+                    _ => "record",
+                };
+                entries.push(synthetic_file_entry(&format!(
+                    "{drive}\\{area}\\folder-{:04}\\{stem}-{:07}.{extension}",
+                    index % 10_000,
+                    index
+                )));
+            }
+
+            Self {
+                entries,
+                agents_path,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum BenchmarkQueryKind {
+        Exact,
+        Prefix,
+        FieldFiltered,
+        LowHit,
+        HighHit,
+        PathSegmentFuzzy,
+    }
+
+    #[derive(Debug, Clone)]
+    struct BenchmarkQuery {
+        name: &'static str,
+        query: &'static str,
+        kind: BenchmarkQueryKind,
+        expected_agents_top_five: bool,
+    }
+
+    fn large_index_benchmark_queries() -> Vec<BenchmarkQuery> {
+        vec![
+            BenchmarkQuery {
+                name: "agents-exact",
+                query: "agents.md",
+                kind: BenchmarkQueryKind::Exact,
+                expected_agents_top_five: true,
+            },
+            BenchmarkQuery {
+                name: "agents-prefix-extension",
+                query: "agents.m",
+                kind: BenchmarkQueryKind::Prefix,
+                expected_agents_top_five: true,
+            },
+            BenchmarkQuery {
+                name: "agents-prefix",
+                query: "agents",
+                kind: BenchmarkQueryKind::Prefix,
+                expected_agents_top_five: true,
+            },
+            BenchmarkQuery {
+                name: "agents-type-md",
+                query: "type:md agents",
+                kind: BenchmarkQueryKind::FieldFiltered,
+                expected_agents_top_five: true,
+            },
+            BenchmarkQuery {
+                name: "agents-dir-workspace",
+                query: "dir:workspace agents",
+                kind: BenchmarkQueryKind::FieldFiltered,
+                expected_agents_top_five: true,
+            },
+            BenchmarkQuery {
+                name: "low-hit-random",
+                query: "needle-not-present-987654321",
+                kind: BenchmarkQueryKind::LowHit,
+                expected_agents_top_five: false,
+            },
+            BenchmarkQuery {
+                name: "path-segment-fuzzy",
+                query: "wrkspc",
+                kind: BenchmarkQueryKind::PathSegmentFuzzy,
+                expected_agents_top_five: false,
+            },
+            BenchmarkQuery {
+                name: "high-hit-project",
+                query: "project",
+                kind: BenchmarkQueryKind::HighHit,
+                expected_agents_top_five: false,
+            },
+        ]
+    }
+
+    fn synthetic_file_entry(path: &str) -> IndexedEntry {
+        let name = path.rsplit(['/', '\\']).next().unwrap_or(path).to_owned();
+        let mut entry = IndexedEntry::legacy(path, name, IndexedEntryKind::File);
+        entry.parent = path
+            .rsplit_once(['/', '\\'])
+            .map(|(parent, _)| parent.to_owned())
+            .unwrap_or_default();
+        entry.extension = entry
+            .name
+            .rsplit_once('.')
+            .map(|(_, extension)| extension.to_ascii_lowercase());
+        entry.root = path
+            .split(['/', '\\'])
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+        entry.depth = path.split(['/', '\\']).count().saturating_sub(1);
+        entry
     }
 
     fn temp_dir(label: &str) -> std::path::PathBuf {

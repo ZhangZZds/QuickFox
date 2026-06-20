@@ -3,7 +3,7 @@
 use crate::core::index_entry::{ContentIndexState, IndexedEntry, IndexedEntryKind};
 use crate::core::search::SearchSnippet;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tantivy::collector::TopDocs;
@@ -38,7 +38,6 @@ pub struct ContentIndex {
     index: Index,
     path_field: Field,
     content_field: Field,
-    documents: HashMap<String, ExtractedDocument>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -46,6 +45,12 @@ pub struct ContentSearchHit {
     pub path: String,
     pub score: f32,
     pub snippet: SearchSnippet,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContentIndexMemoryEstimate {
+    pub resident_document_count: usize,
+    pub resident_cached_content_bytes: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -125,8 +130,6 @@ impl ContentIndex {
         let content_field = schema.get_field("content")?;
         let index = Index::create_in_dir(&index_dir, schema)?;
         let mut writer: IndexWriter = index.writer(50_000_000)?;
-        let mut documents = HashMap::new();
-
         for entry in entries {
             if entry.kind != IndexedEntryKind::File {
                 entry.content_index_state = ContentIndexState::NotIndexed;
@@ -139,7 +142,6 @@ impl ContentIndex {
                         path_field => entry.path.clone(),
                         content_field => content.clone(),
                     ))?;
-                    documents.insert(entry.path.clone(), ExtractedDocument::from_content(content));
                     entry.content_index_state = ContentIndexState::Indexed;
                 }
                 ContentExtractionResult::TooLarge => {
@@ -160,7 +162,6 @@ impl ContentIndex {
             index,
             path_field,
             content_field,
-            documents,
         })
     }
 
@@ -197,9 +198,13 @@ impl ContentIndex {
                 continue;
             }
 
-            let Some(document) = self.documents.get(&path) else {
+            let Some(content) = doc
+                .get_first(self.content_field)
+                .and_then(|value| value.as_str())
+            else {
                 continue;
             };
+            let document = ExtractedDocument::from_content(content.to_owned());
             let Some(snippet) = document.snippet(content_query) else {
                 continue;
             };
@@ -223,7 +228,6 @@ impl ContentIndex {
         let mut writer: IndexWriter = self.index.writer(50_000_000)?;
         writer.delete_term(Term::from_field_text(self.path_field, &path));
         writer.commit()?;
-        self.documents.remove(&path);
         Ok(())
     }
 
@@ -247,8 +251,6 @@ impl ContentIndex {
                     self.content_field => content.clone(),
                 ))?;
                 writer.commit()?;
-                self.documents
-                    .insert(entry.path.clone(), ExtractedDocument::from_content(content));
                 entry.content_index_state = ContentIndexState::Indexed;
             }
             ContentExtractionResult::TooLarge => {
@@ -263,6 +265,13 @@ impl ContentIndex {
         }
 
         Ok(())
+    }
+
+    pub fn memory_estimate(&self) -> ContentIndexMemoryEstimate {
+        ContentIndexMemoryEstimate {
+            resident_document_count: 0,
+            resident_cached_content_bytes: 0,
+        }
     }
 }
 
@@ -439,6 +448,31 @@ mod tests {
     }
 
     #[test]
+    fn content_index_does_not_keep_full_documents_resident_for_snippets() {
+        let workspace = tempfile::tempdir().unwrap();
+        let first = workspace.path().join("first.txt");
+        let second = workspace.path().join("second.txt");
+        fs::write(&first, "alpha\nneedle\nomega").unwrap();
+        fs::write(&second, "beta\nneedle\nomega").unwrap();
+
+        let mut entries = vec![entry(&first), entry(&second)];
+        let content_index = ContentIndex::build(
+            &mut entries,
+            ContentIndexOptions {
+                index_dir: workspace.path().join("tantivy-content"),
+                max_file_bytes: DEFAULT_MAX_CONTENT_BYTES,
+            },
+        )
+        .unwrap();
+
+        let estimate = content_index.memory_estimate();
+
+        assert_eq!(estimate.resident_document_count, 0);
+        assert_eq!(estimate.resident_cached_content_bytes, 0);
+        assert_eq!(content_index.search("needle", None, 10).unwrap().len(), 2);
+    }
+
+    #[test]
     fn applies_candidate_constraints_before_content_results() {
         let workspace = tempfile::tempdir().unwrap();
         let docs = workspace.path().join("docs");
@@ -532,6 +566,49 @@ mod tests {
 
         content_index.remove_path(&first).unwrap();
         assert!(content_index.search("needle", None, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn changed_or_unreadable_content_degrades_without_breaking_name_search() {
+        let workspace = tempfile::tempdir().unwrap();
+        let file = workspace.path().join("report.txt");
+        fs::write(&file, "old needle").unwrap();
+
+        let mut entries = vec![entry(&file)];
+        let options = ContentIndexOptions {
+            index_dir: workspace.path().join("tantivy-content"),
+            max_file_bytes: DEFAULT_MAX_CONTENT_BYTES,
+        };
+        let mut content_index = ContentIndex::build(&mut entries, options.clone()).unwrap();
+        assert_eq!(content_index.search("needle", None, 10).unwrap().len(), 1);
+
+        fs::write(&file, "fresh haystack").unwrap();
+        content_index
+            .update_entry(&mut entries[0], &options, &PlainTextExtractor)
+            .unwrap();
+        assert_eq!(entries[0].content_index_state, ContentIndexState::Indexed);
+        assert!(content_index.search("needle", None, 10).unwrap().is_empty());
+        assert_eq!(content_index.search("haystack", None, 10).unwrap().len(), 1);
+
+        fs::remove_file(&file).unwrap();
+        content_index
+            .update_entry(&mut entries[0], &options, &PlainTextExtractor)
+            .unwrap();
+        assert_eq!(
+            entries[0].content_index_state,
+            ContentIndexState::ReadFailed
+        );
+        assert!(content_index
+            .search("haystack", None, 10)
+            .unwrap()
+            .is_empty());
+
+        let index = SearchIndex::from_entries_with_content_index(entries, content_index);
+        let parser = QueryParser::new(Default::default());
+        let name_results = index.search(&parser.parse("report"));
+
+        assert_eq!(name_results.len(), 1);
+        assert_eq!(name_results[0].title, "report.txt");
     }
 
     fn entry(path: &std::path::Path) -> IndexedEntry {

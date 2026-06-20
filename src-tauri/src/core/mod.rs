@@ -1,4 +1,5 @@
 pub mod actions;
+pub mod compact_index;
 pub mod config;
 pub mod content_index;
 pub mod file_matcher;

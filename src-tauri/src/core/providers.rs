@@ -51,14 +51,14 @@ pub struct FileProvider<'a> {
 
 enum FileProviderIndex<'a> {
     Borrowed(&'a SearchIndex),
-    Owned(SearchIndex),
+    Owned(Box<SearchIndex>),
     Unavailable(String),
 }
 
 impl FileProvider<'static> {
     pub fn new(index: SearchIndex) -> Self {
         Self {
-            index: FileProviderIndex::Owned(index),
+            index: FileProviderIndex::Owned(Box::new(index)),
             candidate_limit: usize::MAX,
         }
     }

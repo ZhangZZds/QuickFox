@@ -127,10 +127,6 @@ impl FileSystemScanner for IgnoreScanner {
                         }
                         report.scan_stats.scanned += 1;
                         if let Some(indexed_entry) = indexed_entry_from_dir_entry(&entry, &root) {
-                            report.scan_events.push(ScanEvent::EntryAccepted {
-                                path: indexed_entry.path.clone(),
-                                kind: indexed_entry.kind.clone(),
-                            });
                             report.entries.push(indexed_entry);
                             report.scan_stats.accepted += 1;
                         } else {
@@ -539,6 +535,40 @@ mod tests {
             .entries
             .iter()
             .any(|entry| entry.name == "ignored.txt"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ignore_scanner_does_not_retain_per_entry_accepted_events() {
+        let root = temp_dir("ignore-bounded-events");
+        for index in 0..64 {
+            fs::write(root.join(format!("file-{index}.md")), "").unwrap();
+        }
+
+        let report = IgnoreScanner::default()
+            .scan(IndexScanPlan {
+                include_roots: vec![root.clone()],
+                stage: Some(IndexScanStage::new("large-root", 10)),
+                ..IndexScanPlan::default()
+            })
+            .unwrap();
+
+        assert_eq!(report.entries.len(), 64);
+        assert_eq!(report.scan_stats.accepted, 64);
+        assert!(!report
+            .scan_events
+            .iter()
+            .any(|event| matches!(event, ScanEvent::EntryAccepted { .. })));
+        assert!(report.scan_events.iter().any(|event| matches!(
+            event,
+            ScanEvent::RootStarted { stage, .. } if stage.as_deref() == Some("large-root")
+        )));
+        assert!(report.scan_events.iter().any(|event| matches!(
+            event,
+            ScanEvent::RootFinished { stage, stats, .. }
+                if stage.as_deref() == Some("large-root") && stats.accepted == 64
+        )));
 
         let _ = fs::remove_dir_all(root);
     }

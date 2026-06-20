@@ -54,6 +54,26 @@
 - 增量刷新后新增/删除文件能反映到搜索结果
 - 存在旧索引快照时，重启后能先使用旧索引搜索，同时后台更新索引
 
+## 大索引性能验收
+
+- 使用发布构建，不使用开发服务器或 debug build
+- 将 name/path 索引范围配置为真实 Windows C/D 多盘大目录，例如 `C:\Users` 和 `D:\`；记录实际磁盘总量、扫描 root 和排除项
+- 等待索引进入 ready 或 refreshing-but-available 状态；记录设置页显示的 entry count、当前 stage、scanned、accepted、skipped、failures
+- 打开任务管理器记录 QuickFox 进程常驻内存；200 万文件级目标小于 500MB，硬上限小于 800MB，超过时必须记录截图和复现配置
+- 在启动器连续输入 `agents.md`，特别观察输入到 `m` 时是否卡顿；录屏中应能看出输入框持续响应、旧搜索结果不会覆盖新输入
+- 查询 `agents.md`、`agents.m`、`agents`、`type:md agents`、`dir:workspace agents`，目标文件应稳定在前 5 个结果内
+- 查询一个不存在的长词，例如 `needle-not-present-987654321`，不应出现明显输入冻结或全量扫描造成的长时间空白
+- 基础 name/path 可用但内容索引仍在准备时，普通查询仍返回结果；`content:` 查询显示内容索引准备中或合理降级
+- 在 Windows 机器上运行 2,000,000 synthetic 阈值命令并保存输出：
+
+```powershell
+cargo test --release --manifest-path src-tauri/Cargo.toml `
+  two_million_entry_search_stays_within_latency_budget `
+  -- --ignored --nocapture
+```
+
+记录 `QUICKFOX_LARGE_INDEX_THRESHOLD` 输出、任务管理器内存截图、`agents.md` 输入录屏和结果截图。若无法在当轮执行，应在 issue 或 QA 记录中明确标注为待验收，不得将其等同于已通过。
+
 ## 命令执行
 
 - `>` 查询能进入命令预览
@@ -84,5 +104,8 @@
 
 - Windows 版本
 - 终端版本
+- QuickFox 构建类型和 commit
+- 索引 entry count、扫描 roots、磁盘规模和任务管理器内存
+- `QUICKFOX_LARGE_INDEX_THRESHOLD` 或未运行原因
 - 复现步骤
 - 预期行为与实际行为

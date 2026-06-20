@@ -508,7 +508,7 @@ export function App({
         });
     };
 
-    if (indexSearchRevision > 0 || shouldSearchImmediately(query, webSearchEnginesRef.current)) {
+    if (shouldSearchImmediately(query, webSearchEnginesRef.current)) {
       runSearch();
       return () => {
         cancelled = true;
