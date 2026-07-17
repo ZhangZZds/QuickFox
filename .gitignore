@@ -1,5 +1,6 @@
 .DS_Store
 .superpowers/
+.worktrees/
 .tmp-*/
 
 node_modules/
@@ -17,4 +18,3 @@ src-tauri/gen/
 .env
 .env.*
 !.env.example
-
