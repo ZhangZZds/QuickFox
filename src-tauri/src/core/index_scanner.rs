@@ -303,7 +303,7 @@ struct AncestorIgnoreEvaluator<'a, P: ?Sized, C> {
     is_cancelled: &'a C,
     dot_ignore: Vec<Gitignore>,
     git_ignore: Vec<Gitignore>,
-    git_exclude: Option<Gitignore>,
+    git_exclude: Vec<Gitignore>,
     global: Option<Gitignore>,
 }
 
@@ -318,7 +318,7 @@ where
             is_cancelled,
             dot_ignore: Vec::new(),
             git_ignore: Vec::new(),
-            git_exclude: None,
+            git_exclude: Vec::new(),
             global: None,
         }
     }
@@ -382,7 +382,9 @@ where
         }
         let git_dir = directory.join(".git");
         if self.probe.is_directory(&git_dir)? {
-            self.git_exclude = self.load_matcher(directory, &git_dir.join("info/exclude"))?;
+            if let Some(matcher) = self.load_matcher(directory, &git_dir.join("info/exclude"))? {
+                self.git_exclude.push(matcher);
+            }
         }
         if let Some(matcher) = self.load_matcher(directory, &directory.join(".gitignore"))? {
             self.git_ignore.push(matcher);
@@ -427,12 +429,7 @@ where
     fn decision(&self, path: &Path, is_dir: bool) -> IgnoreDecision {
         first_match(&self.dot_ignore, path, is_dir)
             .or_else(|| first_match(&self.git_ignore, path, is_dir))
-            .or_else(|| {
-                self.git_exclude
-                    .as_ref()
-                    .map(|matcher| matcher_decision(matcher, path, is_dir))
-                    .filter(|decision| *decision != IgnoreDecision::None)
-            })
+            .or_else(|| first_match(&self.git_exclude, path, is_dir))
             .or_else(|| {
                 self.global
                     .as_ref()

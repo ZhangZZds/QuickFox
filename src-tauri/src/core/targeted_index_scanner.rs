@@ -1044,6 +1044,26 @@ mod tests {
     }
 
     #[test]
+    fn targeted_file_falls_back_to_matching_outer_repo_exclude() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path();
+        fs::create_dir_all(repo.join(".git/info")).unwrap();
+        fs::write(
+            repo.join(".git/info/exclude"),
+            "workspace/nested/outer-only.md\n",
+        )
+        .unwrap();
+        let root = repo.join("workspace");
+        let nested = root.join("nested");
+        fs::create_dir_all(nested.join(".git/info")).unwrap();
+        fs::write(nested.join(".git/info/exclude"), "inner-only.md\n").unwrap();
+        let file = nested.join("outer-only.md");
+        fs::write(&file, "ignored by outer repo").unwrap();
+
+        assert_targeted_file_matches_full_scan(&root, &file, false);
+    }
+
+    #[test]
     fn targeted_file_matches_gitignore_above_configured_root() {
         let temp = TempDir::new().unwrap();
         let repo = temp.path();
