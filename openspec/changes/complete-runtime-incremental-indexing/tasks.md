@@ -13,11 +13,11 @@
 
 ## 3. Targeted scanner 与目录清单
 
-- [ ] 3.1 按 TDD 实现单文件 create/write、remove 和 rename 的 targeted scan 操作，并复用现有包含/排除规则
-- [ ] 3.2 按 TDD 实现新建目录的局部子树扫描以及删除目录的 subtree tombstone
+- [x] 3.1 按 TDD 实现单文件 create/write、remove 和 rename 的 targeted scan 操作，并复用现有包含/排除规则
+- [x] 3.2 按 TDD 实现新建目录的局部子树扫描以及删除目录的 subtree tombstone
 - [ ] 3.3 为 SQLite 增加 directory manifest schema、迁移和 repository API，保存目录指纹及父子关系
-- [ ] 3.4 按 TDD 实现 manifest 校准：检查已知目录指纹，只枚举变化目录，并生成新增、变化和缺失 delta
-- [ ] 3.5 验证部分权限失败保留未确认删除的 baseline entry，并继续校准其他目录
+- [x] 3.4 按 TDD 实现 manifest 校准：检查已知目录指纹，只枚举变化目录，并生成新增、变化和缺失 delta
+- [x] 3.5 验证部分权限失败保留未确认删除的 baseline entry，并继续校准其他目录
 
 ## 4. Baseline、Overlay 与 Tombstone 查询
 

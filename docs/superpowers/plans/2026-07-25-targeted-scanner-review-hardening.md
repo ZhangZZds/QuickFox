@@ -133,7 +133,7 @@ cargo test --manifest-path src-tauri/Cargo.toml targeted_batch_reuses_ancestor_i
 
 Expected: 当前每个 path 重建 evaluator，读取次数约为 `N * depth`。
 
-- [ ] **Step 3: 最小实现并确认 GREEN**
+- [x] **Step 3: 最小实现并确认 GREEN**
 
 增加 batch 生命周期 cache：按 directory 缓存 `.git` stat，按 `(matcher_root, ignore_file)` 缓存已编译 `Option<Gitignore>`。`TargetedIndexScanner` 先按 configured root 分组，每个 root 使用一个 batch scanner。单文件 ignore 通过后直接由 metadata 构造 entry，不启动第二个 `WalkBuilder`；目录仍使用 subtree walker。
 
