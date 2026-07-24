@@ -48,6 +48,7 @@ pub struct IncrementalRuntimeState {
 pub struct IncrementalRecoveryBaseline {
     pub entries: Vec<IndexedEntry>,
     pub generation: u64,
+    pub available: bool,
 }
 
 #[derive(Debug)]
@@ -518,6 +519,7 @@ impl SqliteStorage {
             params![root],
         )?;
         upsert_manifest_rows(&transaction, rows, self.comparison_mode)?;
+        validate_persisted_manifest_tree(&transaction, self.comparison_mode)?;
         transaction.commit()?;
         Ok(())
     }
@@ -927,6 +929,7 @@ impl SqliteStorage {
             return Ok(IncrementalRecoveryBaseline {
                 entries: Vec::new(),
                 generation: 0,
+                available: false,
             });
         };
         let completed_at_ms = self
@@ -945,6 +948,29 @@ impl SqliteStorage {
         Ok(IncrementalRecoveryBaseline {
             entries: self.load_index_snapshot(batch_id, completed_at_ms)?.entries,
             generation,
+            available: true,
+        })
+    }
+
+    pub fn latest_completed_recovery_baseline(
+        &self,
+    ) -> Result<IncrementalRecoveryBaseline, StorageError> {
+        let Some(batch_id) = self.latest_index_batch_id()? else {
+            return Ok(IncrementalRecoveryBaseline {
+                entries: Vec::new(),
+                generation: 0,
+                available: false,
+            });
+        };
+        let completed_at_ms = self.connection.query_row(
+            "SELECT completed_at_ms FROM index_batches WHERE id = ?1",
+            params![batch_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(IncrementalRecoveryBaseline {
+            entries: self.load_index_snapshot(batch_id, completed_at_ms)?.entries,
+            generation: 0,
+            available: true,
         })
     }
 
@@ -1930,6 +1956,41 @@ mod tests {
     }
 
     #[test]
+    fn recovery_reads_legacy_baseline_before_incompatible_runtime_state() {
+        let path = temp_db_path("runtime-state-missing-generation");
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute_batch(
+                    r#"
+                    PRAGMA user_version = 3;
+                    CREATE TABLE index_runtime_state (
+                        singleton INTEGER PRIMARY KEY,
+                        active_baseline_id INTEGER,
+                        last_generation INTEGER NOT NULL
+                    );
+                    "#,
+                )
+                .unwrap();
+        }
+        let storage = SqliteStorage::open(path.clone()).unwrap();
+        storage
+            .save_completed_index_batch(10, &[indexed_entry("/root/legacy.md")])
+            .unwrap();
+
+        let recovery = crate::core::index_journal::recover_layered_index(&storage);
+
+        assert_eq!(recovery.baseline_entry_count(), 1);
+        assert_eq!(
+            recovery.degradation_code(),
+            Some(crate::core::index_journal::IndexDegradationCode::JournalReplayFailed)
+        );
+
+        drop(storage);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn committed_deltas_round_trip_in_generation_order_and_duplicate_commit_is_idempotent() {
         let path = temp_db_path("delta-order");
         let storage = SqliteStorage::open(path.clone()).unwrap();
@@ -2054,6 +2115,40 @@ mod tests {
         ));
         assert!(storage
             .directory_manifest_for_root(Path::new("/root"))
+            .unwrap()
+            .is_empty());
+
+        drop(storage);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn overlapping_root_replace_rolls_back_when_it_orphans_existing_rows() {
+        let path = temp_db_path("overlapping-root-replace-rollback");
+        let storage = SqliteStorage::open(path.clone()).unwrap();
+        let original = vec![
+            fingerprint("/outer", None, "/outer", 1),
+            fingerprint("/outer/nested", Some("/outer"), "/outer", 2),
+            fingerprint("/outer/nested/leaf", Some("/outer/nested"), "/outer", 3),
+        ];
+        storage
+            .replace_directory_manifest(Path::new("/outer"), &original)
+            .unwrap();
+
+        let takeover = storage.replace_directory_manifest(
+            Path::new("/outer/nested"),
+            &[fingerprint("/outer/nested", None, "/outer/nested", 20)],
+        );
+
+        assert!(matches!(takeover, Err(StorageError::InvalidJournal(_))));
+        assert_eq!(
+            storage
+                .directory_manifest_for_root(Path::new("/outer"))
+                .unwrap(),
+            original
+        );
+        assert!(storage
+            .directory_manifest_for_root(Path::new("/outer/nested"))
             .unwrap()
             .is_empty());
 

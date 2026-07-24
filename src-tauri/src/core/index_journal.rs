@@ -37,11 +37,16 @@ pub struct IndexRecovery {
     pub degradation: Option<IndexDegradationCode>,
     pub fallback_reason: Option<IndexFallbackReason>,
     baseline_entry_count: usize,
+    baseline_available: bool,
 }
 
 impl IndexRecovery {
     pub fn baseline_entry_count(&self) -> usize {
         self.baseline_entry_count
+    }
+
+    pub fn baseline_available(&self) -> bool {
+        self.baseline_available
     }
 
     pub fn degradation_code(&self) -> Option<IndexDegradationCode> {
@@ -57,6 +62,8 @@ pub trait IndexJournalRepository {
     fn incremental_schema_is_ready(&self) -> Result<bool, String>;
 
     fn incremental_recovery_baseline(&self) -> Result<IncrementalRecoveryBaseline, String>;
+
+    fn latest_completed_recovery_baseline(&self) -> Result<IncrementalRecoveryBaseline, String>;
 
     fn validate_directory_manifest(&self) -> Result<(), String>;
 
@@ -107,6 +114,10 @@ impl IndexJournalRepository for SqliteStorage {
 
     fn incremental_recovery_baseline(&self) -> Result<IncrementalRecoveryBaseline, String> {
         SqliteStorage::incremental_recovery_baseline(self).map_err(|error| error.to_string())
+    }
+
+    fn latest_completed_recovery_baseline(&self) -> Result<IncrementalRecoveryBaseline, String> {
+        SqliteStorage::latest_completed_recovery_baseline(self).map_err(|error| error.to_string())
     }
 
     fn validate_directory_manifest(&self) -> Result<(), String> {
@@ -212,31 +223,56 @@ pub fn replay_deltas(
 }
 
 pub fn recover_layered_index(repository: &(impl IndexJournalRepository + ?Sized)) -> IndexRecovery {
-    let baseline = match repository.incremental_recovery_baseline() {
+    let legacy_baseline = match repository.latest_completed_recovery_baseline() {
         Ok(baseline) => baseline,
         Err(_) => {
-            return failed_recovery(Vec::new(), 0, 0);
+            return failed_recovery(Vec::new(), 0, 0, false);
         }
     };
-    let baseline_generation = baseline.generation;
-    let baseline = baseline.entries;
-    let baseline_entry_count = baseline.len();
     match repository.incremental_schema_is_ready() {
         Ok(true) => {}
         Ok(false) | Err(_) => {
-            return failed_recovery(baseline, baseline_generation, baseline_entry_count);
+            let baseline_entry_count = legacy_baseline.entries.len();
+            return failed_recovery(
+                legacy_baseline.entries,
+                legacy_baseline.generation,
+                baseline_entry_count,
+                legacy_baseline.available,
+            );
         }
     }
+    let baseline = match repository.incremental_recovery_baseline() {
+        Ok(baseline) => baseline,
+        Err(_) => {
+            let baseline_entry_count = legacy_baseline.entries.len();
+            return failed_recovery(
+                legacy_baseline.entries,
+                legacy_baseline.generation,
+                baseline_entry_count,
+                legacy_baseline.available,
+            );
+        }
+    };
+    if !baseline.available {
+        return unavailable_recovery();
+    }
+    let baseline_generation = baseline.generation;
+    let baseline = baseline.entries;
+    let baseline_entry_count = baseline.len();
     if repository.validate_directory_manifest().is_err() {
         return failed_manifest_recovery(baseline, baseline_generation, baseline_entry_count);
     }
     let deltas = match repository.committed_index_deltas_after(baseline_generation) {
         Ok(deltas) => deltas,
-        Err(_) => return failed_recovery(baseline, baseline_generation, baseline_entry_count),
+        Err(_) => {
+            return failed_recovery(baseline, baseline_generation, baseline_entry_count, true);
+        }
     };
     let deltas = match ordered_unique_deltas(&deltas) {
         Ok(deltas) => deltas,
-        Err(_) => return failed_recovery(baseline, baseline_generation, baseline_entry_count),
+        Err(_) => {
+            return failed_recovery(baseline, baseline_generation, baseline_entry_count, true);
+        }
     };
     let mut index = LayeredSearchIndex::default();
     index.replace_baseline(baseline, baseline_generation);
@@ -248,6 +284,17 @@ pub fn recover_layered_index(repository: &(impl IndexJournalRepository + ?Sized)
         degradation: None,
         fallback_reason: None,
         baseline_entry_count,
+        baseline_available: true,
+    }
+}
+
+fn unavailable_recovery() -> IndexRecovery {
+    IndexRecovery {
+        index: LayeredSearchIndex::default(),
+        degradation: None,
+        fallback_reason: None,
+        baseline_entry_count: 0,
+        baseline_available: false,
     }
 }
 
@@ -255,11 +302,13 @@ fn failed_recovery(
     baseline: Vec<IndexedEntry>,
     baseline_generation: u64,
     baseline_entry_count: usize,
+    baseline_available: bool,
 ) -> IndexRecovery {
     baseline_only_recovery(
         baseline,
         baseline_generation,
         baseline_entry_count,
+        baseline_available,
         IndexDegradationCode::JournalReplayFailed,
         IndexFallbackReason::JournalRecoveryFailed,
     )
@@ -274,6 +323,7 @@ fn failed_manifest_recovery(
         baseline,
         baseline_generation,
         baseline_entry_count,
+        true,
         IndexDegradationCode::CalibrationFailed,
         IndexFallbackReason::FullRefreshFallback,
     )
@@ -283,6 +333,7 @@ fn baseline_only_recovery(
     baseline: Vec<IndexedEntry>,
     baseline_generation: u64,
     baseline_entry_count: usize,
+    baseline_available: bool,
     degradation: IndexDegradationCode,
     fallback_reason: IndexFallbackReason,
 ) -> IndexRecovery {
@@ -293,6 +344,7 @@ fn baseline_only_recovery(
         degradation: Some(degradation),
         fallback_reason: Some(fallback_reason),
         baseline_entry_count,
+        baseline_available,
     }
 }
 
@@ -415,6 +467,56 @@ mod tests {
             search_titles(&recovery.index, "baseline"),
             vec!["baseline.md"]
         );
+
+        drop(storage);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn journal_without_completed_baseline_stays_unavailable_and_unreplayed() {
+        let path = temp_db_path("journal-without-baseline");
+        let storage = SqliteStorage::open(path.clone()).unwrap();
+        storage
+            .commit_incremental_batch(
+                &delta(1, entry("/root/orphan-journal.md"), Vec::new()),
+                &[],
+                &[],
+            )
+            .unwrap();
+
+        let recovery = recover_layered_index(&storage);
+
+        assert!(!recovery.baseline_available());
+        assert_eq!(recovery.baseline_entry_count(), 0);
+        assert!(search_titles(&recovery.index, "orphan-journal").is_empty());
+        assert_eq!(recovery.index.generation(), 0);
+
+        drop(storage);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn completed_empty_baseline_is_available_and_replays_journal() {
+        let path = temp_db_path("completed-empty-baseline");
+        let storage = SqliteStorage::open(path.clone()).unwrap();
+        storage.save_completed_index_batch(10, &[]).unwrap();
+        storage
+            .commit_incremental_batch(
+                &delta(1, entry("/root/from-journal.md"), Vec::new()),
+                &[],
+                &[],
+            )
+            .unwrap();
+
+        let recovery = recover_layered_index(&storage);
+
+        assert!(recovery.baseline_available());
+        assert_eq!(recovery.baseline_entry_count(), 0);
+        assert_eq!(
+            search_titles(&recovery.index, "from-journal"),
+            vec!["from-journal.md"]
+        );
+        assert_eq!(recovery.index.generation(), 1);
 
         drop(storage);
         let _ = fs::remove_file(path);
