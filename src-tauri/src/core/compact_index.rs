@@ -508,6 +508,31 @@ impl CompactCandidateIndex {
             .filter_map(|id| self.table.path_by_id(id).map(str::to_owned))
             .collect()
     }
+
+    pub fn estimated_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(self.table.estimated_bytes())
+            .saturating_add(string_ids_map_bytes(&self.name_tokens.ids_by_token))
+            .saturating_add(string_ids_map_bytes(&self.prefixes.ids_by_prefix))
+            .saturating_add(string_ids_map_bytes(&self.name_trigrams.ids_by_trigram))
+            .saturating_add(string_ids_map_bytes(&self.extensions.ids_by_extension))
+            .saturating_add(string_ids_map_bytes(&self.path_segments.ids_by_segment))
+            .saturating_add(string_ids_map_bytes(&self.path_segments.ids_by_prefix))
+            .saturating_add(string_ids_map_bytes(&self.path_segments.ids_by_fuzzy_key))
+            .saturating_add(exact_path_map_bytes(&self.exact_paths.id_by_path))
+    }
+}
+
+impl EntryTable {
+    fn estimated_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(
+                self.entries
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<CompactEntry>()),
+            )
+            .saturating_add(self.strings.estimated_bytes())
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -546,6 +571,50 @@ impl StringPool {
     pub fn total_bytes(&self) -> usize {
         self.total_bytes
     }
+
+    fn estimated_bytes(&self) -> usize {
+        let value_bytes: usize = self.values.iter().map(String::capacity).sum();
+        let map_key_bytes: usize = self.ids_by_value.keys().map(String::capacity).sum();
+        std::mem::size_of::<Self>()
+            .saturating_add(
+                self.values
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<String>()),
+            )
+            .saturating_add(value_bytes)
+            .saturating_add(self.ids_by_value.capacity().saturating_mul(
+                std::mem::size_of::<String>().saturating_add(std::mem::size_of::<StringId>()),
+            ))
+            .saturating_add(map_key_bytes)
+    }
+}
+
+fn string_ids_map_bytes(map: &BTreeMap<String, Vec<EntryId>>) -> usize {
+    let payload: usize = map
+        .iter()
+        .map(|(key, ids)| {
+            key.capacity()
+                .saturating_add(
+                    ids.capacity()
+                        .saturating_mul(std::mem::size_of::<EntryId>()),
+                )
+                .saturating_add(std::mem::size_of::<(String, Vec<EntryId>)>())
+                .saturating_add(std::mem::size_of::<usize>().saturating_mul(3))
+        })
+        .sum();
+    std::mem::size_of::<BTreeMap<String, Vec<EntryId>>>().saturating_add(payload)
+}
+
+fn exact_path_map_bytes(map: &BTreeMap<String, EntryId>) -> usize {
+    let payload: usize = map
+        .keys()
+        .map(|key| {
+            key.capacity()
+                .saturating_add(std::mem::size_of::<(String, EntryId)>())
+                .saturating_add(std::mem::size_of::<usize>().saturating_mul(3))
+        })
+        .sum();
+    std::mem::size_of::<BTreeMap<String, EntryId>>().saturating_add(payload)
 }
 
 fn intern_non_empty(pool: &mut StringPool, value: String) -> Option<StringId> {

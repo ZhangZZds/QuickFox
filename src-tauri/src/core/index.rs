@@ -45,9 +45,12 @@ impl IndexScanner {
 #[derive(Debug, Default)]
 pub struct SearchIndex {
     entries: Vec<IndexedEntry>,
+    entry_index_by_path: HashMap<String, usize>,
     search_texts: Vec<String>,
     compact_candidates: CompactCandidateIndex,
     content_index: Option<ContentIndex>,
+    #[cfg(test)]
+    content_entry_lookup_probe_count: AtomicUsize,
 }
 
 pub trait FileSearchIndex: Send + Sync {
@@ -61,6 +64,8 @@ pub struct SearchIndexMemoryEstimate {
     pub entry_struct_bytes: usize,
     pub entry_string_bytes: usize,
     pub cached_search_text_bytes: usize,
+    pub compact_candidate_bytes: usize,
+    pub path_lookup_bytes: usize,
 }
 
 impl Clone for SearchIndex {
@@ -70,22 +75,32 @@ impl Clone for SearchIndex {
 
         Self {
             entries: self.entries.clone(),
+            entry_index_by_path: self.entry_index_by_path.clone(),
             search_texts: self.search_texts.clone(),
             compact_candidates: self.compact_candidates.clone(),
             content_index: self.content_index.clone(),
+            #[cfg(test)]
+            content_entry_lookup_probe_count: AtomicUsize::new(
+                self.content_entry_lookup_probe_count
+                    .load(Ordering::Relaxed),
+            ),
         }
     }
 }
 
 impl SearchIndex {
     pub fn from_entries(entries: Vec<IndexedEntry>) -> Self {
+        let entry_index_by_path = build_entry_path_lookup(&entries);
         let search_texts = entries.iter().map(searchable_text).collect();
         let compact_candidates = CompactCandidateIndex::from_entries(entries.clone());
         Self {
             entries,
+            entry_index_by_path,
             search_texts,
             compact_candidates,
             content_index: None,
+            #[cfg(test)]
+            content_entry_lookup_probe_count: AtomicUsize::new(0),
         }
     }
 
@@ -93,13 +108,17 @@ impl SearchIndex {
         entries: Vec<IndexedEntry>,
         content_index: ContentIndex,
     ) -> Self {
+        let entry_index_by_path = build_entry_path_lookup(&entries);
         let search_texts = entries.iter().map(searchable_text).collect();
         let compact_candidates = CompactCandidateIndex::from_entries(entries.clone());
         Self {
             entries,
+            entry_index_by_path,
             search_texts,
             compact_candidates,
             content_index: Some(content_index),
+            #[cfg(test)]
+            content_entry_lookup_probe_count: AtomicUsize::new(0),
         }
     }
 
@@ -112,10 +131,18 @@ impl SearchIndex {
             entry_count: self.entries.len(),
             entry_struct_bytes: self
                 .entries
-                .len()
+                .capacity()
                 .saturating_mul(std::mem::size_of::<IndexedEntry>()),
             entry_string_bytes: self.entries.iter().map(indexed_entry_string_bytes).sum(),
-            cached_search_text_bytes: self.search_texts.iter().map(String::len).sum(),
+            cached_search_text_bytes: self.search_texts.iter().map(String::capacity).sum(),
+            compact_candidate_bytes: self.compact_candidates.estimated_bytes(),
+            path_lookup_bytes: std::mem::size_of::<HashMap<String, usize>>()
+                .saturating_add(self.entry_index_by_path.keys().map(String::capacity).sum())
+                .saturating_add(
+                    self.entry_index_by_path
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<(String, usize)>()),
+                ),
         }
     }
 
@@ -132,6 +159,26 @@ impl SearchIndex {
     #[cfg(test)]
     pub(crate) fn compact_build_id(&self) -> usize {
         self.compact_candidates.build_id()
+    }
+
+    #[cfg(test)]
+    fn reset_content_query_probe_count(&self) {
+        self.content_entry_lookup_probe_count
+            .store(0, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn content_entry_lookup_probe_count(&self) -> usize {
+        self.content_entry_lookup_probe_count
+            .load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn last_content_collector_limit(&self) -> usize {
+        self.content_index
+            .as_ref()
+            .map(ContentIndex::last_collector_limit)
+            .unwrap_or_default()
     }
 
     pub fn refresh_with_scanner(
@@ -221,6 +268,7 @@ impl SearchIndex {
                 .cmp(&right.path)
                 .then_with(|| left.name.cmp(&right.name))
         });
+        self.entry_index_by_path = build_entry_path_lookup(&self.entries);
         self.search_texts = self.entries.iter().map(searchable_text).collect();
         self.compact_candidates = CompactCandidateIndex::from_entries(self.entries.clone());
     }
@@ -270,6 +318,7 @@ impl SearchIndex {
     }
 
     fn replace_entries(&mut self, entries: Vec<IndexedEntry>) {
+        self.entry_index_by_path = build_entry_path_lookup(&entries);
         self.search_texts = entries.iter().map(searchable_text).collect();
         self.compact_candidates = CompactCandidateIndex::from_entries(entries.clone());
         self.entries = entries;
@@ -344,11 +393,7 @@ impl SearchIndex {
         if is_cancelled() {
             return None;
         }
-        let content_hits = self.search_content_hits(
-            &parsed_query,
-            Some(candidate_paths),
-            self.entries.len().max(limit),
-        );
+        let content_hits = self.search_content_hits(&parsed_query, Some(candidate_paths), limit);
         let hit_by_path: HashMap<_, _> = content_hits
             .into_iter()
             .map(|hit| (hit.path.clone(), hit))
@@ -393,22 +438,22 @@ impl SearchIndex {
             let hidden_paths = Arc::new(hidden_paths);
             Some(Arc::new(move |path: &str| !hidden_paths.contains(path)) as ContentPathFilter)
         };
-        let hits =
-            self.search_content_hits_with_filter(query, path_filter, self.entries.len().max(limit));
-        let entry_by_path: HashMap<_, _> = self
-            .entries
-            .iter()
-            .map(|entry| (entry.path.as_str(), entry))
-            .collect();
+        let hits = self.search_content_hits_with_filter(query, path_filter, limit);
         let mut results: Vec<_> = hits
             .into_iter()
             .filter_map(|hit| {
                 let score = content_score(&hit);
-                entry_by_path.get(hit.path.as_str()).map(|entry| {
-                    entry_to_result(entry)
-                        .with_snippet(hit.snippet)
-                        .with_score(score)
-                })
+                #[cfg(test)]
+                self.content_entry_lookup_probe_count
+                    .fetch_add(1, Ordering::Relaxed);
+                self.entry_index_by_path
+                    .get(&hit.path)
+                    .and_then(|index| self.entries.get(*index))
+                    .map(|entry| {
+                        entry_to_result(entry)
+                            .with_snippet(hit.snippet)
+                            .with_score(score)
+                    })
             })
             .collect();
         results.sort_by(|left, right| {
@@ -514,17 +559,25 @@ fn searchable_text(entry: &IndexedEntry) -> String {
     }
 }
 
+fn build_entry_path_lookup(entries: &[IndexedEntry]) -> HashMap<String, usize> {
+    entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| (entry.path.clone(), index))
+        .collect()
+}
+
 fn indexed_entry_string_bytes(entry: &IndexedEntry) -> usize {
-    entry.path.len()
-        + entry.name.len()
-        + entry.parent.len()
+    entry.path.capacity()
+        + entry.name.capacity()
+        + entry.parent.capacity()
         + entry
             .extension
             .as_ref()
-            .map(String::len)
+            .map(String::capacity)
             .unwrap_or_default()
-        + entry.root.len()
-        + entry.search_text.len()
+        + entry.root.capacity()
+        + entry.search_text.capacity()
 }
 
 fn snapshot_metadata_matches(previous: &IndexedEntry, scanned: &IndexedEntry) -> bool {
@@ -1443,6 +1496,7 @@ mod tests {
     fn content_only_visibility_filter_precedes_tantivy_top_docs_cutoff() {
         let (_workspace, index) = large_visibility_content_fixture("content-only-top-docs");
         let parser = crate::core::search::QueryParser::new(Default::default());
+        index.reset_content_query_probe_count();
 
         let results =
             index.search_with_limit_visible(&parser.parse("content:needle"), 1, |entry| {
@@ -1451,12 +1505,15 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].title, "shared-visible.md");
+        assert_eq!(index.last_content_collector_limit(), 10);
+        assert_eq!(index.content_entry_lookup_probe_count(), 1);
     }
 
     #[test]
     fn mixed_content_visibility_filter_precedes_tantivy_top_docs_cutoff() {
         let (_workspace, index) = large_visibility_content_fixture("mixed-top-docs");
         let parser = crate::core::search::QueryParser::new(Default::default());
+        index.reset_content_query_probe_count();
 
         let results =
             index.search_with_limit_visible(&parser.parse("shared content:needle"), 1, |entry| {
@@ -1465,6 +1522,8 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].title, "shared-visible.md");
+        assert_eq!(index.last_content_collector_limit(), 10);
+        assert_eq!(index.content_entry_lookup_probe_count(), 0);
     }
 
     #[test]

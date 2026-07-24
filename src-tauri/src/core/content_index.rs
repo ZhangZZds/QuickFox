@@ -7,6 +7,9 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tantivy::collector::{BytesFilterCollector, TopDocs};
 use tantivy::query::QueryParser;
 use tantivy::schema::{Field, Schema, Value, FAST, STORED, STRING, TEXT};
@@ -43,6 +46,8 @@ pub struct ContentIndex {
     path_field: Field,
     path_filter_field: Field,
     content_field: Field,
+    #[cfg(test)]
+    last_collector_limit: Arc<AtomicUsize>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -170,6 +175,8 @@ impl ContentIndex {
             path_field,
             path_filter_field,
             content_field,
+            #[cfg(test)]
+            last_collector_limit: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -212,6 +219,9 @@ impl ContentIndex {
         let parser = QueryParser::for_index(&self.index, vec![self.content_field]);
         let query = parser.parse_query(content_query)?;
         let tantivy_limit = limit.saturating_mul(4).clamp(10, 10_000);
+        #[cfg(test)]
+        self.last_collector_limit
+            .store(tantivy_limit, Ordering::Relaxed);
         let top_docs = if let Some(path_filter) = path_filter {
             let collector = BytesFilterCollector::new(
                 PATH_FILTER_FIELD_NAME.to_owned(),
@@ -311,6 +321,11 @@ impl ContentIndex {
             resident_document_count: 0,
             resident_cached_content_bytes: 0,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_collector_limit(&self) -> usize {
+        self.last_collector_limit.load(Ordering::Relaxed)
     }
 }
 
