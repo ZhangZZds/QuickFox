@@ -6,8 +6,8 @@
 
 ## 2. 有界 watcher 事件协调器
 
-- [ ] 2.1 按 TDD 让 `RuntimeIndexWatcher` 返回可持续消费的 receiver，并支持 8192 容量的非阻塞事件通道
-- [ ] 2.2 按 TDD 实现 5 秒静默窗口、10 秒硬上限和 create/write/remove/rename 的确定性批次折叠
+- [x] 2.1 按 TDD 让 `RuntimeIndexWatcher` 返回可持续消费的 receiver，并支持 8192 容量的非阻塞事件通道
+- [x] 2.2 按 TDD 实现 5 秒静默窗口、10 秒硬上限和 create/write/remove/rename 的确定性批次折叠
 - [ ] 2.3 按 TDD 实现 channel overflow、平台 overflow 和 watcher failure 的 dirty-root 标记与结构化失败 code
 - [ ] 2.4 实现 coordinator 生命周期、取消和关闭，验证保存配置、刷新和应用退出不会泄漏 watcher 线程
 
