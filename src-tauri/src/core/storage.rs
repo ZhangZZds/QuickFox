@@ -2,13 +2,15 @@
 
 use crate::core::index::{IndexedEntry, IndexedEntryKind};
 use crate::core::index_entry::{
-    build_search_text, normalize_path_key, normalize_path_text_key, ContentIndexState,
+    build_search_text, normalize_path_key_for_mode, normalize_path_text_key_for_mode,
+    ContentIndexState, PathComparisonMode,
 };
 use crate::core::layered_index::CommittedIndexDelta;
 use crate::core::targeted_index_scanner::{
     DirectoryFingerprint, FileSystemEntryKind, KnownIndexedChild,
 };
 use rusqlite::{params, Connection, OptionalExtension};
+use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -36,6 +38,8 @@ pub struct IndexSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IncrementalRuntimeState {
+    pub active_baseline_id: Option<i64>,
+    pub baseline_generation: u64,
     pub last_generation: u64,
     pub degradation_code: Option<String>,
     pub baseline_refresh_reason: Option<String>,
@@ -82,16 +86,27 @@ impl std::error::Error for StorageError {
 
 pub struct SqliteStorage {
     connection: Connection,
+    comparison_mode: PathComparisonMode,
 }
 
 impl SqliteStorage {
     pub fn open(path: PathBuf) -> Result<Self, StorageError> {
+        Self::open_with_comparison_mode(path, PathComparisonMode::native())
+    }
+
+    pub(crate) fn open_with_comparison_mode(
+        path: PathBuf,
+        comparison_mode: PathComparisonMode,
+    ) -> Result<Self, StorageError> {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
         let connection = Connection::open(path)?;
         connection.pragma_update(None, "foreign_keys", true)?;
-        let storage = Self { connection };
+        let storage = Self {
+            connection,
+            comparison_mode,
+        };
         storage.migrate()?;
         Ok(storage)
     }
@@ -146,7 +161,8 @@ impl SqliteStorage {
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 generation INTEGER NOT NULL UNIQUE,
                 status TEXT NOT NULL CHECK (status IN ('pending', 'committed')),
-                committed_at INTEGER NOT NULL
+                committed_at_ms INTEGER NOT NULL,
+                payload_hash TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS index_delta_entries (
@@ -175,19 +191,23 @@ impl SqliteStorage {
             CREATE INDEX IF NOT EXISTS idx_index_directory_manifest_parent
                 ON index_directory_manifest(parent);
 
-            CREATE TABLE IF NOT EXISTS runtime_state (
+            CREATE TABLE IF NOT EXISTS index_runtime_state (
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                active_baseline_id INTEGER,
+                baseline_generation INTEGER NOT NULL,
                 last_generation INTEGER NOT NULL,
                 degradation_code TEXT,
-                baseline_refresh_reason TEXT
+                baseline_refresh_reason TEXT,
+                FOREIGN KEY (active_baseline_id) REFERENCES index_batches(id) ON DELETE SET NULL
             );
             "#,
         )?;
         Self::ensure_index_entry_metadata_columns(&transaction)?;
+        Self::backfill_index_entry_keys(&transaction, self.comparison_mode)?;
         transaction.execute_batch(
             r#"
             CREATE INDEX IF NOT EXISTS idx_index_entries_batch_root_parent
-                ON index_entries(batch_id, root, parent);
+                ON index_entries(batch_id, root_key, parent_key);
             "#,
         )?;
         let user_version: i64 =
@@ -209,6 +229,9 @@ impl SqliteStorage {
             ("modified_ms", "INTEGER"),
             ("size_bytes", "INTEGER"),
             ("content_index_state", "TEXT"),
+            ("path_key", "TEXT"),
+            ("root_key", "TEXT"),
+            ("parent_key", "TEXT"),
         ];
         for (name, sql_type) in columns {
             if !existing.contains(&name.to_owned()) {
@@ -221,20 +244,119 @@ impl SqliteStorage {
         Ok(())
     }
 
+    fn backfill_index_entry_keys(
+        connection: &Connection,
+        mode: PathComparisonMode,
+    ) -> Result<(), StorageError> {
+        let mut statement = connection.prepare(
+            r#"
+            SELECT rowid, path, COALESCE(root, ''), COALESCE(parent, '')
+            FROM index_entries
+            WHERE path_key IS NULL OR root_key IS NULL OR parent_key IS NULL
+            "#,
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut entries = Vec::new();
+        for row in rows {
+            entries.push(row?);
+        }
+        drop(statement);
+        let mut update = connection.prepare(
+            "UPDATE index_entries SET path_key = ?1, root_key = ?2, parent_key = ?3 WHERE rowid = ?4",
+        )?;
+        for (row_id, path, root, parent) in entries {
+            update.execute(params![
+                normalize_path_text_key_for_mode(&path, mode),
+                normalize_path_text_key_for_mode(&root, mode),
+                normalize_path_text_key_for_mode(&parent, mode),
+                row_id,
+            ])?;
+        }
+        Ok(())
+    }
+
     pub fn incremental_schema_is_ready(&self) -> Result<bool, StorageError> {
-        const REQUIRED_TABLES: [&str; 4] = [
-            "index_delta_batches",
-            "index_delta_entries",
-            "index_directory_manifest",
-            "runtime_state",
+        let user_version: i64 =
+            self.connection
+                .pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if user_version < 3 {
+            return Ok(false);
+        }
+        let required_tables = [
+            ("index_entries", &["path_key", "root_key", "parent_key"][..]),
+            (
+                "index_delta_batches",
+                &[
+                    "id",
+                    "generation",
+                    "status",
+                    "committed_at_ms",
+                    "payload_hash",
+                ][..],
+            ),
+            (
+                "index_delta_entries",
+                &["batch_id", "ordinal", "operation", "path", "entry_json"][..],
+            ),
+            (
+                "index_directory_manifest",
+                &["path", "parent", "root", "modified_ms"][..],
+            ),
+            (
+                "index_runtime_state",
+                &[
+                    "singleton",
+                    "active_baseline_id",
+                    "baseline_generation",
+                    "last_generation",
+                    "degradation_code",
+                    "baseline_refresh_reason",
+                ][..],
+            ),
         ];
-        for table in REQUIRED_TABLES {
-            let exists = self.connection.query_row(
-                "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
-                params![table],
-                |row| row.get::<_, i64>(0),
-            )? != 0;
-            if !exists {
+        for (table, columns) in required_tables {
+            if !table_has_columns(&self.connection, table, columns)? {
+                return Ok(false);
+            }
+        }
+        if !foreign_key_matches(
+            &self.connection,
+            "index_delta_entries",
+            "batch_id",
+            "index_delta_batches",
+            "id",
+            "CASCADE",
+        )? {
+            return Ok(false);
+        }
+        if !foreign_key_matches(
+            &self.connection,
+            "index_runtime_state",
+            "active_baseline_id",
+            "index_batches",
+            "id",
+            "SET NULL",
+        )? {
+            return Ok(false);
+        }
+        let required_indexes = [
+            ("idx_index_delta_entries_path", &["path"][..]),
+            ("idx_index_directory_manifest_root", &["root"][..]),
+            ("idx_index_directory_manifest_parent", &["parent"][..]),
+            (
+                "idx_index_entries_batch_root_parent",
+                &["batch_id", "root_key", "parent_key"][..],
+            ),
+        ];
+        for (index, columns) in required_indexes {
+            if !index_has_columns(&self.connection, index, columns)? {
                 return Ok(false);
             }
         }
@@ -247,41 +369,48 @@ impl SqliteStorage {
         manifest_upserts: &[DirectoryFingerprint],
         manifest_removals: &[PathBuf],
     ) -> Result<(), StorageError> {
-        validate_delta(delta)?;
-        validate_manifest_rows(manifest_upserts)?;
+        validate_delta(delta, self.comparison_mode)?;
+        validate_manifest_rows(manifest_upserts, self.comparison_mode)?;
+        let payload_identity = canonical_batch_identity(
+            delta,
+            manifest_upserts,
+            manifest_removals,
+            self.comparison_mode,
+        )?;
         let generation = generation_to_i64(delta.generation)?;
         let transaction = self.connection.unchecked_transaction()?;
 
         let existing_batch = transaction
             .query_row(
-                "SELECT id, status FROM index_delta_batches WHERE generation = ?1",
+                "SELECT status, payload_hash FROM index_delta_batches WHERE generation = ?1",
                 params![generation],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()?;
-        if let Some((batch_id, status)) = existing_batch {
+        if let Some((status, existing_identity)) = existing_batch {
             if status != "committed" {
                 return Err(StorageError::InvalidJournal(format!(
                     "generation {} already exists without a committed status",
                     delta.generation
                 )));
             }
-            let existing = load_delta_entries(&transaction, batch_id, delta.generation)?;
-            if &existing == delta {
+            if existing_identity == payload_identity {
                 return Ok(());
             }
             return Err(StorageError::InvalidJournal(format!(
-                "generation {} was committed with different operations",
+                "generation {} was committed with a different batch payload",
                 delta.generation
             )));
         }
+        validate_manifest_removals(&transaction, manifest_removals, self.comparison_mode)?;
 
         transaction.execute(
             r#"
-            INSERT INTO index_delta_batches (generation, status, committed_at)
-            VALUES (?1, 'committed', ?2)
+            INSERT INTO index_delta_batches
+                (generation, status, committed_at_ms, payload_hash)
+            VALUES (?1, 'committed', ?2, ?3)
             "#,
-            params![generation, unix_timestamp_ms()],
+            params![generation, unix_timestamp_ms(), payload_identity],
         )?;
         let batch_id = transaction.last_insert_rowid();
         {
@@ -298,7 +427,7 @@ impl SqliteStorage {
                     batch_id,
                     ordinal,
                     "upsert",
-                    normalize_path_text_key(&entry.path),
+                    normalize_path_text_key_for_mode(&entry.path, self.comparison_mode),
                     serde_json::to_string(entry)?,
                 ])?;
                 ordinal += 1;
@@ -308,13 +437,18 @@ impl SqliteStorage {
                     batch_id,
                     ordinal,
                     "remove",
-                    normalize_path_key(path),
+                    normalize_path_key_for_mode(path, self.comparison_mode),
                     Option::<String>::None,
                 ])?;
                 ordinal += 1;
             }
         }
-        apply_manifest_changes(&transaction, manifest_upserts, manifest_removals)?;
+        apply_manifest_changes(
+            &transaction,
+            manifest_upserts,
+            manifest_removals,
+            self.comparison_mode,
+        )?;
         transaction.commit()?;
         Ok(())
     }
@@ -346,7 +480,12 @@ impl SqliteStorage {
             let generation = u64::try_from(generation).map_err(|_| {
                 StorageError::InvalidJournal("journal generation must not be negative".to_owned())
             })?;
-            deltas.push(load_delta_entries(&self.connection, batch_id, generation)?);
+            deltas.push(load_delta_entries(
+                &self.connection,
+                batch_id,
+                generation,
+                self.comparison_mode,
+            )?);
         }
         Ok(deltas)
     }
@@ -356,11 +495,11 @@ impl SqliteStorage {
         root: &Path,
         rows: &[DirectoryFingerprint],
     ) -> Result<(), StorageError> {
-        validate_manifest_rows(rows)?;
-        let root = normalize_path_key(root);
+        validate_manifest_rows(rows, self.comparison_mode)?;
+        let root = normalize_path_key_for_mode(root, self.comparison_mode);
         if rows
             .iter()
-            .any(|row| normalize_path_text_key(&row.root) != root)
+            .any(|row| normalize_path_text_key_for_mode(&row.root, self.comparison_mode) != root)
         {
             return Err(StorageError::InvalidJournal(
                 "directory manifest row belongs to a different root".to_owned(),
@@ -371,7 +510,7 @@ impl SqliteStorage {
             "DELETE FROM index_directory_manifest WHERE root = ?1",
             params![root],
         )?;
-        upsert_manifest_rows(&transaction, rows)?;
+        upsert_manifest_rows(&transaction, rows, self.comparison_mode)?;
         transaction.commit()?;
         Ok(())
     }
@@ -380,7 +519,7 @@ impl SqliteStorage {
         &self,
         root: &Path,
     ) -> Result<Vec<DirectoryFingerprint>, StorageError> {
-        let root = normalize_path_key(root);
+        let root = normalize_path_key_for_mode(root, self.comparison_mode);
         let mut statement = self.connection.prepare(
             r#"
             SELECT path, parent, root, modified_ms
@@ -412,18 +551,55 @@ impl SqliteStorage {
         Ok(())
     }
 
+    pub fn activate_baseline(
+        &self,
+        baseline_id: i64,
+        baseline_generation: u64,
+    ) -> Result<(), StorageError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        activate_baseline_in_transaction(&transaction, baseline_id, baseline_generation)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn activate_baseline_and_clear_incremental_state(
+        &self,
+        baseline_id: i64,
+        baseline_generation: u64,
+    ) -> Result<(), StorageError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        activate_baseline_in_transaction(&transaction, baseline_id, baseline_generation)?;
+        transaction.execute(
+            "DELETE FROM index_delta_batches WHERE generation <= ?1",
+            params![generation_to_i64(baseline_generation)?],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn save_runtime_state(&self, state: &IncrementalRuntimeState) -> Result<(), StorageError> {
         self.connection.execute(
             r#"
-            INSERT INTO runtime_state
-                (singleton, last_generation, degradation_code, baseline_refresh_reason)
-            VALUES (1, ?1, ?2, ?3)
+            INSERT INTO index_runtime_state
+                (
+                    singleton,
+                    active_baseline_id,
+                    baseline_generation,
+                    last_generation,
+                    degradation_code,
+                    baseline_refresh_reason
+                )
+            VALUES (1, ?1, ?2, ?3, ?4, ?5)
             ON CONFLICT(singleton) DO UPDATE SET
+                active_baseline_id = excluded.active_baseline_id,
+                baseline_generation = excluded.baseline_generation,
                 last_generation = excluded.last_generation,
                 degradation_code = excluded.degradation_code,
                 baseline_refresh_reason = excluded.baseline_refresh_reason
             "#,
             params![
+                state.active_baseline_id,
+                generation_to_i64(state.baseline_generation)?,
                 generation_to_i64(state.last_generation)?,
                 state.degradation_code,
                 state.baseline_refresh_reason,
@@ -436,30 +612,54 @@ impl SqliteStorage {
         self.connection
             .query_row(
                 r#"
-                SELECT last_generation, degradation_code, baseline_refresh_reason
-                FROM runtime_state
+                SELECT
+                    active_baseline_id,
+                    baseline_generation,
+                    last_generation,
+                    degradation_code,
+                    baseline_refresh_reason
+                FROM index_runtime_state
                 WHERE singleton = 1
                 "#,
                 [],
                 |row| {
-                    let generation = row.get::<_, i64>(0)?;
-                    Ok((generation, row.get(1)?, row.get(2)?))
+                    Ok((
+                        row.get::<_, Option<i64>>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
                 },
             )
             .optional()?
-            .map(|(generation, degradation_code, baseline_refresh_reason)| {
-                u64::try_from(generation)
-                    .map(|last_generation| IncrementalRuntimeState {
-                        last_generation,
-                        degradation_code,
-                        baseline_refresh_reason,
-                    })
-                    .map_err(|_| {
-                        StorageError::InvalidJournal(
-                            "runtime last_generation must not be negative".to_owned(),
-                        )
-                    })
-            })
+            .map(
+                |(
+                    active_baseline_id,
+                    baseline_generation,
+                    last_generation,
+                    degradation_code,
+                    baseline_refresh_reason,
+                )| {
+                    u64::try_from(baseline_generation)
+                        .and_then(|baseline_generation| {
+                            u64::try_from(last_generation).map(|last_generation| {
+                                IncrementalRuntimeState {
+                                    active_baseline_id,
+                                    baseline_generation,
+                                    last_generation,
+                                    degradation_code,
+                                    baseline_refresh_reason,
+                                }
+                            })
+                        })
+                        .map_err(|_| {
+                            StorageError::InvalidJournal(
+                                "runtime generations must not be negative".to_owned(),
+                            )
+                        })
+                },
+            )
             .transpose()
     }
 
@@ -468,8 +668,8 @@ impl SqliteStorage {
         root: &Path,
         directory: &Path,
     ) -> Result<Vec<KnownIndexedChild>, StorageError> {
-        let root_text = root.to_string_lossy();
-        let directory_text = directory.to_string_lossy();
+        let root_key = normalize_path_key_for_mode(root, self.comparison_mode);
+        let directory_key = normalize_path_key_for_mode(directory, self.comparison_mode);
         let mut entries = BTreeMap::new();
         let latest_batch_id = self
             .connection
@@ -484,45 +684,40 @@ impl SqliteStorage {
                 r#"
                 SELECT path, kind, modified_ms, size_bytes
                 FROM index_entries
-                WHERE batch_id = ?1 AND root = ?2 AND parent = ?3
+                WHERE batch_id = ?1 AND root_key = ?2 AND parent_key = ?3
                 ORDER BY path ASC
                 "#,
             )?;
-            let rows = statement.query_map(
-                params![batch_id, root_text.as_ref(), directory_text.as_ref()],
-                |row| {
-                    let path = row.get::<_, String>(0)?;
-                    let kind = index_kind_from_storage(&row.get::<_, String>(1)?);
-                    Ok((
-                        normalize_path_text_key(&path),
-                        KnownIndexedChild {
-                            path,
-                            filesystem_kind: if kind == IndexedEntryKind::Directory {
-                                FileSystemEntryKind::Directory
-                            } else {
-                                FileSystemEntryKind::File
-                            },
-                            kind,
-                            modified_ms: row.get(2)?,
-                            size_bytes: row
-                                .get::<_, Option<i64>>(3)?
-                                .map(|size| size.max(0) as u64),
+            let rows = statement.query_map(params![batch_id, root_key, directory_key], |row| {
+                let path = row.get::<_, String>(0)?;
+                let kind = index_kind_from_storage(&row.get::<_, String>(1)?);
+                Ok((
+                    normalize_path_text_key_for_mode(&path, self.comparison_mode),
+                    KnownIndexedChild {
+                        path,
+                        filesystem_kind: if kind == IndexedEntryKind::Directory {
+                            FileSystemEntryKind::Directory
+                        } else {
+                            FileSystemEntryKind::File
                         },
-                    ))
-                },
-            )?;
+                        kind,
+                        modified_ms: row.get(2)?,
+                        size_bytes: row.get::<_, Option<i64>>(3)?.map(|size| size.max(0) as u64),
+                    },
+                ))
+            })?;
             for row in rows {
                 let (path, entry) = row?;
                 entries.insert(path, entry);
             }
         }
 
-        let root = normalize_path_key(root);
-        let directory = normalize_path_key(directory);
+        let root = normalize_path_key_for_mode(root, self.comparison_mode);
+        let directory = normalize_path_key_for_mode(directory, self.comparison_mode);
         let manifest_paths: BTreeSet<_> = self
             .directory_manifest_for_root(Path::new(&root))?
             .into_iter()
-            .map(|row| normalize_path_text_key(&row.path))
+            .map(|row| normalize_path_text_key_for_mode(&row.path, self.comparison_mode))
             .collect();
         for (path, entry) in &mut entries {
             if manifest_paths.contains(path) {
@@ -532,7 +727,7 @@ impl SqliteStorage {
 
         for delta in self.committed_index_deltas_after(0)? {
             for removal in delta.removals {
-                let key = normalize_path_key(&removal);
+                let key = normalize_path_key_for_mode(&removal, self.comparison_mode);
                 if key == directory || path_is_descendant(&key, &directory) {
                     entries.clear();
                 } else if normalized_parent(&key) == Some(directory.as_str()) {
@@ -540,14 +735,15 @@ impl SqliteStorage {
                 }
             }
             for entry in delta.upserts {
-                let key = normalize_path_text_key(&entry.path);
+                let key = normalize_path_text_key_for_mode(&entry.path, self.comparison_mode);
                 if (key == directory || path_is_descendant(&key, &directory))
                     && entry.kind != IndexedEntryKind::Directory
                 {
                     entries.clear();
                 }
-                if normalize_path_text_key(&entry.root) == root
-                    && normalize_path_text_key(&entry.parent) == directory
+                if normalize_path_text_key_for_mode(&entry.root, self.comparison_mode) == root
+                    && normalize_path_text_key_for_mode(&entry.parent, self.comparison_mode)
+                        == directory
                 {
                     entries.insert(
                         key.clone(),
@@ -610,7 +806,7 @@ impl SqliteStorage {
         &self,
         completed_at_ms: i64,
         entries: &[IndexedEntry],
-    ) -> Result<(), StorageError> {
+    ) -> Result<i64, StorageError> {
         let transaction = self.connection.unchecked_transaction()?;
         transaction.execute(
             r#"
@@ -638,9 +834,15 @@ impl SqliteStorage {
                         root,
                         modified_ms,
                         size_bytes,
-                        content_index_state
+                        content_index_state,
+                        path_key,
+                        root_key,
+                        parent_key
                     )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+                    ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16
+                )
                 "#,
             )?;
             for entry in entries {
@@ -658,12 +860,15 @@ impl SqliteStorage {
                     entry.modified_ms,
                     entry.size_bytes.map(|size| size as i64),
                     content_index_state_to_storage(&entry.content_index_state),
+                    normalize_path_text_key_for_mode(&entry.path, self.comparison_mode),
+                    normalize_path_text_key_for_mode(&entry.root, self.comparison_mode),
+                    normalize_path_text_key_for_mode(&entry.parent, self.comparison_mode),
                 ])?;
             }
         }
 
         transaction.commit()?;
-        Ok(())
+        Ok(batch_id)
     }
 
     pub fn latest_index_snapshot(&self) -> Result<Option<IndexSnapshot>, StorageError> {
@@ -683,7 +888,33 @@ impl SqliteStorage {
         else {
             return Ok(None);
         };
+        Ok(Some(self.load_index_snapshot(batch_id, completed_at_ms)?))
+    }
 
+    pub fn active_index_snapshot(&self) -> Result<Option<IndexSnapshot>, StorageError> {
+        let active = self
+            .connection
+            .query_row(
+                r#"
+                SELECT batches.id, batches.completed_at_ms
+                FROM index_runtime_state AS state
+                JOIN index_batches AS batches ON batches.id = state.active_baseline_id
+                WHERE state.singleton = 1
+                "#,
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        active
+            .map(|(batch_id, completed_at_ms)| self.load_index_snapshot(batch_id, completed_at_ms))
+            .transpose()
+    }
+
+    fn load_index_snapshot(
+        &self,
+        batch_id: i64,
+        completed_at_ms: i64,
+    ) -> Result<IndexSnapshot, StorageError> {
         let mut statement = self.connection.prepare(
             r#"
             SELECT
@@ -732,11 +963,11 @@ impl SqliteStorage {
             entries.push(row?);
         }
 
-        Ok(Some(IndexSnapshot {
+        Ok(IndexSnapshot {
             completed_at_ms,
             entries,
             needs_full_refresh: snapshot_needs_full_refresh(&self.connection, batch_id)?,
-        }))
+        })
     }
 
     pub fn record_path_usage(&self, path: &str, opened_at_ms: i64) -> Result<(), StorageError> {
@@ -888,11 +1119,14 @@ impl SqliteStorage {
     }
 }
 
-fn validate_delta(delta: &CommittedIndexDelta) -> Result<(), StorageError> {
+fn validate_delta(
+    delta: &CommittedIndexDelta,
+    mode: PathComparisonMode,
+) -> Result<(), StorageError> {
     generation_to_i64(delta.generation)?;
     let mut paths = BTreeSet::new();
     for entry in &delta.upserts {
-        let path = normalize_path_text_key(&entry.path);
+        let path = normalize_path_text_key_for_mode(&entry.path, mode);
         if path.is_empty() {
             return Err(StorageError::InvalidJournal(
                 "journal upsert path must not be empty".to_owned(),
@@ -905,7 +1139,7 @@ fn validate_delta(delta: &CommittedIndexDelta) -> Result<(), StorageError> {
         }
     }
     for removal in &delta.removals {
-        let path = normalize_path_key(removal);
+        let path = normalize_path_key_for_mode(removal, mode);
         if path.is_empty() {
             return Err(StorageError::InvalidJournal(
                 "journal removal path must not be empty".to_owned(),
@@ -920,11 +1154,66 @@ fn validate_delta(delta: &CommittedIndexDelta) -> Result<(), StorageError> {
     Ok(())
 }
 
-fn validate_manifest_rows(rows: &[DirectoryFingerprint]) -> Result<(), StorageError> {
+#[derive(Serialize)]
+struct CanonicalBatchIdentity {
+    generation: u64,
+    upserts: Vec<IndexedEntry>,
+    removals: Vec<String>,
+    manifest_upserts: Vec<DirectoryFingerprint>,
+    manifest_removals: Vec<String>,
+}
+
+fn canonical_batch_identity(
+    delta: &CommittedIndexDelta,
+    manifest_upserts: &[DirectoryFingerprint],
+    manifest_removals: &[PathBuf],
+    mode: PathComparisonMode,
+) -> Result<String, StorageError> {
+    let mut upserts = delta.upserts.clone();
+    for entry in &mut upserts {
+        entry.path = normalize_path_text_key_for_mode(&entry.path, mode);
+        entry.root = normalize_path_text_key_for_mode(&entry.root, mode);
+        entry.parent = normalize_path_text_key_for_mode(&entry.parent, mode);
+    }
+    upserts.sort_by(|left, right| left.path.cmp(&right.path));
+    let mut removals: Vec<_> = delta
+        .removals
+        .iter()
+        .map(|path| normalize_path_key_for_mode(path, mode))
+        .collect();
+    removals.sort();
+    let mut manifest_upserts = manifest_upserts.to_vec();
+    for row in &mut manifest_upserts {
+        row.path = normalize_path_text_key_for_mode(&row.path, mode);
+        row.root = normalize_path_text_key_for_mode(&row.root, mode);
+        row.parent = row
+            .parent
+            .as_deref()
+            .map(|parent| normalize_path_text_key_for_mode(parent, mode));
+    }
+    manifest_upserts.sort_by(|left, right| left.path.cmp(&right.path));
+    let mut manifest_removals: Vec<_> = manifest_removals
+        .iter()
+        .map(|path| normalize_path_key_for_mode(path, mode))
+        .collect();
+    manifest_removals.sort();
+    Ok(serde_json::to_string(&CanonicalBatchIdentity {
+        generation: delta.generation,
+        upserts,
+        removals,
+        manifest_upserts,
+        manifest_removals,
+    })?)
+}
+
+fn validate_manifest_rows(
+    rows: &[DirectoryFingerprint],
+    mode: PathComparisonMode,
+) -> Result<(), StorageError> {
     let mut paths = BTreeSet::new();
     for row in rows {
-        let path = normalize_path_text_key(&row.path);
-        let root = normalize_path_text_key(&row.root);
+        let path = normalize_path_text_key_for_mode(&row.path, mode);
+        let root = normalize_path_text_key_for_mode(&row.root, mode);
         if path.is_empty() || root.is_empty() {
             return Err(StorageError::InvalidJournal(
                 "directory manifest path and root must not be empty".to_owned(),
@@ -935,13 +1224,59 @@ fn validate_manifest_rows(rows: &[DirectoryFingerprint]) -> Result<(), StorageEr
                 "directory manifest contains duplicate normalized paths".to_owned(),
             ));
         }
-        if row
+        if path == root {
+            if row.parent.is_some() {
+                return Err(StorageError::InvalidJournal(
+                    "directory manifest root must not have a parent".to_owned(),
+                ));
+            }
+            continue;
+        }
+        if !path_is_descendant(&root, &path) {
+            return Err(StorageError::InvalidJournal(
+                "directory manifest path must be inside its root".to_owned(),
+            ));
+        }
+        let expected_parent = normalized_parent(&path);
+        let actual_parent = row
             .parent
             .as_deref()
-            .is_some_and(|parent| normalize_path_text_key(parent) == path)
-        {
+            .map(|parent| normalize_path_text_key_for_mode(parent, mode));
+        if actual_parent.as_deref() != expected_parent {
             return Err(StorageError::InvalidJournal(
-                "directory manifest path cannot be its own parent".to_owned(),
+                "directory manifest parent must be the normalized direct parent".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_manifest_removals(
+    connection: &Connection,
+    removals: &[PathBuf],
+    mode: PathComparisonMode,
+) -> Result<(), StorageError> {
+    let mut paths = BTreeSet::new();
+    for removal in removals {
+        let path = normalize_path_key_for_mode(removal, mode);
+        if path.is_empty() {
+            return Err(StorageError::InvalidJournal(
+                "directory manifest removal must not be empty".to_owned(),
+            ));
+        }
+        if !paths.insert(path.clone()) {
+            return Err(StorageError::InvalidJournal(
+                "directory manifest removals contain a duplicate path".to_owned(),
+            ));
+        }
+        let exists = connection.query_row(
+            "SELECT EXISTS (SELECT 1 FROM index_directory_manifest WHERE path = ?1)",
+            params![path],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        if !exists {
+            return Err(StorageError::InvalidJournal(
+                "directory manifest removal is outside the known manifest scope".to_owned(),
             ));
         }
     }
@@ -952,6 +1287,7 @@ fn load_delta_entries(
     connection: &Connection,
     batch_id: i64,
     generation: u64,
+    mode: PathComparisonMode,
 ) -> Result<CommittedIndexDelta, StorageError> {
     let mut statement = connection.prepare(
         r#"
@@ -979,7 +1315,7 @@ fn load_delta_entries(
                 "generation {generation} has a non-contiguous ordinal"
             )));
         }
-        let path = normalize_path_text_key(&path);
+        let path = normalize_path_text_key_for_mode(&path, mode);
         if path.is_empty() || !paths.insert(path.clone()) {
             return Err(StorageError::InvalidJournal(format!(
                 "generation {generation} has an empty or duplicate path"
@@ -993,7 +1329,7 @@ fn load_delta_entries(
                     ))
                 })?;
                 let entry: IndexedEntry = serde_json::from_str(&json)?;
-                if normalize_path_text_key(&entry.path) != path {
+                if normalize_path_text_key_for_mode(&entry.path, mode) != path {
                     return Err(StorageError::InvalidJournal(format!(
                         "generation {generation} upsert path does not match its entry JSON"
                     )));
@@ -1026,23 +1362,27 @@ fn apply_manifest_changes(
     connection: &Connection,
     upserts: &[DirectoryFingerprint],
     removals: &[PathBuf],
+    mode: PathComparisonMode,
 ) -> Result<(), StorageError> {
     for removal in removals {
-        let path = normalize_path_key(removal);
+        let path = normalize_path_key_for_mode(removal, mode);
         connection.execute(
             r#"
             DELETE FROM index_directory_manifest
-            WHERE path = ?1 OR substr(path, 1, length(?1) + 1) = ?1 || '/'
+            WHERE path = ?1
+               OR (?1 = '/' AND substr(path, 1, 1) = '/')
+               OR (?1 <> '/' AND substr(path, 1, length(?1) + 1) = ?1 || '/')
             "#,
             params![path],
         )?;
     }
-    upsert_manifest_rows(connection, upserts)
+    upsert_manifest_rows(connection, upserts, mode)
 }
 
 fn upsert_manifest_rows(
     connection: &Connection,
     rows: &[DirectoryFingerprint],
+    mode: PathComparisonMode,
 ) -> Result<(), StorageError> {
     let mut statement = connection.prepare(
         r#"
@@ -1056,9 +1396,11 @@ fn upsert_manifest_rows(
     )?;
     for row in rows {
         statement.execute(params![
-            normalize_path_text_key(&row.path),
-            row.parent.as_deref().map(normalize_path_text_key),
-            normalize_path_text_key(&row.root),
+            normalize_path_text_key_for_mode(&row.path, mode),
+            row.parent
+                .as_deref()
+                .map(|parent| normalize_path_text_key_for_mode(parent, mode)),
+            normalize_path_text_key_for_mode(&row.root, mode),
             row.modified_ms,
         ])?;
     }
@@ -1069,6 +1411,44 @@ fn generation_to_i64(generation: u64) -> Result<i64, StorageError> {
     i64::try_from(generation).map_err(|_| {
         StorageError::InvalidJournal("journal generation exceeds SQLite range".to_owned())
     })
+}
+
+fn activate_baseline_in_transaction(
+    connection: &Connection,
+    baseline_id: i64,
+    baseline_generation: u64,
+) -> Result<(), StorageError> {
+    let baseline_exists = connection.query_row(
+        "SELECT EXISTS (SELECT 1 FROM index_batches WHERE id = ?1)",
+        params![baseline_id],
+        |row| row.get::<_, i64>(0),
+    )? != 0;
+    if !baseline_exists {
+        return Err(StorageError::InvalidJournal(
+            "active baseline must reference a persisted index batch".to_owned(),
+        ));
+    }
+    let generation = generation_to_i64(baseline_generation)?;
+    connection.execute(
+        r#"
+        INSERT INTO index_runtime_state
+            (
+                singleton,
+                active_baseline_id,
+                baseline_generation,
+                last_generation,
+                degradation_code,
+                baseline_refresh_reason
+            )
+        VALUES (1, ?1, ?2, ?2, NULL, NULL)
+        ON CONFLICT(singleton) DO UPDATE SET
+            active_baseline_id = excluded.active_baseline_id,
+            baseline_generation = excluded.baseline_generation,
+            last_generation = MAX(index_runtime_state.last_generation, excluded.last_generation)
+        "#,
+        params![baseline_id, generation],
+    )?;
+    Ok(())
 }
 
 fn unix_timestamp_ms() -> i64 {
@@ -1159,6 +1539,72 @@ fn index_entry_columns(connection: &Connection) -> Result<Vec<String>, StorageEr
     Ok(columns)
 }
 
+fn table_has_columns(
+    connection: &Connection,
+    table: &str,
+    required: &[&str],
+) -> Result<bool, StorageError> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info(\"{table}\")"))?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+    let mut columns = BTreeSet::new();
+    for row in rows {
+        columns.insert(row?);
+    }
+    Ok(required.iter().all(|column| columns.contains(*column)))
+}
+
+fn foreign_key_matches(
+    connection: &Connection,
+    table: &str,
+    from: &str,
+    target_table: &str,
+    target_column: &str,
+    on_delete: &str,
+) -> Result<bool, StorageError> {
+    let mut statement = connection.prepare(&format!("PRAGMA foreign_key_list(\"{table}\")"))?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(6)?,
+        ))
+    })?;
+    for row in rows {
+        let (found_table, found_from, found_target, found_delete) = row?;
+        if found_table == target_table
+            && found_from == from
+            && found_target == target_column
+            && found_delete.eq_ignore_ascii_case(on_delete)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn index_has_columns(
+    connection: &Connection,
+    index: &str,
+    required: &[&str],
+) -> Result<bool, StorageError> {
+    let exists = connection.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1)",
+        params![index],
+        |row| row.get::<_, i64>(0),
+    )? != 0;
+    if !exists {
+        return Ok(false);
+    }
+    let mut statement = connection.prepare(&format!("PRAGMA index_info(\"{index}\")"))?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(2))?;
+    let mut columns = Vec::new();
+    for row in rows {
+        columns.push(row?);
+    }
+    Ok(columns == required)
+}
+
 fn snapshot_needs_full_refresh(
     connection: &Connection,
     batch_id: i64,
@@ -1186,6 +1632,7 @@ fn snapshot_needs_full_refresh(
 mod tests {
     use super::*;
     use crate::core::index::{IndexedEntry, IndexedEntryKind, SearchIndex};
+    use crate::core::index_entry::PathComparisonMode;
     use crate::core::layered_index::CommittedIndexDelta;
     use crate::core::search::QueryParser;
     use crate::core::targeted_index_scanner::DirectoryFingerprint;
@@ -1233,6 +1680,66 @@ mod tests {
         let snapshot = storage.latest_index_snapshot().unwrap().unwrap();
         assert_eq!(snapshot.entries.len(), 1);
         assert_eq!(snapshot.entries[0].path, "/root/legacy.md");
+
+        drop(storage);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn same_name_incremental_tables_without_required_foreign_key_are_not_ready() {
+        let path = temp_db_path("incompatible-incremental-schema");
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute_batch(
+                    r#"
+                    PRAGMA user_version = 3;
+                    CREATE TABLE index_delta_batches (
+                        id INTEGER PRIMARY KEY,
+                        generation INTEGER NOT NULL UNIQUE,
+                        status TEXT NOT NULL,
+                        committed_at_ms INTEGER NOT NULL,
+                        payload_hash TEXT NOT NULL
+                    );
+                    CREATE TABLE index_delta_entries (
+                        batch_id INTEGER NOT NULL,
+                        ordinal INTEGER NOT NULL,
+                        operation TEXT NOT NULL,
+                        path TEXT NOT NULL,
+                        entry_json TEXT,
+                        PRIMARY KEY (batch_id, ordinal)
+                    );
+                    CREATE TABLE index_directory_manifest (
+                        path TEXT PRIMARY KEY,
+                        parent TEXT,
+                        root TEXT NOT NULL,
+                        modified_ms INTEGER
+                    );
+                    CREATE TABLE index_runtime_state (
+                        singleton INTEGER PRIMARY KEY,
+                        active_baseline_id INTEGER,
+                        baseline_generation INTEGER NOT NULL,
+                        last_generation INTEGER NOT NULL,
+                        degradation_code TEXT,
+                        baseline_refresh_reason TEXT
+                    );
+                    "#,
+                )
+                .unwrap();
+        }
+
+        let storage = SqliteStorage::open(path.clone()).unwrap();
+
+        assert!(!storage.incremental_schema_is_ready().unwrap());
+        let recovery = crate::core::index_journal::recover_layered_index(
+            &storage,
+            vec![indexed_entry("/root/baseline.md")],
+        );
+        assert_eq!(
+            recovery.degradation_code(),
+            Some(crate::core::index_journal::IndexDegradationCode::JournalReplayFailed)
+        );
+        assert_eq!(recovery.baseline_entry_count(), 1);
 
         drop(storage);
         let _ = fs::remove_file(path);
@@ -1302,20 +1809,124 @@ mod tests {
     }
 
     #[test]
+    fn manifest_rejects_cross_root_and_non_direct_parent_rows() {
+        let path = temp_db_path("manifest-structure");
+        let storage = SqliteStorage::open(path.clone()).unwrap();
+
+        let cross_root = storage.replace_directory_manifest(
+            Path::new("/root"),
+            &[fingerprint("/outside", Some("/"), "/root", 1)],
+        );
+        let wrong_parent = storage.replace_directory_manifest(
+            Path::new("/root"),
+            &[fingerprint(
+                "/root/child/grandchild",
+                Some("/root"),
+                "/root",
+                1,
+            )],
+        );
+        let root_with_parent = storage.replace_directory_manifest(
+            Path::new("/root"),
+            &[fingerprint("/root", Some("/"), "/root", 1)],
+        );
+
+        assert!(matches!(cross_root, Err(StorageError::InvalidJournal(_))));
+        assert!(matches!(wrong_parent, Err(StorageError::InvalidJournal(_))));
+        assert!(matches!(
+            root_with_parent,
+            Err(StorageError::InvalidJournal(_))
+        ));
+        assert!(storage
+            .directory_manifest_for_root(Path::new("/root"))
+            .unwrap()
+            .is_empty());
+
+        drop(storage);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn manifest_removal_outside_known_root_rejects_entire_batch() {
+        let path = temp_db_path("manifest-removal-scope");
+        let storage = SqliteStorage::open(path.clone()).unwrap();
+        storage
+            .replace_directory_manifest(
+                Path::new("/root"),
+                &[fingerprint("/root", None, "/root", 1)],
+            )
+            .unwrap();
+
+        let result = storage.commit_incremental_batch(
+            &committed_delta(1, indexed_entry("/root/new.md"), Vec::new()),
+            &[],
+            &[PathBuf::from("/outside")],
+        );
+
+        assert!(matches!(result, Err(StorageError::InvalidJournal(_))));
+        assert!(storage.committed_index_deltas_after(0).unwrap().is_empty());
+        assert_eq!(
+            storage
+                .directory_manifest_for_root(Path::new("/root"))
+                .unwrap(),
+            vec![fingerprint("/root", None, "/root", 1)]
+        );
+
+        drop(storage);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn posix_root_manifest_removal_deletes_all_descendants() {
+        let path = temp_db_path("manifest-posix-root-removal");
+        let storage = SqliteStorage::open(path.clone()).unwrap();
+        storage
+            .replace_directory_manifest(
+                Path::new("/"),
+                &[
+                    fingerprint("/", None, "/", 1),
+                    fingerprint("/a", Some("/"), "/", 2),
+                    fingerprint("/a/b", Some("/a"), "/", 3),
+                ],
+            )
+            .unwrap();
+
+        storage
+            .commit_incremental_batch(
+                &CommittedIndexDelta {
+                    generation: 1,
+                    upserts: Vec::new(),
+                    removals: Vec::new(),
+                },
+                &[],
+                &[PathBuf::from("/")],
+            )
+            .unwrap();
+
+        assert!(storage
+            .directory_manifest_for_root(Path::new("/"))
+            .unwrap()
+            .is_empty());
+
+        drop(storage);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn pending_delta_is_ignored_and_malformed_committed_entry_is_rejected() {
         let path = temp_db_path("delta-validation");
         let storage = SqliteStorage::open(path.clone()).unwrap();
         storage
             .connection
             .execute(
-                "INSERT INTO index_delta_batches (generation, status, committed_at) VALUES (1, 'pending', 1)",
+                "INSERT INTO index_delta_batches (generation, status, committed_at_ms, payload_hash) VALUES (1, 'pending', 1, '')",
                 [],
             )
             .unwrap();
         storage
             .connection
             .execute(
-                "INSERT INTO index_delta_batches (generation, status, committed_at) VALUES (2, 'committed', 2)",
+                "INSERT INTO index_delta_batches (generation, status, committed_at_ms, payload_hash) VALUES (2, 'committed', 2, '')",
                 [],
             )
             .unwrap();
@@ -1345,7 +1956,7 @@ mod tests {
         storage
             .connection
             .execute(
-                "INSERT INTO index_delta_batches (generation, status, committed_at) VALUES (1, 'pending', 1)",
+                "INSERT INTO index_delta_batches (generation, status, committed_at_ms, payload_hash) VALUES (1, 'pending', 1, '')",
                 [],
             )
             .unwrap();
@@ -1417,6 +2028,51 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_generation_requires_identical_delta_and_manifest_payload() {
+        let path = temp_db_path("journal-full-payload-identity");
+        let storage = SqliteStorage::open(path.clone()).unwrap();
+        storage
+            .replace_directory_manifest(
+                Path::new("/root"),
+                &[
+                    fingerprint("/root", None, "/root", 1),
+                    fingerprint("/root/old", Some("/root"), "/root", 2),
+                ],
+            )
+            .unwrap();
+        let delta = committed_delta(1, indexed_entry("/root/new.md"), Vec::new());
+        let upserts = [fingerprint("/root/new", Some("/root"), "/root", 3)];
+        let removals = [PathBuf::from("/root/old")];
+        storage
+            .commit_incremental_batch(&delta, &upserts, &removals)
+            .unwrap();
+
+        storage
+            .commit_incremental_batch(&delta, &upserts, &removals)
+            .unwrap();
+        let conflicting_manifest = [fingerprint("/root/new", Some("/root"), "/root", 999)];
+        let conflict = storage.commit_incremental_batch(&delta, &conflicting_manifest, &removals);
+
+        assert!(matches!(conflict, Err(StorageError::InvalidJournal(_))));
+        assert_eq!(
+            storage.committed_index_deltas_after(0).unwrap(),
+            vec![delta]
+        );
+        assert_eq!(
+            storage
+                .directory_manifest_for_root(Path::new("/root"))
+                .unwrap(),
+            vec![
+                fingerprint("/root", None, "/root", 1),
+                fingerprint("/root/new", Some("/root"), "/root", 3),
+            ]
+        );
+
+        drop(storage);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn clear_through_keeps_newer_journal_and_runtime_state_round_trips() {
         let path = temp_db_path("delta-clear");
         let storage = SqliteStorage::open(path.clone()).unwrap();
@@ -1434,6 +2090,8 @@ mod tests {
                 .unwrap();
         }
         let state = IncrementalRuntimeState {
+            active_baseline_id: None,
+            baseline_generation: 0,
             last_generation: 3,
             degradation_code: Some("journalReplayFailed".to_owned()),
             baseline_refresh_reason: Some("journalRecovery".to_owned()),
@@ -1459,6 +2117,60 @@ mod tests {
             })
             .unwrap();
         assert_eq!(remaining_entry_rows, 1);
+
+        drop(storage);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn baseline_activation_and_journal_clear_share_one_transaction() {
+        let path = temp_db_path("baseline-activation-clear");
+        let storage = SqliteStorage::open(path.clone()).unwrap();
+        for generation in 1..=3 {
+            storage
+                .commit_incremental_batch(
+                    &committed_delta(
+                        generation,
+                        indexed_entry(&format!("/root/{generation}.md")),
+                        Vec::new(),
+                    ),
+                    &[],
+                    &[],
+                )
+                .unwrap();
+        }
+        let baseline_id = storage
+            .save_completed_index_batch(10, &[indexed_entry("/root/baseline.md")])
+            .unwrap();
+
+        let invalid = storage.activate_baseline_and_clear_incremental_state(999_999, 2);
+        assert!(matches!(invalid, Err(StorageError::InvalidJournal(_))));
+        assert_eq!(storage.committed_index_deltas_after(0).unwrap().len(), 3);
+
+        storage
+            .activate_baseline_and_clear_incremental_state(baseline_id, 2)
+            .unwrap();
+
+        assert_eq!(
+            storage
+                .committed_index_deltas_after(0)
+                .unwrap()
+                .into_iter()
+                .map(|delta| delta.generation)
+                .collect::<Vec<_>>(),
+            vec![3]
+        );
+        let state = storage.runtime_state().unwrap().unwrap();
+        assert_eq!(state.active_baseline_id, Some(baseline_id));
+        assert_eq!(state.baseline_generation, 2);
+        assert_eq!(state.last_generation, 2);
+        storage
+            .save_completed_index_batch(20, &[indexed_entry("/root/not-active.md")])
+            .unwrap();
+        assert_eq!(
+            storage.active_index_snapshot().unwrap().unwrap().entries[0].path,
+            "/root/baseline.md"
+        );
 
         drop(storage);
         let _ = fs::remove_file(path);
@@ -1505,6 +2217,104 @@ mod tests {
             children[0].filesystem_kind,
             crate::core::targeted_index_scanner::FileSystemEntryKind::Directory
         );
+
+        drop(storage);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn windows_known_direct_children_use_persisted_normalized_keys_for_mixed_paths() {
+        let path = temp_db_path("windows-known-children");
+        let storage =
+            SqliteStorage::open_with_comparison_mode(path.clone(), PathComparisonMode::Windows)
+                .unwrap();
+        let mut old = indexed_entry(r"C:\Root\Old.md");
+        old.parent = r"C:\ROOT".to_owned();
+        old.root = r"C:\Root".to_owned();
+        storage.save_completed_index_batch(10, &[old]).unwrap();
+        let mut new = indexed_entry("c:/ROOT/New.md");
+        new.parent = "c:/Root".to_owned();
+        new.root = "C:/ROOT".to_owned();
+        storage
+            .commit_incremental_batch(
+                &CommittedIndexDelta {
+                    generation: 1,
+                    upserts: vec![new],
+                    removals: vec![PathBuf::from("c:/root/OLD.md")],
+                },
+                &[],
+                &[],
+            )
+            .unwrap();
+
+        let children = storage
+            .known_direct_indexed_children(Path::new("c:/ROOT"), Path::new(r"C:\root"))
+            .unwrap();
+
+        assert_eq!(
+            children
+                .iter()
+                .map(|entry| entry.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["c:/ROOT/New.md"]
+        );
+
+        drop(storage);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn windows_migration_backfills_normalized_keys_for_existing_baseline_rows() {
+        let path = temp_db_path("windows-key-backfill");
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute_batch(
+                    r#"
+                    PRAGMA user_version = 2;
+                    CREATE TABLE index_batches (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        completed_at_ms INTEGER NOT NULL,
+                        entry_count INTEGER NOT NULL
+                    );
+                    CREATE TABLE index_entries (
+                        batch_id INTEGER NOT NULL,
+                        path TEXT NOT NULL,
+                        name TEXT NOT NULL,
+                        kind TEXT NOT NULL,
+                        search_text TEXT NOT NULL,
+                        updated_at_ms INTEGER NOT NULL,
+                        parent TEXT,
+                        extension TEXT,
+                        depth INTEGER,
+                        root TEXT,
+                        modified_ms INTEGER,
+                        size_bytes INTEGER,
+                        content_index_state TEXT,
+                        PRIMARY KEY (batch_id, path)
+                    );
+                    INSERT INTO index_batches (completed_at_ms, entry_count) VALUES (10, 1);
+                    INSERT INTO index_entries (
+                        batch_id, path, name, kind, search_text, updated_at_ms,
+                        parent, depth, root, content_index_state
+                    ) VALUES (
+                        1, 'C:\Root\Legacy.md', 'Legacy.md', 'file', 'legacy', 10,
+                        'C:\ROOT', 1, 'C:\Root', 'not_indexed'
+                    );
+                    "#,
+                )
+                .unwrap();
+        }
+        let storage =
+            SqliteStorage::open_with_comparison_mode(path.clone(), PathComparisonMode::Windows)
+                .unwrap();
+
+        let children = storage
+            .known_direct_indexed_children(Path::new("c:/root"), Path::new("C:/ROOT"))
+            .unwrap();
+
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].path, r"C:\Root\Legacy.md");
 
         drop(storage);
         let _ = fs::remove_file(path);

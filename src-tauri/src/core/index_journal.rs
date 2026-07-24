@@ -53,6 +53,8 @@ impl IndexRecovery {
 }
 
 pub trait IndexJournalRepository {
+    fn incremental_schema_is_ready(&self) -> Result<bool, String>;
+
     fn commit_incremental_batch(
         &mut self,
         delta: &CommittedIndexDelta,
@@ -82,12 +84,22 @@ pub trait IndexJournalRepository {
 
     fn clear_incremental_state_through(&mut self, generation: u64) -> Result<(), String>;
 
+    fn activate_baseline_and_clear_incremental_state(
+        &mut self,
+        baseline_id: i64,
+        baseline_generation: u64,
+    ) -> Result<(), String>;
+
     fn runtime_state(&self) -> Result<Option<IncrementalRuntimeState>, String>;
 
     fn save_runtime_state(&mut self, state: &IncrementalRuntimeState) -> Result<(), String>;
 }
 
 impl IndexJournalRepository for SqliteStorage {
+    fn incremental_schema_is_ready(&self) -> Result<bool, String> {
+        SqliteStorage::incremental_schema_is_ready(self).map_err(|error| error.to_string())
+    }
+
     fn commit_incremental_batch(
         &mut self,
         delta: &CommittedIndexDelta,
@@ -136,6 +148,19 @@ impl IndexJournalRepository for SqliteStorage {
             .map_err(|error| error.to_string())
     }
 
+    fn activate_baseline_and_clear_incremental_state(
+        &mut self,
+        baseline_id: i64,
+        baseline_generation: u64,
+    ) -> Result<(), String> {
+        SqliteStorage::activate_baseline_and_clear_incremental_state(
+            self,
+            baseline_id,
+            baseline_generation,
+        )
+        .map_err(|error| error.to_string())
+    }
+
     fn runtime_state(&self) -> Result<Option<IncrementalRuntimeState>, String> {
         SqliteStorage::runtime_state(self).map_err(|error| error.to_string())
     }
@@ -178,7 +203,16 @@ pub fn recover_layered_index(
     baseline: Vec<IndexedEntry>,
 ) -> IndexRecovery {
     let baseline_entry_count = baseline.len();
-    let deltas = match repository.committed_index_deltas_after(0) {
+    match repository.incremental_schema_is_ready() {
+        Ok(true) => {}
+        Ok(false) | Err(_) => return failed_recovery(baseline, baseline_entry_count),
+    }
+    let baseline_generation = match repository.runtime_state() {
+        Ok(Some(state)) => state.baseline_generation,
+        Ok(None) => 0,
+        Err(_) => return failed_recovery(baseline, baseline_entry_count),
+    };
+    let deltas = match repository.committed_index_deltas_after(baseline_generation) {
         Ok(deltas) => deltas,
         Err(_) => return failed_recovery(baseline, baseline_entry_count),
     };
@@ -186,7 +220,8 @@ pub fn recover_layered_index(
         Ok(deltas) => deltas,
         Err(_) => return failed_recovery(baseline, baseline_entry_count),
     };
-    let mut index = LayeredSearchIndex::from_baseline(baseline);
+    let mut index = LayeredSearchIndex::default();
+    index.replace_baseline(baseline, baseline_generation);
     for delta in deltas {
         index.apply_delta(delta);
     }
@@ -294,7 +329,7 @@ mod tests {
         let connection = Connection::open(&path).unwrap();
         connection
             .execute(
-                "INSERT INTO index_delta_batches (generation, status, committed_at) VALUES (1, 'committed', 1)",
+                "INSERT INTO index_delta_batches (generation, status, committed_at_ms, payload_hash) VALUES (1, 'committed', 1, '')",
                 [],
             )
             .unwrap();
@@ -372,6 +407,32 @@ mod tests {
         let repository: Box<dyn IndexJournalRepository + Send> = Box::new(storage);
 
         drop(repository);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn recovery_skips_journal_already_incorporated_by_active_baseline() {
+        let path = temp_db_path("active-baseline-recovery");
+        let storage = SqliteStorage::open(path.clone()).unwrap();
+        let stale_delta = CommittedIndexDelta {
+            generation: 1,
+            upserts: vec![entry("/root/stale.md")],
+            removals: Vec::new(),
+        };
+        storage
+            .commit_incremental_batch(&stale_delta, &[], &[])
+            .unwrap();
+        let baseline = vec![entry("/root/fresh.md")];
+        let baseline_id = storage.save_completed_index_batch(10, &baseline).unwrap();
+        storage.activate_baseline(baseline_id, 1).unwrap();
+
+        let recovery = recover_layered_index(&storage, baseline);
+
+        assert!(search_titles(&recovery.index, "stale").is_empty());
+        assert_eq!(search_titles(&recovery.index, "fresh"), vec!["fresh.md"]);
+        assert_eq!(recovery.index.generation(), 1);
+
+        drop(storage);
         let _ = fs::remove_file(path);
     }
 
