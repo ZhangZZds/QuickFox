@@ -55,6 +55,7 @@ pub(crate) fn path_is_same_or_descendant_for_mode(
     let root = normalize_path_key_for_mode(root, mode);
     let candidate = normalize_path_key_for_mode(candidate, mode);
     candidate == root
+        || (root == "/" && candidate.starts_with('/'))
         || candidate
             .strip_prefix(&root)
             .is_some_and(|remainder| remainder.starts_with('/'))
@@ -464,6 +465,41 @@ mod tests {
             normalize_path_text_key(r"A\B"),
             normalize_path_text_key(r"a\b")
         );
+    }
+
+    #[test]
+    fn filesystem_roots_match_descendants_without_crossing_path_kinds() {
+        assert!(path_is_same_or_descendant_for_mode(
+            "/",
+            "/tmp/a",
+            PathComparisonMode::Native,
+        ));
+        assert!(!path_is_same_or_descendant_for_mode(
+            "/",
+            "tmp/a",
+            PathComparisonMode::Native,
+        ));
+        assert!(!path_is_same_or_descendant_for_mode(
+            "/",
+            r"C:\tmp\a",
+            PathComparisonMode::Native,
+        ));
+
+        assert!(path_is_same_or_descendant_for_mode(
+            "C:/",
+            r"c:\tmp\a",
+            PathComparisonMode::Windows,
+        ));
+        assert!(!path_is_same_or_descendant_for_mode(
+            "C:/",
+            "C:tmp/a",
+            PathComparisonMode::Windows,
+        ));
+        assert!(!path_is_same_or_descendant_for_mode(
+            "C:/",
+            "D:/tmp/a",
+            PathComparisonMode::Windows,
+        ));
     }
 
     #[test]

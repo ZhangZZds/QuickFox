@@ -1240,6 +1240,42 @@ mod tests {
     }
 
     #[test]
+    fn configured_root_matching_accepts_filesystem_root_descendants() {
+        let posix_root = PathBuf::from("/");
+        let posix_rules = IndexPathRules::from_plan(&IndexScanPlan {
+            include_roots: vec![posix_root.clone()],
+            ..IndexScanPlan::default()
+        })
+        .unwrap();
+
+        assert_eq!(
+            posix_rules.configured_root_for_mode(Path::new("/tmp/a"), PathComparisonMode::Native,),
+            Some(posix_root.as_path())
+        );
+        assert_eq!(
+            posix_rules.configured_root_for_mode(Path::new("tmp/a"), PathComparisonMode::Native),
+            None
+        );
+
+        let windows_root = PathBuf::from("C:/");
+        let windows_rules = IndexPathRules::from_plan(&IndexScanPlan {
+            include_roots: vec![windows_root.clone()],
+            ..IndexScanPlan::default()
+        })
+        .unwrap();
+        assert_eq!(
+            windows_rules
+                .configured_root_for_mode(Path::new(r"c:\tmp\a"), PathComparisonMode::Windows,),
+            Some(windows_root.as_path())
+        );
+        assert_eq!(
+            windows_rules
+                .configured_root_for_mode(Path::new("D:/tmp/a"), PathComparisonMode::Windows,),
+            None
+        );
+    }
+
+    #[test]
     fn configured_root_matching_supports_explicit_windows_mode() {
         let windows_root = PathBuf::from(r"C:\Users\Frank");
         let nested_root = PathBuf::from(r"C:\Users\Frank\Projects");
