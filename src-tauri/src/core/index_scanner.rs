@@ -4,7 +4,8 @@ use crate::core::index_entry::{
     IndexFailure, IndexReport, IndexScanStats, IndexedEntry, IndexedEntryKind, ScanEvent,
 };
 use globset::{Glob, GlobSet, GlobSetBuilder};
-use ignore::{DirEntry, WalkBuilder};
+use ignore::gitignore::GitignoreBuilder;
+use ignore::{DirEntry, Match, WalkBuilder};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -41,6 +42,48 @@ pub struct IndexScanPlan {
     pub stage: Option<IndexScanStage>,
 }
 
+#[derive(Debug, Clone)]
+pub struct IndexPathRules {
+    pub roots: Vec<PathBuf>,
+    exclude_dirs: HashSet<PathBuf>,
+    exclude_patterns: GlobSet,
+    pub respect_project_ignores: bool,
+}
+
+impl IndexPathRules {
+    pub fn from_plan(plan: &IndexScanPlan) -> Result<Self, std::io::Error> {
+        Ok(Self {
+            roots: unique_paths(plan.include_roots.clone()),
+            exclude_dirs: canonicalize_existing_paths(&plan.exclude_dirs),
+            exclude_patterns: compile_exclude_patterns(&plan.exclude_patterns)?,
+            respect_project_ignores: plan.respect_project_ignores,
+        })
+    }
+
+    pub fn configured_root_for(&self, path: &Path) -> Option<&Path> {
+        self.roots
+            .iter()
+            .filter(|root| path.starts_with(root))
+            .max_by_key(|root| root.components().count())
+            .map(PathBuf::as_path)
+    }
+
+    pub fn is_forced_or_user_excluded(&self, path: &Path) -> bool {
+        let configured_root = self.configured_root_for(path);
+        path.ancestors()
+            .take_while(|candidate| Some(*candidate) != configured_root)
+            .any(|candidate| {
+                is_forced_excluded(candidate)
+                    || is_user_excluded(candidate, &self.exclude_dirs)
+                    || matches_exclude_patterns(candidate, &self.exclude_patterns)
+            })
+    }
+
+    pub fn is_excluded(&self, path: &Path) -> bool {
+        self.is_forced_or_user_excluded(path) || is_inside_app_bundle(path)
+    }
+}
+
 impl Default for IndexScanPlan {
     fn default() -> Self {
         Self {
@@ -62,16 +105,111 @@ impl IgnoreScanner {
     pub fn with_threads(threads: usize) -> Self {
         Self { threads }
     }
+
+    pub fn scan_subtree(
+        &self,
+        target: &Path,
+        configured_root: &Path,
+        rules: &IndexPathRules,
+    ) -> Result<IndexReport, std::io::Error> {
+        self.scan_subtree_cancellable(target, configured_root, rules, || false)
+    }
+
+    pub fn scan_subtree_cancellable(
+        &self,
+        target: &Path,
+        configured_root: &Path,
+        rules: &IndexPathRules,
+        is_cancelled: impl Fn() -> bool,
+    ) -> Result<IndexReport, std::io::Error> {
+        if !target.starts_with(configured_root) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "target is outside its configured index root",
+            ));
+        }
+        if rules.is_excluded(target) {
+            return Ok(IndexReport::default());
+        }
+        if !target.exists() {
+            let failure = IndexFailure {
+                root: path_to_string(target),
+                message: "target path is not accessible".to_owned(),
+            };
+            return Ok(IndexReport {
+                failures: vec![failure.clone()],
+                scan_stats: IndexScanStats {
+                    failures: 1,
+                    ..IndexScanStats::default()
+                },
+                scan_events: vec![ScanEvent::Failure(failure)],
+                ..IndexReport::default()
+            });
+        }
+        if rules.respect_project_ignores
+            && target.is_file()
+            && is_project_ignored(target, configured_root)?
+        {
+            return Ok(IndexReport::default());
+        }
+
+        let mut report = IndexReport::default();
+        let filtered_skips = Arc::new(AtomicUsize::new(0));
+        let filter_rules = rules.clone();
+        let filter_skips = Arc::clone(&filtered_skips);
+        let mut builder = WalkBuilder::new(target);
+        builder
+            .standard_filters(rules.respect_project_ignores)
+            .hidden(false)
+            .require_git(false)
+            .threads(self.threads.max(1))
+            .filter_entry(move |entry| {
+                let keep = !filter_rules.is_excluded(entry.path());
+                if !keep {
+                    filter_skips.fetch_add(1, Ordering::Relaxed);
+                }
+                keep
+            });
+
+        for entry in builder.build() {
+            if is_cancelled() {
+                break;
+            }
+            match entry {
+                Ok(entry) => {
+                    report.scan_stats.scanned += 1;
+                    if let Some(indexed_entry) =
+                        indexed_entry_from_dir_entry(&entry, configured_root)
+                    {
+                        report.entries.push(indexed_entry);
+                        report.scan_stats.accepted += 1;
+                    } else {
+                        report.scan_stats.skipped += 1;
+                    }
+                }
+                Err(error) => push_failure(
+                    &mut report,
+                    IndexFailure {
+                        root: error_path(&error)
+                            .map(path_to_string)
+                            .unwrap_or_else(|| path_to_string(target)),
+                        message: error.to_string(),
+                    },
+                ),
+            }
+        }
+        report.scan_stats.skipped += filtered_skips.load(Ordering::Relaxed);
+        sort_report_entries(&mut report);
+        Ok(report)
+    }
 }
 
 impl FileSystemScanner for IgnoreScanner {
     fn scan(&self, plan: IndexScanPlan) -> Result<IndexReport, std::io::Error> {
-        let include_roots = unique_paths(plan.include_roots);
-        let exclude_dirs = canonicalize_existing_paths(&plan.exclude_dirs);
-        let exclude_patterns = compile_exclude_patterns(&plan.exclude_patterns)?;
+        let rules = IndexPathRules::from_plan(&plan)?;
         let mut report = IndexReport::default();
 
-        for root in include_roots {
+        for root in rules.roots.clone() {
             let root_label = path_to_string(&root);
             let stage_name = plan.stage.as_ref().map(|stage| stage.name.clone());
             report.scan_events.push(ScanEvent::RootStarted {
@@ -97,8 +235,7 @@ impl FileSystemScanner for IgnoreScanner {
             }
 
             let filtered_skips = Arc::new(AtomicUsize::new(0));
-            let filter_exclude_dirs = exclude_dirs.clone();
-            let filter_patterns = exclude_patterns.clone();
+            let filter_rules = rules.clone();
             let filter_skips = Arc::clone(&filtered_skips);
             let mut builder = WalkBuilder::new(&root);
             builder
@@ -108,11 +245,7 @@ impl FileSystemScanner for IgnoreScanner {
                 .threads(self.threads.max(1))
                 .filter_entry(move |entry| {
                     let path = entry.path();
-                    let keep = entry.depth() == 0
-                        || (!is_forced_excluded(path)
-                            && !is_user_excluded(path, &filter_exclude_dirs)
-                            && !matches_exclude_patterns(path, &filter_patterns)
-                            && !is_inside_app_bundle(path));
+                    let keep = entry.depth() == 0 || !filter_rules.is_excluded(path);
                     if !keep {
                         filter_skips.fetch_add(1, Ordering::Relaxed);
                     }
@@ -163,11 +296,10 @@ pub struct StdFsScanner;
 
 impl FileSystemScanner for StdFsScanner {
     fn scan(&self, plan: IndexScanPlan) -> Result<IndexReport, std::io::Error> {
-        let exclude_dirs = canonicalize_existing_paths(&plan.exclude_dirs);
-        let exclude_patterns = compile_exclude_patterns(&plan.exclude_patterns)?;
+        let rules = IndexPathRules::from_plan(&plan)?;
         let mut report = IndexReport::default();
 
-        for root in unique_paths(plan.include_roots) {
+        for root in rules.roots.clone() {
             if !root.is_dir() {
                 push_failure(
                     &mut report,
@@ -178,7 +310,7 @@ impl FileSystemScanner for StdFsScanner {
                 );
                 continue;
             }
-            scan_dir_std(&root, &root, &exclude_dirs, &exclude_patterns, &mut report)?;
+            scan_dir_std(&root, &root, &rules, &mut report)?;
         }
 
         sort_report_entries(&mut report);
@@ -189,8 +321,7 @@ impl FileSystemScanner for StdFsScanner {
 fn scan_dir_std(
     root: &Path,
     dir: &Path,
-    exclude_dirs: &HashSet<PathBuf>,
-    exclude_patterns: &GlobSet,
+    rules: &IndexPathRules,
     report: &mut IndexReport,
 ) -> Result<(), std::io::Error> {
     let read_dir = match fs::read_dir(dir) {
@@ -225,10 +356,7 @@ fn scan_dir_std(
             }
         };
         let path = entry.path();
-        if is_forced_excluded(&path)
-            || is_user_excluded(&path, exclude_dirs)
-            || matches_exclude_patterns(&path, exclude_patterns)
-        {
+        if rules.is_excluded(&path) {
             report.scan_stats.skipped += 1;
             continue;
         }
@@ -261,7 +389,7 @@ fn scan_dir_std(
             .push(IndexedEntry::from_path_metadata(&path, root, kind));
         report.scan_stats.accepted += 1;
         if file_type.is_dir() && !is_application_path(&path) {
-            scan_dir_std(root, &path, exclude_dirs, exclude_patterns, report)?;
+            scan_dir_std(root, &path, rules, report)?;
         }
     }
     Ok(())
@@ -346,15 +474,51 @@ fn unique_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
 fn canonicalize_existing_paths(paths: &[PathBuf]) -> HashSet<PathBuf> {
     paths
         .iter()
-        .filter_map(|path| path.canonicalize().ok())
+        .flat_map(|path| {
+            let canonical = path.canonicalize().ok();
+            std::iter::once(path.clone()).chain(canonical)
+        })
         .collect()
 }
 
 fn is_user_excluded(path: &Path, exclude_dirs: &HashSet<PathBuf>) -> bool {
-    let Ok(canonical) = path.canonicalize() else {
-        return false;
+    exclude_dirs.contains(path)
+}
+
+fn is_project_ignored(path: &Path, configured_root: &Path) -> Result<bool, std::io::Error> {
+    let Some(parent) = path.parent() else {
+        return Ok(false);
     };
-    exclude_dirs.contains(&canonical)
+    let Ok(relative_parent) = parent.strip_prefix(configured_root) else {
+        return Ok(false);
+    };
+    let mut directories = vec![configured_root.to_path_buf()];
+    let mut current = configured_root.to_path_buf();
+    for component in relative_parent.components() {
+        current.push(component);
+        directories.push(current.clone());
+    }
+
+    let mut ignored = false;
+    for directory in directories {
+        for filename in [".git/info/exclude", ".gitignore", ".ignore"] {
+            let ignore_file = directory.join(filename);
+            if !ignore_file.is_file() {
+                continue;
+            }
+            let mut builder = GitignoreBuilder::new(&directory);
+            if let Some(error) = builder.add(&ignore_file) {
+                return Err(glob_error_to_io(error));
+            }
+            let matcher = builder.build().map_err(glob_error_to_io)?;
+            match matcher.matched(path, false) {
+                Match::Ignore(_) => ignored = true,
+                Match::Whitelist(_) => ignored = false,
+                Match::None => {}
+            }
+        }
+    }
+    Ok(ignored)
 }
 
 fn is_forced_excluded(path: &Path) -> bool {
@@ -665,6 +829,56 @@ mod tests {
             event,
             ScanEvent::Failure(IndexFailure { root, .. }) if root.ends_with("locked")
         )));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn index_path_rules_choose_longest_segment_boundary_root() {
+        let root = temp_dir("rules-root");
+        let nested = root.join("work");
+        let sibling_prefix = root.join("workspace");
+        fs::create_dir_all(&nested).unwrap();
+        fs::create_dir_all(&sibling_prefix).unwrap();
+        let rules = IndexPathRules::from_plan(&IndexScanPlan {
+            include_roots: vec![root.clone(), nested.clone()],
+            ..IndexScanPlan::default()
+        })
+        .unwrap();
+
+        assert_eq!(
+            rules.configured_root_for(&nested.join("file.md")),
+            Some(nested.as_path())
+        );
+        assert_eq!(
+            rules.configured_root_for(&sibling_prefix.join("file.md")),
+            Some(root.as_path())
+        );
+        assert_eq!(
+            rules.configured_root_for(&root.with_extension("other")),
+            None
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn index_path_rules_apply_forced_user_and_glob_exclusions_to_descendants() {
+        let root = temp_dir("rules-excludes");
+        let user_excluded = root.join("private");
+        fs::create_dir_all(user_excluded.join("nested")).unwrap();
+        let rules = IndexPathRules::from_plan(&IndexScanPlan {
+            include_roots: vec![root.clone()],
+            exclude_dirs: vec![user_excluded.clone()],
+            exclude_patterns: vec!["*.tmp".to_owned()],
+            ..IndexScanPlan::default()
+        })
+        .unwrap();
+
+        assert!(rules.is_forced_or_user_excluded(&root.join("node_modules/pkg/a.js")));
+        assert!(rules.is_forced_or_user_excluded(&user_excluded.join("nested/file.md")));
+        assert!(rules.is_forced_or_user_excluded(&root.join("nested/cache.tmp")));
+        assert!(!rules.is_forced_or_user_excluded(&root.join("nested/keep.md")));
 
         let _ = fs::remove_dir_all(root);
     }

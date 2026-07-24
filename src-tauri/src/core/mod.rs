@@ -14,3 +14,4 @@ pub mod platform;
 pub mod providers;
 pub mod search;
 pub mod storage;
+pub mod targeted_index_scanner;
