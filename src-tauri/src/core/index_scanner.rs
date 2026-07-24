@@ -4,8 +4,7 @@ use crate::core::index_entry::{
     IndexFailure, IndexReport, IndexScanStats, IndexedEntry, IndexedEntryKind, ScanEvent,
 };
 use globset::{Glob, GlobSet, GlobSetBuilder};
-use ignore::gitignore::GitignoreBuilder;
-use ignore::{DirEntry, Match, WalkBuilder};
+use ignore::{DirEntry, WalkBuilder};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -146,10 +145,7 @@ impl IgnoreScanner {
                 ..IndexReport::default()
             });
         }
-        if rules.respect_project_ignores
-            && target.is_file()
-            && is_project_ignored(target, configured_root)?
-        {
+        if !self.path_is_included(target, configured_root, rules)? {
             return Ok(IndexReport::default());
         }
 
@@ -201,6 +197,44 @@ impl IgnoreScanner {
         report.scan_stats.skipped += filtered_skips.load(Ordering::Relaxed);
         sort_report_entries(&mut report);
         Ok(report)
+    }
+
+    pub fn path_is_included(
+        &self,
+        target: &Path,
+        configured_root: &Path,
+        rules: &IndexPathRules,
+    ) -> Result<bool, std::io::Error> {
+        if !target.starts_with(configured_root) || rules.is_excluded(target) {
+            return Ok(false);
+        }
+        if !rules.respect_project_ignores || target == configured_root {
+            return Ok(true);
+        }
+
+        let target_path = target.to_path_buf();
+        let filter_target = target_path.clone();
+        let filter_rules = rules.clone();
+        let mut builder = WalkBuilder::new(configured_root);
+        builder
+            .standard_filters(true)
+            .hidden(false)
+            .require_git(false)
+            .threads(1)
+            .filter_entry(move |entry| {
+                entry.depth() == 0
+                    || (filter_target.starts_with(entry.path())
+                        && !filter_rules.is_excluded(entry.path()))
+            });
+
+        for entry in builder.build() {
+            match entry {
+                Ok(entry) if entry.path() == target_path => return Ok(true),
+                Ok(_) => {}
+                Err(error) => return Err(glob_error_to_io(error)),
+            }
+        }
+        Ok(false)
     }
 }
 
@@ -483,42 +517,6 @@ fn canonicalize_existing_paths(paths: &[PathBuf]) -> HashSet<PathBuf> {
 
 fn is_user_excluded(path: &Path, exclude_dirs: &HashSet<PathBuf>) -> bool {
     exclude_dirs.contains(path)
-}
-
-fn is_project_ignored(path: &Path, configured_root: &Path) -> Result<bool, std::io::Error> {
-    let Some(parent) = path.parent() else {
-        return Ok(false);
-    };
-    let Ok(relative_parent) = parent.strip_prefix(configured_root) else {
-        return Ok(false);
-    };
-    let mut directories = vec![configured_root.to_path_buf()];
-    let mut current = configured_root.to_path_buf();
-    for component in relative_parent.components() {
-        current.push(component);
-        directories.push(current.clone());
-    }
-
-    let mut ignored = false;
-    for directory in directories {
-        for filename in [".git/info/exclude", ".gitignore", ".ignore"] {
-            let ignore_file = directory.join(filename);
-            if !ignore_file.is_file() {
-                continue;
-            }
-            let mut builder = GitignoreBuilder::new(&directory);
-            if let Some(error) = builder.add(&ignore_file) {
-                return Err(glob_error_to_io(error));
-            }
-            let matcher = builder.build().map_err(glob_error_to_io)?;
-            match matcher.matched(path, false) {
-                Match::Ignore(_) => ignored = true,
-                Match::Whitelist(_) => ignored = false,
-                Match::None => {}
-            }
-        }
-    }
-    Ok(ignored)
 }
 
 fn is_forced_excluded(path: &Path) -> bool {

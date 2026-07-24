@@ -2,6 +2,31 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
+pub fn normalize_path_key(path: impl AsRef<Path>) -> String {
+    normalize_path_text_key(&path.as_ref().to_string_lossy())
+}
+
+pub fn normalize_path_text_key(path: &str) -> String {
+    let normalized = path.replace('\\', "/");
+    let normalized = if normalized.len() > 1 {
+        normalized.trim_end_matches('/').to_owned()
+    } else {
+        normalized
+    };
+    let bytes = path.as_bytes();
+    let has_windows_drive_prefix =
+        bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+    let windows_style = cfg!(target_os = "windows")
+        || path.contains('\\')
+        || normalized.starts_with("//")
+        || has_windows_drive_prefix;
+    if windows_style {
+        normalized.to_lowercase()
+    } else {
+        normalized
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IndexedEntryKind {
     Application,

@@ -2,10 +2,11 @@
 
 use crate::core::content_index::ContentPathFilter;
 use crate::core::index::{FileSearchIndex, IndexedEntry, IndexedEntryKind, SearchIndex};
+use crate::core::index_entry::{normalize_path_key, normalize_path_text_key};
 use crate::core::search::{QueryRequest, SearchResult};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 #[cfg(test)]
@@ -126,7 +127,7 @@ impl ContentVisibilitySnapshot {
     }
 
     fn is_visible(&self, path: &str) -> bool {
-        let key = normalize_path_text(path);
+        let key = normalize_path_text_key(path);
         if self.overlay_paths.contains(&key) || self.exact_tombstones.contains(&key) {
             return false;
         }
@@ -182,7 +183,7 @@ impl LayeredSearchIndex {
         let baseline_by_path: BTreeMap<_, _> = baseline
             .entries()
             .iter()
-            .map(|entry| (normalize_path_text(&entry.path), entry.kind.clone()))
+            .map(|entry| (normalize_path_text_key(&entry.path), entry.kind.clone()))
             .collect();
         let visible_entry_count = baseline_by_path.len();
         Self {
@@ -209,7 +210,7 @@ impl LayeredSearchIndex {
         }
 
         for removal in delta.removals {
-            let key = normalize_path(removal);
+            let key = normalize_path_key(removal);
             let is_directory = self.path_is_directory(&key);
             let visible_before = self.count_visible_scope(&key, is_directory);
             if is_directory {
@@ -225,7 +226,7 @@ impl LayeredSearchIndex {
         }
 
         for entry in delta.upserts {
-            let key = normalize_path_text(&entry.path);
+            let key = normalize_path_text_key(&entry.path);
             let replaces_directory =
                 entry.kind != IndexedEntryKind::Directory && self.path_is_directory(&key);
             let visible_before = self.count_visible_scope(&key, replaces_directory);
@@ -259,7 +260,7 @@ impl LayeredSearchIndex {
         }
         self.baseline_by_path = entries
             .iter()
-            .map(|entry| (normalize_path_text(&entry.path), entry.kind.clone()))
+            .map(|entry| (normalize_path_text_key(&entry.path), entry.kind.clone()))
             .collect();
         self.visible_entry_count = self.baseline_by_path.len();
         self.baseline = SearchIndex::from_entries(entries);
@@ -378,7 +379,7 @@ impl LayeredSearchIndex {
         #[cfg(test)]
         self.content_visibility_baseline_scan_count
             .fetch_add(1, Ordering::Relaxed);
-        let key = normalize_path_text(&entry.path);
+        let key = normalize_path_text_key(&entry.path);
         !self.overlay_entries.contains_key(&key) && !self.tombstones.contains(&key)
     }
 
@@ -477,28 +478,6 @@ impl FileSearchIndex for LayeredSearchIndex {
 
     fn indexed_entry_count(&self) -> usize {
         self.entry_count()
-    }
-}
-
-fn normalize_path(path: impl AsRef<Path>) -> String {
-    normalize_path_text(&path.as_ref().to_string_lossy())
-}
-
-fn normalize_path_text(path: &str) -> String {
-    let normalized = path.replace('\\', "/");
-    let normalized = if normalized.len() > 1 {
-        normalized.trim_end_matches('/').to_owned()
-    } else {
-        normalized
-    };
-
-    #[cfg(target_os = "windows")]
-    {
-        normalized.to_lowercase()
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        normalized
     }
 }
 
