@@ -1,7 +1,7 @@
 ## 1. 回归基线与模块边界
 
 - [ ] 1.1 增加失败测试，证明当前 watcher receiver 被丢弃后创建事件不会更新运行期搜索结果
-- [ ] 1.2 增加失败性能测试，证明现有 `apply_update_batch` 会重建完整 compact candidate index
+- [x] 1.2 增加失败性能测试，证明现有 `apply_update_batch` 会重建完整 compact candidate index
 - [ ] 1.3 建立 `index_update_coordinator`、`targeted_index_scanner`、`layered_index` 和 `index_journal` 模块边界，保持 `lib.rs` 只负责 Tauri/runtime 接线
 
 ## 2. 有界 watcher 事件协调器
@@ -21,11 +21,11 @@
 
 ## 4. Baseline、Overlay 与 Tombstone 查询
 
-- [ ] 4.1 按 TDD 实现规范化路径键、overlay 替换和目录前缀 tombstone 数据结构
-- [ ] 4.2 扩展 compact baseline 查询，在候选评分和截断前应用 visibility predicate
-- [ ] 4.3 按 TDD 实现 `LayeredSearchIndex` 的 baseline/overlay 合并、去重、稳定排序与 generation snapshot
-- [ ] 4.4 使用现有完整索引作为 oracle，验证新增、覆盖、文件删除、目录删除、重命名和历史排序语义
-- [ ] 4.5 验证普通增量只重建 overlay 候选结构，compact baseline build count 不发生变化
+- [x] 4.1 按 TDD 实现规范化路径键、overlay 替换和目录前缀 tombstone 数据结构
+- [x] 4.2 扩展 compact baseline 查询，在候选评分和截断前应用 visibility predicate
+- [x] 4.3 按 TDD 实现 `LayeredSearchIndex` 的 baseline/overlay 合并、去重、稳定排序与 generation snapshot
+- [x] 4.4 使用现有完整索引作为 oracle，验证新增、覆盖、文件删除、目录删除、重命名和历史排序语义
+- [x] 4.5 验证普通增量只重建 overlay 候选结构，compact baseline build count 不发生变化
 
 ## 5. Delta journal、恢复与基线安全阈值
 
