@@ -367,6 +367,8 @@ pub struct CompactCandidateIndex {
     extensions: ExtensionIndex,
     path_segments: PathSegmentIndex,
     exact_paths: ExactPathIndex,
+    #[cfg(test)]
+    build_id: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -385,7 +387,9 @@ pub struct CandidateRetrieval {
 impl CompactCandidateIndex {
     pub fn from_entries(entries: Vec<IndexedEntry>) -> Self {
         #[cfg(test)]
-        COMPACT_INDEX_BUILD_COUNT.fetch_add(1, Ordering::Relaxed);
+        let build_id = COMPACT_INDEX_BUILD_COUNT
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
 
         let table = EntryTable::from_entries(entries);
         Self {
@@ -396,6 +400,8 @@ impl CompactCandidateIndex {
             path_segments: PathSegmentIndex::build(&table),
             exact_paths: ExactPathIndex::build(&table),
             table,
+            #[cfg(test)]
+            build_id,
         }
     }
 
@@ -407,6 +413,11 @@ impl CompactCandidateIndex {
     #[cfg(test)]
     pub fn build_count() -> usize {
         COMPACT_INDEX_BUILD_COUNT.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub fn build_id(&self) -> usize {
+        self.build_id
     }
 
     pub fn retrieve_ordinary_term(&self, term: &str) -> CandidateRetrieval {

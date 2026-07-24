@@ -79,6 +79,8 @@ pub struct LayeredSearchIndex {
     generation: u64,
     #[cfg(test)]
     baseline_build_count: usize,
+    #[cfg(test)]
+    overlay_build_count: usize,
 }
 
 impl Default for LayeredSearchIndex {
@@ -90,6 +92,8 @@ impl Default for LayeredSearchIndex {
 impl LayeredSearchIndex {
     pub fn from_baseline(entries: Vec<IndexedEntry>) -> Self {
         let baseline = SearchIndex::from_entries(entries);
+        #[cfg(test)]
+        let baseline_build_count = baseline.compact_build_id();
         Self {
             baseline,
             overlay_entries: BTreeMap::new(),
@@ -97,7 +101,9 @@ impl LayeredSearchIndex {
             tombstones: PathTombstones::default(),
             generation: 0,
             #[cfg(test)]
-            baseline_build_count: 1,
+            baseline_build_count,
+            #[cfg(test)]
+            overlay_build_count: 0,
         }
     }
 
@@ -125,6 +131,11 @@ impl LayeredSearchIndex {
         }
 
         self.overlay = SearchIndex::from_entries(self.overlay_entries.values().cloned().collect());
+        #[cfg(test)]
+        {
+            debug_assert_ne!(self.overlay.compact_build_id(), 0);
+            self.overlay_build_count = self.overlay_build_count.saturating_add(1);
+        }
         self.generation = delta.generation;
     }
 
@@ -139,7 +150,7 @@ impl LayeredSearchIndex {
         self.generation = generation;
         #[cfg(test)]
         {
-            self.baseline_build_count = self.baseline_build_count.saturating_add(1);
+            self.baseline_build_count = self.baseline.compact_build_id();
         }
     }
 
@@ -212,6 +223,11 @@ impl LayeredSearchIndex {
     #[cfg(test)]
     pub fn baseline_build_count(&self) -> usize {
         self.baseline_build_count
+    }
+
+    #[cfg(test)]
+    pub fn overlay_build_count(&self) -> usize {
+        self.overlay_build_count
     }
 
     fn baseline_entry_is_visible(&self, entry: &IndexedEntry) -> bool {
@@ -310,7 +326,6 @@ fn indexed_entry_string_bytes(entry: &IndexedEntry) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{CommittedIndexDelta, LayeredSearchIndex};
-    use crate::core::compact_index::CompactCandidateIndex;
     use crate::core::index::{IndexedEntry, IndexedEntryKind, SearchIndex};
     use crate::core::index_watcher::IndexUpdateBatch;
     use crate::core::search::{HistoryScores, QueryRequest, Ranker, SearchMode};
@@ -528,8 +543,8 @@ mod tests {
             &root,
             IndexedEntryKind::File,
         )]);
-        let compact_builds = CompactCandidateIndex::build_count();
         let baseline_builds = index.baseline_build_count();
+        let overlay_builds = index.overlay_build_count();
 
         index.apply_delta(CommittedIndexDelta {
             generation: 1,
@@ -537,8 +552,9 @@ mod tests {
             removals: Vec::new(),
         });
 
-        assert!(CompactCandidateIndex::build_count() > compact_builds);
+        assert_eq!(index.overlay_build_count(), overlay_builds + 1);
         assert_eq!(index.baseline_build_count(), baseline_builds);
+        assert_ne!(baseline_builds, 0);
     }
 
     #[test]

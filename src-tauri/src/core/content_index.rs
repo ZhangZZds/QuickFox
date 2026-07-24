@@ -6,15 +6,19 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use tantivy::collector::TopDocs;
+use std::sync::Arc;
+use tantivy::collector::{BytesFilterCollector, TopDocs};
 use tantivy::query::QueryParser;
-use tantivy::schema::{Field, Schema, Value, STORED, STRING, TEXT};
+use tantivy::schema::{Field, Schema, Value, FAST, STORED, STRING, TEXT};
 use tantivy::{doc, Index, IndexWriter, TantivyDocument, Term};
 
 pub const DEFAULT_MAX_CONTENT_BYTES: u64 = 2 * 1024 * 1024;
 pub const CONTENT_INDEX_DIR_VERSION: &str = "content-v1";
 
 type ContentResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+pub(crate) type ContentPathFilter = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
+const PATH_FILTER_FIELD_NAME: &str = "path_filter";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContentIndexOptions {
@@ -37,6 +41,7 @@ impl Default for ContentIndexOptions {
 pub struct ContentIndex {
     index: Index,
     path_field: Field,
+    path_filter_field: Field,
     content_field: Field,
 }
 
@@ -127,6 +132,7 @@ impl ContentIndex {
 
         let schema = content_schema();
         let path_field = schema.get_field("path")?;
+        let path_filter_field = schema.get_field(PATH_FILTER_FIELD_NAME)?;
         let content_field = schema.get_field("content")?;
         let index = Index::create_in_dir(&index_dir, schema)?;
         let mut writer: IndexWriter = index.writer(50_000_000)?;
@@ -140,6 +146,7 @@ impl ContentIndex {
                 ContentExtractionResult::Text(content) => {
                     writer.add_document(doc!(
                         path_field => entry.path.clone(),
+                        path_filter_field => entry.path.as_bytes(),
                         content_field => content.clone(),
                     ))?;
                     entry.content_index_state = ContentIndexState::Indexed;
@@ -161,6 +168,7 @@ impl ContentIndex {
         Ok(Self {
             index,
             path_field,
+            path_filter_field,
             content_field,
         })
     }
@@ -169,6 +177,30 @@ impl ContentIndex {
         &self,
         content_query: &str,
         candidate_paths: Option<&HashSet<String>>,
+        limit: usize,
+    ) -> ContentResult<Vec<ContentSearchHit>> {
+        self.search_with_candidate_paths(
+            content_query,
+            candidate_paths.map(|paths| Arc::new(paths.clone())),
+            limit,
+        )
+    }
+
+    pub(crate) fn search_with_candidate_paths(
+        &self,
+        content_query: &str,
+        candidate_paths: Option<Arc<HashSet<String>>>,
+        limit: usize,
+    ) -> ContentResult<Vec<ContentSearchHit>> {
+        let path_filter = candidate_paths
+            .map(|paths| Arc::new(move |path: &str| paths.contains(path)) as ContentPathFilter);
+        self.search_with_path_filter(content_query, path_filter, limit)
+    }
+
+    pub(crate) fn search_with_path_filter(
+        &self,
+        content_query: &str,
+        path_filter: Option<ContentPathFilter>,
         limit: usize,
     ) -> ContentResult<Vec<ContentSearchHit>> {
         if limit == 0 || content_query.trim().is_empty() {
@@ -180,8 +212,18 @@ impl ContentIndex {
         let parser = QueryParser::for_index(&self.index, vec![self.content_field]);
         let query = parser.parse_query(content_query)?;
         let tantivy_limit = limit.saturating_mul(4).clamp(10, 10_000);
-        let top_docs =
-            searcher.search(&query, &TopDocs::with_limit(tantivy_limit).order_by_score())?;
+        let top_docs = if let Some(path_filter) = path_filter {
+            let collector = BytesFilterCollector::new(
+                PATH_FILTER_FIELD_NAME.to_owned(),
+                move |path_bytes: &[u8]| {
+                    std::str::from_utf8(path_bytes).is_ok_and(|path| path_filter(path))
+                },
+                TopDocs::with_limit(tantivy_limit).order_by_score(),
+            );
+            searcher.search(&query, &collector)?
+        } else {
+            searcher.search(&query, &TopDocs::with_limit(tantivy_limit).order_by_score())?
+        };
         let mut hits = Vec::new();
 
         for (score, address) in top_docs {
@@ -193,10 +235,6 @@ impl ContentIndex {
             else {
                 continue;
             };
-
-            if candidate_paths.is_some_and(|candidates| !candidates.contains(&path)) {
-                continue;
-            }
 
             let Some(content) = doc
                 .get_first(self.content_field)
@@ -247,8 +285,9 @@ impl ContentIndex {
             ContentExtractionResult::Text(content) => {
                 let mut writer: IndexWriter = self.index.writer(50_000_000)?;
                 writer.add_document(doc!(
-                    self.path_field => entry.path.clone(),
-                    self.content_field => content.clone(),
+                        self.path_field => entry.path.clone(),
+                        self.path_filter_field => entry.path.as_bytes(),
+                        self.content_field => content.clone(),
                 ))?;
                 writer.commit()?;
                 entry.content_index_state = ContentIndexState::Indexed;
@@ -327,6 +366,7 @@ impl ExtractedDocument {
 fn content_schema() -> Schema {
     let mut builder = Schema::builder();
     builder.add_text_field("path", STRING | STORED);
+    builder.add_bytes_field(PATH_FILTER_FIELD_NAME, FAST);
     builder.add_text_field("content", TEXT | STORED);
     builder.build()
 }

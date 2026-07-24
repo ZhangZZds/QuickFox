@@ -3,7 +3,7 @@
 use crate::core::actions::Action;
 use crate::core::compact_index::CompactCandidateIndex;
 use crate::core::content_index::{
-    ContentIndex, ContentIndexOptions, ContentSearchHit, PlainTextExtractor,
+    ContentIndex, ContentIndexOptions, ContentPathFilter, ContentSearchHit, PlainTextExtractor,
 };
 use crate::core::file_matcher::FileMatcher;
 use crate::core::file_query::FileQuery;
@@ -15,6 +15,7 @@ use crate::core::index_scanner::{FileSystemScanner, IgnoreScanner, IndexScanPlan
 use crate::core::search::{QueryRequest, SearchMode, SearchResult, SearchResultKind};
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -126,6 +127,11 @@ impl SearchIndex {
     #[cfg(test)]
     pub fn clone_count() -> usize {
         SEARCH_INDEX_CLONE_COUNT.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn compact_build_id(&self) -> usize {
+        self.compact_candidates.build_id()
     }
 
     pub fn refresh_with_scanner(
@@ -334,14 +340,13 @@ impl SearchIndex {
             return Some(candidates.into_iter().map(entry_to_result).collect());
         }
 
-        let candidate_paths: HashSet<_> =
-            candidates.iter().map(|entry| entry.path.clone()).collect();
+        let candidate_paths = Arc::new(candidates.iter().map(|entry| entry.path.clone()).collect());
         if is_cancelled() {
             return None;
         }
         let content_hits = self.search_content_hits(
             &parsed_query,
-            Some(&candidate_paths),
+            Some(candidate_paths),
             self.entries.len().max(limit),
         );
         let hit_by_path: HashMap<_, _> = content_hits
@@ -376,14 +381,20 @@ impl SearchIndex {
         limit: usize,
         is_visible: &impl Fn(&IndexedEntry) -> bool,
     ) -> Vec<SearchResult> {
-        let visible_paths: HashSet<_> = self
+        let hidden_paths: HashSet<_> = self
             .entries
             .iter()
-            .filter(|entry| is_visible(entry))
+            .filter(|entry| !is_visible(entry))
             .map(|entry| entry.path.clone())
             .collect();
+        let path_filter = if hidden_paths.is_empty() {
+            None
+        } else {
+            let hidden_paths = Arc::new(hidden_paths);
+            Some(Arc::new(move |path: &str| !hidden_paths.contains(path)) as ContentPathFilter)
+        };
         let hits =
-            self.search_content_hits(query, Some(&visible_paths), self.entries.len().max(limit));
+            self.search_content_hits_with_filter(query, path_filter, self.entries.len().max(limit));
         let entry_by_path: HashMap<_, _> = self
             .entries
             .iter()
@@ -414,7 +425,7 @@ impl SearchIndex {
     fn search_content_hits(
         &self,
         query: &FileQuery,
-        candidate_paths: Option<&HashSet<String>>,
+        candidate_paths: Option<Arc<HashSet<String>>>,
         limit: usize,
     ) -> Vec<ContentSearchHit> {
         let Some(content_index) = &self.content_index else {
@@ -422,7 +433,22 @@ impl SearchIndex {
         };
         let content_query = query.content_queries.join(" ");
         content_index
-            .search(&content_query, candidate_paths, limit)
+            .search_with_candidate_paths(&content_query, candidate_paths, limit)
+            .unwrap_or_default()
+    }
+
+    fn search_content_hits_with_filter(
+        &self,
+        query: &FileQuery,
+        path_filter: Option<ContentPathFilter>,
+        limit: usize,
+    ) -> Vec<ContentSearchHit> {
+        let Some(content_index) = &self.content_index else {
+            return Vec::new();
+        };
+        let content_query = query.content_queries.join(" ");
+        content_index
+            .search_with_path_filter(&content_query, path_filter, limit)
             .unwrap_or_default()
     }
 
@@ -588,7 +614,9 @@ fn parent_path_text(path: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::content_index::DEFAULT_MAX_CONTENT_BYTES;
+    use crate::core::content_index::{
+        ContentExtractionResult, TextExtractor, DEFAULT_MAX_CONTENT_BYTES,
+    };
     use std::fs;
     use std::path::PathBuf;
     use std::time::Instant;
@@ -1412,6 +1440,34 @@ mod tests {
     }
 
     #[test]
+    fn content_only_visibility_filter_precedes_tantivy_top_docs_cutoff() {
+        let (_workspace, index) = large_visibility_content_fixture("content-only-top-docs");
+        let parser = crate::core::search::QueryParser::new(Default::default());
+
+        let results =
+            index.search_with_limit_visible(&parser.parse("content:needle"), 1, |entry| {
+                entry.name == "shared-visible.md"
+            });
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "shared-visible.md");
+    }
+
+    #[test]
+    fn mixed_content_visibility_filter_precedes_tantivy_top_docs_cutoff() {
+        let (_workspace, index) = large_visibility_content_fixture("mixed-top-docs");
+        let parser = crate::core::search::QueryParser::new(Default::default());
+
+        let results =
+            index.search_with_limit_visible(&parser.parse("shared content:needle"), 1, |entry| {
+                entry.name == "shared-visible.md"
+            });
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "shared-visible.md");
+    }
+
+    #[test]
     fn update_batch_rebuilds_full_compact_candidate_index() {
         let mut index = SearchIndex::from_entries(vec![file_entry("/tmp/base.md")]);
         let builds_before_update = CompactCandidateIndex::build_count();
@@ -1940,6 +1996,52 @@ mod tests {
             .to_owned();
         entry.depth = path.split(['/', '\\']).count().saturating_sub(1);
         entry
+    }
+
+    struct RankedContentExtractor;
+
+    impl TextExtractor for RankedContentExtractor {
+        fn extract(&self, path: &std::path::Path, _max_bytes: u64) -> ContentExtractionResult {
+            if path
+                .file_name()
+                .is_some_and(|name| name == "shared-visible.md")
+            {
+                ContentExtractionResult::Text("needle".to_owned())
+            } else {
+                ContentExtractionResult::Text("needle ".repeat(32))
+            }
+        }
+    }
+
+    fn large_visibility_content_fixture(label: &str) -> (tempfile::TempDir, SearchIndex) {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path();
+        let mut entries: Vec<_> = (0..10_001)
+            .map(|index| {
+                file_entry(
+                    &root
+                        .join(format!("shared-hidden-{index:05}.md"))
+                        .to_string_lossy(),
+                )
+            })
+            .collect();
+        entries.push(file_entry(
+            &root.join("shared-visible.md").to_string_lossy(),
+        ));
+        let content_index = ContentIndex::build_with_extractor(
+            &mut entries,
+            ContentIndexOptions {
+                index_dir: root.join(format!("tantivy-{label}")),
+                max_file_bytes: DEFAULT_MAX_CONTENT_BYTES,
+            },
+            &RankedContentExtractor,
+        )
+        .unwrap();
+
+        (
+            workspace,
+            SearchIndex::from_entries_with_content_index(entries, content_index),
+        )
     }
 
     fn temp_dir(label: &str) -> std::path::PathBuf {
