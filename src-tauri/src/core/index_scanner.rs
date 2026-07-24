@@ -4,7 +4,8 @@ use crate::core::index_entry::{
     IndexFailure, IndexReport, IndexScanStats, IndexedEntry, IndexedEntryKind, ScanEvent,
 };
 use globset::{Glob, GlobSet, GlobSetBuilder};
-use ignore::{DirEntry, WalkBuilder};
+use ignore::gitignore::{gitconfig_excludes_path, Gitignore, GitignoreBuilder};
+use ignore::{DirEntry, Match, WalkBuilder};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -95,14 +96,72 @@ impl Default for IndexScanPlan {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+pub trait IgnorePathProbe: std::fmt::Debug + Send + Sync {
+    fn read_file(&self, path: &Path) -> Result<Option<String>, std::io::Error>;
+    fn is_directory(&self, path: &Path) -> Result<bool, std::io::Error>;
+    fn global_ignore_path(&self) -> Option<PathBuf>;
+    fn read_dir(&self, path: &Path) -> Result<Vec<PathBuf>, std::io::Error>;
+}
+
+#[derive(Debug, Default)]
+struct StdIgnorePathProbe;
+
+impl IgnorePathProbe for StdIgnorePathProbe {
+    fn read_file(&self, path: &Path) -> Result<Option<String>, std::io::Error> {
+        match fs::read_to_string(path) {
+            Ok(contents) => Ok(Some(contents)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn is_directory(&self, path: &Path) -> Result<bool, std::io::Error> {
+        match fs::metadata(path) {
+            Ok(metadata) => Ok(metadata.is_dir()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn global_ignore_path(&self) -> Option<PathBuf> {
+        gitconfig_excludes_path()
+    }
+
+    fn read_dir(&self, path: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
+        fs::read_dir(path)?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct IgnoreScanner {
     threads: usize,
+    path_probe: Arc<dyn IgnorePathProbe>,
+}
+
+impl Default for IgnoreScanner {
+    fn default() -> Self {
+        Self {
+            threads: 0,
+            path_probe: Arc::new(StdIgnorePathProbe),
+        }
+    }
 }
 
 impl IgnoreScanner {
     pub fn with_threads(threads: usize) -> Self {
-        Self { threads }
+        Self {
+            threads,
+            ..Self::default()
+        }
+    }
+
+    pub fn with_path_probe(path_probe: Arc<dyn IgnorePathProbe>) -> Self {
+        Self {
+            path_probe,
+            ..Self::default()
+        }
     }
 
     pub fn scan_subtree(
@@ -145,8 +204,9 @@ impl IgnoreScanner {
                 ..IndexReport::default()
             });
         }
-        if !self.path_is_included(target, configured_root, rules)? {
-            return Ok(IndexReport::default());
+        match self.path_is_included_cancellable(target, configured_root, rules, &is_cancelled)? {
+            Some(true) => {}
+            Some(false) | None => return Ok(IndexReport::default()),
         }
 
         let mut report = IndexReport::default();
@@ -205,36 +265,201 @@ impl IgnoreScanner {
         configured_root: &Path,
         rules: &IndexPathRules,
     ) -> Result<bool, std::io::Error> {
+        Ok(self
+            .path_is_included_cancellable(target, configured_root, rules, &|| false)?
+            .unwrap_or(false))
+    }
+
+    pub fn path_is_included_cancellable(
+        &self,
+        target: &Path,
+        configured_root: &Path,
+        rules: &IndexPathRules,
+        is_cancelled: &impl Fn() -> bool,
+    ) -> Result<Option<bool>, std::io::Error> {
         if !target.starts_with(configured_root) || rules.is_excluded(target) {
-            return Ok(false);
+            return Ok(Some(false));
         }
         if !rules.respect_project_ignores || target == configured_root {
-            return Ok(true);
+            return Ok(Some(true));
         }
+        AncestorIgnoreEvaluator::new(self.path_probe.as_ref(), is_cancelled).evaluate_inclusion(
+            configured_root,
+            target,
+            target.is_dir(),
+        )
+    }
+}
 
-        let target_path = target.to_path_buf();
-        let filter_target = target_path.clone();
-        let filter_rules = rules.clone();
-        let mut builder = WalkBuilder::new(configured_root);
-        builder
-            .standard_filters(true)
-            .hidden(false)
-            .require_git(false)
-            .threads(1)
-            .filter_entry(move |entry| {
-                entry.depth() == 0
-                    || (filter_target.starts_with(entry.path())
-                        && !filter_rules.is_excluded(entry.path()))
-            });
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IgnoreDecision {
+    None,
+    Ignore,
+    Include,
+}
 
-        for entry in builder.build() {
-            match entry {
-                Ok(entry) if entry.path() == target_path => return Ok(true),
-                Ok(_) => {}
-                Err(error) => return Err(glob_error_to_io(error)),
+struct AncestorIgnoreEvaluator<'a, P: ?Sized, C> {
+    probe: &'a P,
+    is_cancelled: &'a C,
+    dot_ignore: Vec<Gitignore>,
+    git_ignore: Vec<Gitignore>,
+    git_exclude: Option<Gitignore>,
+    global: Option<Gitignore>,
+}
+
+impl<'a, P, C> AncestorIgnoreEvaluator<'a, P, C>
+where
+    P: IgnorePathProbe + ?Sized,
+    C: Fn() -> bool,
+{
+    fn new(probe: &'a P, is_cancelled: &'a C) -> Self {
+        Self {
+            probe,
+            is_cancelled,
+            dot_ignore: Vec::new(),
+            git_ignore: Vec::new(),
+            git_exclude: None,
+            global: None,
+        }
+    }
+
+    fn evaluate_inclusion(
+        mut self,
+        configured_root: &Path,
+        target: &Path,
+        target_is_dir: bool,
+    ) -> Result<Option<bool>, std::io::Error> {
+        if self.cancelled() {
+            return Ok(None);
+        }
+        self.load_global()?;
+        self.load_containing_repository(configured_root)?;
+        self.load_directory(configured_root)?;
+
+        let relative = target.strip_prefix(configured_root).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "target is outside its configured index root",
+            )
+        })?;
+        let components: Vec<_> = relative.components().collect();
+        let mut current = configured_root.to_path_buf();
+        for (index, component) in components.iter().enumerate() {
+            if self.cancelled() {
+                return Ok(None);
+            }
+            current.push(component);
+            let is_last = index + 1 == components.len();
+            let is_directory = !is_last || target_is_dir;
+            if self.decision(&current, is_directory) == IgnoreDecision::Ignore {
+                return Ok(Some(false));
+            }
+            if is_directory && !is_last {
+                self.load_directory(&current)?;
             }
         }
-        Ok(false)
+        Ok(Some(true))
+    }
+
+    fn load_global(&mut self) -> Result<(), std::io::Error> {
+        if self.cancelled() {
+            return Ok(());
+        }
+        let Some(path) = self.probe.global_ignore_path() else {
+            return Ok(());
+        };
+        let root = std::env::current_dir()?;
+        self.global = self.load_matcher(&root, &path)?;
+        Ok(())
+    }
+
+    fn load_directory(&mut self, directory: &Path) -> Result<(), std::io::Error> {
+        if self.cancelled() {
+            return Ok(());
+        }
+        let git_dir = directory.join(".git");
+        if self.probe.is_directory(&git_dir)? {
+            self.git_ignore.clear();
+            self.git_exclude = self.load_matcher(directory, &git_dir.join("info/exclude"))?;
+        }
+        if let Some(matcher) = self.load_matcher(directory, &directory.join(".gitignore"))? {
+            self.git_ignore.push(matcher);
+        }
+        if let Some(matcher) = self.load_matcher(directory, &directory.join(".ignore"))? {
+            self.dot_ignore.push(matcher);
+        }
+        Ok(())
+    }
+
+    fn load_containing_repository(&mut self, configured_root: &Path) -> Result<(), std::io::Error> {
+        for directory in configured_root.ancestors() {
+            if self.cancelled() {
+                return Ok(());
+            }
+            let git_dir = directory.join(".git");
+            if self.probe.is_directory(&git_dir)? {
+                self.git_exclude = self.load_matcher(directory, &git_dir.join("info/exclude"))?;
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn load_matcher(&self, root: &Path, path: &Path) -> Result<Option<Gitignore>, std::io::Error> {
+        if self.cancelled() {
+            return Ok(None);
+        }
+        let Some(contents) = self.probe.read_file(path)? else {
+            return Ok(None);
+        };
+        let mut builder = GitignoreBuilder::new(root);
+        for line in contents.lines() {
+            if self.cancelled() {
+                return Ok(None);
+            }
+            builder
+                .add_line(Some(path.to_path_buf()), line)
+                .map_err(glob_error_to_io)?;
+        }
+        builder.build().map(Some).map_err(glob_error_to_io)
+    }
+
+    fn decision(&self, path: &Path, is_dir: bool) -> IgnoreDecision {
+        first_match(&self.dot_ignore, path, is_dir)
+            .or_else(|| first_match(&self.git_ignore, path, is_dir))
+            .or_else(|| {
+                self.git_exclude
+                    .as_ref()
+                    .map(|matcher| matcher_decision(matcher, path, is_dir))
+                    .filter(|decision| *decision != IgnoreDecision::None)
+            })
+            .or_else(|| {
+                self.global
+                    .as_ref()
+                    .map(|matcher| matcher_decision(matcher, path, is_dir))
+                    .filter(|decision| *decision != IgnoreDecision::None)
+            })
+            .unwrap_or(IgnoreDecision::None)
+    }
+
+    fn cancelled(&self) -> bool {
+        (self.is_cancelled)()
+    }
+}
+
+fn first_match(matchers: &[Gitignore], path: &Path, is_dir: bool) -> Option<IgnoreDecision> {
+    matchers
+        .iter()
+        .rev()
+        .map(|matcher| matcher_decision(matcher, path, is_dir))
+        .find(|decision| *decision != IgnoreDecision::None)
+}
+
+fn matcher_decision(matcher: &Gitignore, path: &Path, is_dir: bool) -> IgnoreDecision {
+    match matcher.matched(path, is_dir) {
+        Match::None => IgnoreDecision::None,
+        Match::Ignore(_) => IgnoreDecision::Ignore,
+        Match::Whitelist(_) => IgnoreDecision::Include,
     }
 }
 

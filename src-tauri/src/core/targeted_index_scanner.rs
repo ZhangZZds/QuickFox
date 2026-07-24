@@ -70,6 +70,7 @@ pub trait DirectoryManifestReader {
 pub struct KnownIndexedChild {
     pub path: String,
     pub kind: IndexedEntryKind,
+    pub filesystem_kind: FileSystemEntryKind,
     pub modified_ms: Option<i64>,
     pub size_bytes: Option<u64>,
 }
@@ -82,7 +83,7 @@ pub trait KnownDirectoryEntriesReader {
     ) -> Result<Vec<KnownIndexedChild>, String>;
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FileSystemEntryKind {
     File,
     Directory,
@@ -196,6 +197,10 @@ impl TargetedIndexScanner {
         }
     }
 
+    pub fn with_scanner(rules: IndexPathRules, scanner: IgnoreScanner) -> Self {
+        Self { rules, scanner }
+    }
+
     pub fn rules(&self) -> &IndexPathRules {
         &self.rules
     }
@@ -236,7 +241,7 @@ impl TargetedIndexScanner {
             }
             result.failures.extend(report.failures);
             for entry in report.entries {
-                if entry.kind == IndexedEntryKind::Directory {
+                if entry.kind == IndexedEntryKind::Directory || Path::new(&entry.path).is_dir() {
                     result.manifest_upserts.push(directory_fingerprint(&entry));
                 }
                 result.upserts.push(entry);
@@ -517,7 +522,7 @@ fn diff_direct_entries(
         let unchanged = known_by_path
             .get(&normalize_path_key(&entry.path))
             .is_some_and(|known| {
-                known.kind == IndexedEntryKind::File
+                known.filesystem_kind == FileSystemEntryKind::File
                     && known.modified_ms == entry.metadata.modified_ms
                     && known.size_bytes == entry.metadata.size_bytes
             });
@@ -526,8 +531,11 @@ fn diff_direct_entries(
         }
     }
     for entry in known {
-        if entry.kind == IndexedEntryKind::File
-            && !current_by_path.contains_key(&normalize_path_text_key(&entry.path))
+        let current_shape = current_by_path
+            .get(&normalize_path_text_key(&entry.path))
+            .map(|entry| entry.metadata.kind);
+        if entry.filesystem_kind != FileSystemEntryKind::Directory
+            && current_shape != Some(FileSystemEntryKind::File)
         {
             removals.push(PathBuf::from(&entry.path));
         }
@@ -665,12 +673,14 @@ fn path_to_string(path: &Path) -> String {
 mod tests {
     use super::*;
     use crate::core::index_entry::IndexedEntryKind;
-    use crate::core::index_scanner::{IndexPathRules, IndexScanPlan};
+    use crate::core::index_scanner::{IgnorePathProbe, IndexPathRules, IndexScanPlan};
     use std::cell::{Cell, RefCell};
     use std::collections::BTreeMap;
     use std::fs;
     use std::io;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     fn scan_rules(root: &Path) -> IndexPathRules {
@@ -764,6 +774,29 @@ mod tests {
             .manifest_upserts
             .iter()
             .any(|fingerprint| fingerprint.path.ends_with("new/nested")));
+    }
+
+    #[test]
+    fn directory_shaped_application_is_recorded_in_manifest() {
+        let temp = TempDir::new().unwrap();
+        let app = temp.path().join("Tool.app");
+        fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
+        fs::write(app.join("Contents/MacOS/tool"), "binary").unwrap();
+        let scanner = TargetedIndexScanner::new(scan_rules(temp.path()));
+
+        let result = scanner
+            .scan_changed_paths(std::slice::from_ref(&app))
+            .unwrap();
+
+        assert!(result
+            .upserts
+            .iter()
+            .any(|entry| entry.path == app.to_string_lossy()
+                && entry.kind == IndexedEntryKind::Application));
+        assert!(result
+            .manifest_upserts
+            .iter()
+            .any(|fingerprint| fingerprint.path == app.to_string_lossy()));
     }
 
     #[test]
@@ -994,6 +1027,104 @@ mod tests {
         fs::write(&file, "ignored").unwrap();
 
         assert_targeted_file_matches_full_scan(root, &file, false);
+    }
+
+    #[test]
+    fn targeted_file_matches_repo_exclude_above_configured_root() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path();
+        fs::create_dir_all(repo.join(".git/info")).unwrap();
+        fs::write(repo.join(".git/info/exclude"), "local.md\n").unwrap();
+        let root = repo.join("workspace");
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("local.md");
+        fs::write(&file, "ignored").unwrap();
+
+        assert_targeted_file_matches_full_scan(&root, &file, false);
+    }
+
+    #[derive(Debug, Default)]
+    struct CountingIgnorePathProbe {
+        read_dir_calls: AtomicUsize,
+        read_file_calls: AtomicUsize,
+    }
+
+    impl IgnorePathProbe for CountingIgnorePathProbe {
+        fn read_file(&self, path: &Path) -> io::Result<Option<String>> {
+            self.read_file_calls.fetch_add(1, Ordering::Relaxed);
+            match fs::read_to_string(path) {
+                Ok(contents) => Ok(Some(contents)),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(error),
+            }
+        }
+
+        fn is_directory(&self, path: &Path) -> io::Result<bool> {
+            match fs::metadata(path) {
+                Ok(metadata) => Ok(metadata.is_dir()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+                Err(error) => Err(error),
+            }
+        }
+
+        fn global_ignore_path(&self) -> Option<PathBuf> {
+            None
+        }
+
+        fn read_dir(&self, path: &Path) -> io::Result<Vec<PathBuf>> {
+            self.read_dir_calls.fetch_add(1, Ordering::Relaxed);
+            fs::read_dir(path)?
+                .map(|entry| entry.map(|entry| entry.path()))
+                .collect()
+        }
+    }
+
+    #[test]
+    fn targeted_single_file_ignore_decision_never_enumerates_root_or_siblings() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        fs::write(root.join(".gitignore"), "ignored.md\n").unwrap();
+        let target = root.join("target.md");
+        fs::write(&target, "target").unwrap();
+        for index in 0..512 {
+            fs::write(root.join(format!("sibling-{index}.md")), "sibling").unwrap();
+        }
+        let probe = Arc::new(CountingIgnorePathProbe::default());
+        let scanner = TargetedIndexScanner::with_scanner(
+            scan_rules(root),
+            IgnoreScanner::with_path_probe(probe.clone()),
+        );
+
+        let result = scanner.scan_changed_paths(&[target]).unwrap();
+
+        assert_eq!(result.upserts.len(), 1);
+        assert_eq!(probe.read_dir_calls.load(Ordering::Relaxed), 0);
+        assert!(probe.read_file_calls.load(Ordering::Relaxed) <= 4);
+    }
+
+    #[test]
+    fn cancellation_during_single_file_ignore_evaluation_returns_cancelled() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        fs::write(root.join(".gitignore"), "ignored.md\n").unwrap();
+        let target = root.join("target.md");
+        fs::write(&target, "target").unwrap();
+        let probe = Arc::new(CountingIgnorePathProbe::default());
+        let scanner = TargetedIndexScanner::with_scanner(
+            scan_rules(root),
+            IgnoreScanner::with_path_probe(probe.clone()),
+        );
+        let checks = Cell::new(0);
+
+        let result = scanner.scan_changed_paths_cancellable(&[target], || {
+            let current = checks.get();
+            checks.set(current + 1);
+            current >= 1
+        });
+
+        assert!(matches!(result, Err(TargetedScanError::Cancelled)));
+        assert_eq!(probe.read_dir_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(probe.read_file_calls.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -1260,6 +1391,21 @@ mod tests {
         KnownIndexedChild {
             path: path.to_owned(),
             kind: IndexedEntryKind::File,
+            filesystem_kind: FileSystemEntryKind::File,
+            modified_ms: Some(modified_ms),
+            size_bytes: Some(size_bytes),
+        }
+    }
+
+    fn known_file_shaped_application(
+        path: &str,
+        modified_ms: i64,
+        size_bytes: u64,
+    ) -> KnownIndexedChild {
+        KnownIndexedChild {
+            path: path.to_owned(),
+            kind: IndexedEntryKind::Application,
+            filesystem_kind: FileSystemEntryKind::File,
             modified_ms: Some(modified_ms),
             size_bytes: Some(size_bytes),
         }
@@ -1333,5 +1479,113 @@ mod tests {
 
         assert!(result.entry_removals.is_empty());
         assert!(result.entry_upserts.is_empty());
+    }
+
+    #[test]
+    fn unchanged_file_shaped_application_is_not_rebuilt() {
+        let mut fs = RecordingFileSystem::default();
+        fs.directory("C:/root", 11);
+        fs.directory_entries(
+            "C:/root",
+            vec![FileSystemEntry::file("C:/root/Tool.exe", Some(20), Some(5))],
+        );
+        let manifest = MemoryManifest {
+            rows: vec![fingerprint("C:/root", None, "C:/root", 10)],
+        };
+        let known = MemoryKnownEntries {
+            entries: BTreeMap::from([(
+                PathBuf::from("C:/root"),
+                vec![known_file_shaped_application("C:/root/Tool.exe", 20, 5)],
+            )]),
+        };
+
+        let result = calibrate_manifest(&fs, &manifest, &known, Path::new("C:/root")).unwrap();
+
+        assert!(result.entry_upserts.is_empty());
+        assert!(result.entry_removals.is_empty());
+    }
+
+    #[test]
+    fn deleted_file_shaped_application_emits_tombstone() {
+        let mut fs = RecordingFileSystem::default();
+        fs.directory("/root", 11);
+        fs.directory_entries("/root", Vec::new());
+        let manifest = MemoryManifest {
+            rows: vec![fingerprint("/root", None, "/root", 10)],
+        };
+        let known = MemoryKnownEntries {
+            entries: BTreeMap::from([(
+                PathBuf::from("/root"),
+                vec![known_file_shaped_application("/root/tool.desktop", 20, 5)],
+            )]),
+        };
+
+        let result = calibrate_manifest(&fs, &manifest, &known, Path::new("/root")).unwrap();
+
+        assert_eq!(
+            result.entry_removals,
+            vec![PathBuf::from("/root/tool.desktop")]
+        );
+    }
+
+    #[test]
+    fn file_shaped_application_becoming_other_emits_tombstone() {
+        let mut fs = RecordingFileSystem::default();
+        fs.directory("/root", 11);
+        fs.directory_entries(
+            "/root",
+            vec![FileSystemEntry {
+                path: PathBuf::from("/root/tool.desktop"),
+                metadata: FileSystemMetadata {
+                    kind: FileSystemEntryKind::Other,
+                    modified_ms: Some(21),
+                    size_bytes: None,
+                },
+            }],
+        );
+        let manifest = MemoryManifest {
+            rows: vec![fingerprint("/root", None, "/root", 10)],
+        };
+        let known = MemoryKnownEntries {
+            entries: BTreeMap::from([(
+                PathBuf::from("/root"),
+                vec![known_file_shaped_application("/root/tool.desktop", 20, 5)],
+            )]),
+        };
+
+        let result = calibrate_manifest(&fs, &manifest, &known, Path::new("/root")).unwrap();
+
+        assert_eq!(
+            result.entry_removals,
+            vec![PathBuf::from("/root/tool.desktop")]
+        );
+        assert!(result.entry_upserts.is_empty());
+    }
+
+    #[test]
+    fn file_shaped_application_becoming_directory_is_removed_and_manifested_as_new() {
+        let mut fs = RecordingFileSystem::default();
+        fs.directory("/root", 11);
+        fs.directory_entries(
+            "/root",
+            vec![FileSystemEntry::directory("/root/Tool.app", Some(21))],
+        );
+        let manifest = MemoryManifest {
+            rows: vec![fingerprint("/root", None, "/root", 10)],
+        };
+        let known = MemoryKnownEntries {
+            entries: BTreeMap::from([(
+                PathBuf::from("/root"),
+                vec![known_file_shaped_application("/root/Tool.app", 20, 5)],
+            )]),
+        };
+
+        let result = calibrate_manifest(&fs, &manifest, &known, Path::new("/root")).unwrap();
+
+        assert_eq!(result.entry_removals, vec![PathBuf::from("/root/Tool.app")]);
+        assert_eq!(
+            result.new_directories,
+            vec![PathBuf::from("/root/Tool.app")]
+        );
     }
 }
