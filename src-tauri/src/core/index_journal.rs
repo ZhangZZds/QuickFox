@@ -3,7 +3,7 @@
 use crate::core::index::IndexedEntry;
 use crate::core::index_entry::{normalize_path_key, normalize_path_text_key};
 use crate::core::layered_index::{CommittedIndexDelta, LayeredSearchIndex};
-use crate::core::storage::{IncrementalRuntimeState, SqliteStorage};
+use crate::core::storage::{IncrementalRecoveryBaseline, IncrementalRuntimeState, SqliteStorage};
 use crate::core::targeted_index_scanner::{
     DirectoryFingerprint, DirectoryManifestReader, KnownDirectoryEntriesReader, KnownIndexedChild,
 };
@@ -28,6 +28,7 @@ pub enum IndexDegradationCode {
 #[serde(rename_all = "camelCase")]
 pub enum IndexFallbackReason {
     JournalRecoveryFailed,
+    FullRefreshFallback,
 }
 
 #[derive(Debug)]
@@ -54,6 +55,10 @@ impl IndexRecovery {
 
 pub trait IndexJournalRepository {
     fn incremental_schema_is_ready(&self) -> Result<bool, String>;
+
+    fn incremental_recovery_baseline(&self) -> Result<IncrementalRecoveryBaseline, String>;
+
+    fn validate_directory_manifest(&self) -> Result<(), String>;
 
     fn commit_incremental_batch(
         &mut self,
@@ -98,6 +103,14 @@ pub trait IndexJournalRepository {
 impl IndexJournalRepository for SqliteStorage {
     fn incremental_schema_is_ready(&self) -> Result<bool, String> {
         SqliteStorage::incremental_schema_is_ready(self).map_err(|error| error.to_string())
+    }
+
+    fn incremental_recovery_baseline(&self) -> Result<IncrementalRecoveryBaseline, String> {
+        SqliteStorage::incremental_recovery_baseline(self).map_err(|error| error.to_string())
+    }
+
+    fn validate_directory_manifest(&self) -> Result<(), String> {
+        SqliteStorage::validate_directory_manifest(self).map_err(|error| error.to_string())
     }
 
     fn commit_incremental_batch(
@@ -198,27 +211,32 @@ pub fn replay_deltas(
     Ok(index)
 }
 
-pub fn recover_layered_index(
-    repository: &(impl IndexJournalRepository + ?Sized),
-    baseline: Vec<IndexedEntry>,
-) -> IndexRecovery {
+pub fn recover_layered_index(repository: &(impl IndexJournalRepository + ?Sized)) -> IndexRecovery {
+    let baseline = match repository.incremental_recovery_baseline() {
+        Ok(baseline) => baseline,
+        Err(_) => {
+            return failed_recovery(Vec::new(), 0, 0);
+        }
+    };
+    let baseline_generation = baseline.generation;
+    let baseline = baseline.entries;
     let baseline_entry_count = baseline.len();
     match repository.incremental_schema_is_ready() {
         Ok(true) => {}
-        Ok(false) | Err(_) => return failed_recovery(baseline, baseline_entry_count),
+        Ok(false) | Err(_) => {
+            return failed_recovery(baseline, baseline_generation, baseline_entry_count);
+        }
     }
-    let baseline_generation = match repository.runtime_state() {
-        Ok(Some(state)) => state.baseline_generation,
-        Ok(None) => 0,
-        Err(_) => return failed_recovery(baseline, baseline_entry_count),
-    };
+    if repository.validate_directory_manifest().is_err() {
+        return failed_manifest_recovery(baseline, baseline_generation, baseline_entry_count);
+    }
     let deltas = match repository.committed_index_deltas_after(baseline_generation) {
         Ok(deltas) => deltas,
-        Err(_) => return failed_recovery(baseline, baseline_entry_count),
+        Err(_) => return failed_recovery(baseline, baseline_generation, baseline_entry_count),
     };
     let deltas = match ordered_unique_deltas(&deltas) {
         Ok(deltas) => deltas,
-        Err(_) => return failed_recovery(baseline, baseline_entry_count),
+        Err(_) => return failed_recovery(baseline, baseline_generation, baseline_entry_count),
     };
     let mut index = LayeredSearchIndex::default();
     index.replace_baseline(baseline, baseline_generation);
@@ -233,11 +251,47 @@ pub fn recover_layered_index(
     }
 }
 
-fn failed_recovery(baseline: Vec<IndexedEntry>, baseline_entry_count: usize) -> IndexRecovery {
+fn failed_recovery(
+    baseline: Vec<IndexedEntry>,
+    baseline_generation: u64,
+    baseline_entry_count: usize,
+) -> IndexRecovery {
+    baseline_only_recovery(
+        baseline,
+        baseline_generation,
+        baseline_entry_count,
+        IndexDegradationCode::JournalReplayFailed,
+        IndexFallbackReason::JournalRecoveryFailed,
+    )
+}
+
+fn failed_manifest_recovery(
+    baseline: Vec<IndexedEntry>,
+    baseline_generation: u64,
+    baseline_entry_count: usize,
+) -> IndexRecovery {
+    baseline_only_recovery(
+        baseline,
+        baseline_generation,
+        baseline_entry_count,
+        IndexDegradationCode::CalibrationFailed,
+        IndexFallbackReason::FullRefreshFallback,
+    )
+}
+
+fn baseline_only_recovery(
+    baseline: Vec<IndexedEntry>,
+    baseline_generation: u64,
+    baseline_entry_count: usize,
+    degradation: IndexDegradationCode,
+    fallback_reason: IndexFallbackReason,
+) -> IndexRecovery {
+    let mut index = LayeredSearchIndex::default();
+    index.replace_baseline(baseline, baseline_generation);
     IndexRecovery {
-        index: LayeredSearchIndex::from_baseline(baseline),
-        degradation: Some(IndexDegradationCode::JournalReplayFailed),
-        fallback_reason: Some(IndexFallbackReason::JournalRecoveryFailed),
+        index,
+        degradation: Some(degradation),
+        fallback_reason: Some(fallback_reason),
         baseline_entry_count,
     }
 }
@@ -295,7 +349,7 @@ mod tests {
     use crate::core::storage::SqliteStorage;
     use rusqlite::{params, Connection};
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -342,9 +396,11 @@ mod tests {
             .unwrap();
         drop(connection);
         let storage = SqliteStorage::open(path.clone()).unwrap();
-        let baseline = vec![entry("/root/baseline.md")];
+        storage
+            .save_completed_index_batch(1, &[entry("/root/baseline.md")])
+            .unwrap();
 
-        let recovery = recover_layered_index(&storage, baseline);
+        let recovery = recover_layered_index(&storage);
 
         assert_eq!(recovery.baseline_entry_count(), 1);
         assert_eq!(
@@ -426,11 +482,125 @@ mod tests {
         let baseline_id = storage.save_completed_index_batch(10, &baseline).unwrap();
         storage.activate_baseline(baseline_id, 1).unwrap();
 
-        let recovery = recover_layered_index(&storage, baseline);
+        let recovery = recover_layered_index(&storage);
 
         assert!(search_titles(&recovery.index, "stale").is_empty());
         assert_eq!(search_titles(&recovery.index, "fresh"), vec!["fresh.md"]);
         assert_eq!(recovery.index.generation(), 1);
+
+        drop(storage);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn recovery_and_known_children_use_only_the_active_baseline() {
+        let path = temp_db_path("active-baseline-single-source");
+        let storage = SqliteStorage::open(path.clone()).unwrap();
+        let old_id = storage
+            .save_completed_index_batch(10, &[entry("/root/old.md")])
+            .unwrap();
+        storage.activate_baseline(old_id, 0).unwrap();
+        storage
+            .commit_incremental_batch(&delta(1, entry("/root/journal.md"), Vec::new()), &[], &[])
+            .unwrap();
+        let new_id = storage
+            .save_completed_index_batch(20, &[entry("/root/new.md")])
+            .unwrap();
+
+        let before_activation = recover_layered_index(&storage);
+        let before_children = storage
+            .known_direct_indexed_children(Path::new("/root"), Path::new("/root"))
+            .unwrap();
+
+        assert_eq!(
+            search_titles(&before_activation.index, "old"),
+            vec!["old.md"]
+        );
+        assert_eq!(
+            search_titles(&before_activation.index, "journal"),
+            vec!["journal.md"]
+        );
+        assert!(search_titles(&before_activation.index, "new").is_empty());
+        assert_eq!(
+            before_children
+                .iter()
+                .map(|entry| entry.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/root/journal.md", "/root/old.md"]
+        );
+
+        storage.activate_baseline(new_id, 1).unwrap();
+        let after_activation = recover_layered_index(&storage);
+        let after_children = storage
+            .known_direct_indexed_children(Path::new("/root"), Path::new("/root"))
+            .unwrap();
+
+        assert_eq!(
+            search_titles(&after_activation.index, "new"),
+            vec!["new.md"]
+        );
+        assert!(search_titles(&after_activation.index, "old").is_empty());
+        assert!(search_titles(&after_activation.index, "journal").is_empty());
+        assert_eq!(
+            after_children
+                .iter()
+                .map(|entry| entry.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/root/new.md"]
+        );
+
+        drop(storage);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn corrupt_manifest_keeps_active_baseline_and_requests_full_refresh() {
+        let path = temp_db_path("corrupt-manifest-recovery");
+        let storage = SqliteStorage::open(path.clone()).unwrap();
+        let baseline_id = storage
+            .save_completed_index_batch(10, &[entry("/root/baseline.md")])
+            .unwrap();
+        storage.activate_baseline(baseline_id, 0).unwrap();
+        storage
+            .replace_directory_manifest(
+                Path::new("/root"),
+                &[DirectoryFingerprint {
+                    path: "/root".to_owned(),
+                    parent: None,
+                    root: "/root".to_owned(),
+                    modified_ms: Some(1),
+                }],
+            )
+            .unwrap();
+        drop(storage);
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO index_directory_manifest (path, parent, root, modified_ms) VALUES ('/root/orphan/child', '/root/orphan', '/root', 2)",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        let storage = SqliteStorage::open(path.clone()).unwrap();
+
+        assert!(storage
+            .directory_manifest_for_root(Path::new("/root"))
+            .is_err());
+        let recovery = recover_layered_index(&storage);
+
+        assert_eq!(recovery.baseline_entry_count(), 1);
+        assert_eq!(
+            recovery.degradation_code(),
+            Some(IndexDegradationCode::CalibrationFailed)
+        );
+        assert_eq!(
+            recovery.fallback_reason(),
+            Some(IndexFallbackReason::FullRefreshFallback)
+        );
+        assert_eq!(
+            search_titles(&recovery.index, "baseline"),
+            vec!["baseline.md"]
+        );
 
         drop(storage);
         let _ = fs::remove_file(path);
