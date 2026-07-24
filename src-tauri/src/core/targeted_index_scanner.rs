@@ -7,7 +7,7 @@ use crate::core::index_scanner::{IgnoreScanner, IndexPathRules};
 use crate::core::index_update_coordinator::CoordinatorBatch;
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -143,7 +143,12 @@ impl FileSystemEntry {
 
 pub trait FileSystemProbe {
     fn metadata(&self, path: &Path) -> io::Result<Option<FileSystemMetadata>>;
-    fn read_dir(&self, path: &Path) -> io::Result<Vec<FileSystemEntry>>;
+    fn visit_dir(
+        &self,
+        path: &Path,
+        is_cancelled: &dyn Fn() -> bool,
+        visitor: &mut dyn FnMut(FileSystemEntry),
+    ) -> TargetedScanResultValue<()>;
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -158,17 +163,23 @@ impl FileSystemProbe for StdFileSystemProbe {
         }
     }
 
-    fn read_dir(&self, path: &Path) -> io::Result<Vec<FileSystemEntry>> {
-        let mut entries = Vec::new();
+    fn visit_dir(
+        &self,
+        path: &Path,
+        is_cancelled: &dyn Fn() -> bool,
+        visitor: &mut dyn FnMut(FileSystemEntry),
+    ) -> TargetedScanResultValue<()> {
         for entry in fs::read_dir(path)? {
+            if is_cancelled() {
+                return Err(TargetedScanError::Cancelled);
+            }
             let entry = entry?;
-            entries.push(FileSystemEntry {
+            visitor(FileSystemEntry {
                 path: entry.path(),
                 metadata: metadata_from_std(&entry.metadata()?),
             });
         }
-        entries.sort_by(|left, right| left.path.cmp(&right.path));
-        Ok(entries)
+        Ok(())
     }
 }
 
@@ -217,7 +228,7 @@ impl TargetedIndexScanner {
         paths: &[PathBuf],
         is_cancelled: impl Fn() -> bool,
     ) -> TargetedScanResultValue<TargetedScanResult> {
-        let mut result = TargetedScanResult::default();
+        let mut paths_by_root: BTreeMap<String, (PathBuf, Vec<PathBuf>)> = BTreeMap::new();
         for path in sorted_unique_paths(paths) {
             if is_cancelled() {
                 return Err(TargetedScanError::Cancelled);
@@ -228,23 +239,43 @@ impl TargetedIndexScanner {
             if self.rules.is_excluded(&path) {
                 continue;
             }
-            let cancelled_during_walk = Cell::new(false);
-            let report = self
-                .scanner
-                .scan_subtree_cancellable(&path, root, &self.rules, || {
-                    let cancelled = is_cancelled();
-                    cancelled_during_walk.set(cancelled_during_walk.get() || cancelled);
-                    cancelled
-                })?;
-            if cancelled_during_walk.get() {
-                return Err(TargetedScanError::Cancelled);
-            }
-            result.failures.extend(report.failures);
-            for entry in report.entries {
-                if entry.kind == IndexedEntryKind::Directory || Path::new(&entry.path).is_dir() {
-                    result.manifest_upserts.push(directory_fingerprint(&entry));
+            paths_by_root
+                .entry(normalize_path_key(root))
+                .or_insert_with(|| (root.to_path_buf(), Vec::new()))
+                .1
+                .push(path);
+        }
+
+        let mut result = TargetedScanResult::default();
+        for (_, (root, paths)) in paths_by_root {
+            let mut cache = self.scanner.batch_cache();
+            for path in paths {
+                if is_cancelled() {
+                    return Err(TargetedScanError::Cancelled);
                 }
-                result.upserts.push(entry);
+                let cancelled_during_walk = Cell::new(false);
+                let report = self.scanner.scan_subtree_cancellable_cached(
+                    &path,
+                    &root,
+                    &self.rules,
+                    &mut cache,
+                    || {
+                        let cancelled = is_cancelled();
+                        cancelled_during_walk.set(cancelled_during_walk.get() || cancelled);
+                        cancelled
+                    },
+                )?;
+                if cancelled_during_walk.get() {
+                    return Err(TargetedScanError::Cancelled);
+                }
+                result.failures.extend(report.failures);
+                for entry in report.entries {
+                    if entry.kind == IndexedEntryKind::Directory || Path::new(&entry.path).is_dir()
+                    {
+                        result.manifest_upserts.push(directory_fingerprint(&entry));
+                    }
+                    result.upserts.push(entry);
+                }
             }
         }
         if is_cancelled() {
@@ -424,8 +455,9 @@ pub fn calibrate_manifest_cancellable(
                 if metadata.modified_ms == fingerprint.modified_ms {
                     continue;
                 }
-                match probe.read_dir(&path) {
-                    Ok(mut entries) => {
+                let mut entries = Vec::new();
+                match probe.visit_dir(&path, is_cancelled, &mut |entry| entries.push(entry)) {
+                    Ok(()) => {
                         entries.sort_by(|left, right| {
                             normalize_path_key(&left.path)
                                 .cmp(&normalize_path_key(&right.path))
@@ -460,7 +492,10 @@ pub fn calibrate_manifest_cancellable(
                         }
                         result.changed_directories.push(path);
                     }
-                    Err(error) => result.failures.push(IndexFailure {
+                    Err(TargetedScanError::Cancelled) => {
+                        return Err(TargetedScanError::Cancelled);
+                    }
+                    Err(TargetedScanError::Io(error)) => result.failures.push(IndexFailure {
                         root: path_to_string(&path),
                         message: error.to_string(),
                     }),
@@ -609,19 +644,10 @@ fn sort_result(result: &mut TargetedScanResult) {
 fn sort_calibration_result(result: &mut ManifestCalibrationResult) {
     sort_dedup_paths(&mut result.changed_directories);
     sort_dedup_paths(&mut result.new_directories);
-    sort_dedup_paths(&mut result.missing_directories);
-    let mut subtree_roots: Vec<PathBuf> = Vec::new();
-    for path in std::mem::take(&mut result.missing_directories) {
-        if !subtree_roots.iter().any(|ancestor| {
-            normalized_path_is_same_or_descendant(
-                &normalize_path_key(ancestor),
-                &normalize_path_key(&path),
-            )
-        }) {
-            subtree_roots.push(path);
-        }
-    }
-    result.missing_directories = subtree_roots;
+    result.missing_directories = collapse_missing_directories_with_probe_count(std::mem::take(
+        &mut result.missing_directories,
+    ))
+    .0;
     result.failures.sort_by(|left, right| {
         normalize_path_text_key(&left.root)
             .cmp(&normalize_path_text_key(&right.root))
@@ -643,6 +669,37 @@ fn sort_calibration_result(result: &mut ManifestCalibrationResult) {
     sort_dedup_paths(&mut result.entry_removals);
 }
 
+fn collapse_missing_directories_with_probe_count(mut paths: Vec<PathBuf>) -> (Vec<PathBuf>, usize) {
+    sort_dedup_paths(&mut paths);
+    let missing_keys: HashSet<_> = paths.iter().map(normalize_path_key).collect();
+    let mut subtree_roots = Vec::new();
+    let mut probes = 0;
+    for path in paths {
+        let key = normalize_path_key(&path);
+        let mut candidate = key.as_str();
+        let mut has_missing_ancestor = false;
+        while let Some(separator) = candidate.rfind('/') {
+            candidate = if separator == 0 {
+                "/"
+            } else {
+                &candidate[..separator]
+            };
+            probes += 1;
+            if missing_keys.contains(candidate) {
+                has_missing_ancestor = true;
+                break;
+            }
+            if separator == 0 {
+                break;
+            }
+        }
+        if !has_missing_ancestor {
+            subtree_roots.push(path);
+        }
+    }
+    (subtree_roots, probes)
+}
+
 fn sorted_unique_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
     let mut paths = paths.to_vec();
     sort_dedup_paths(&mut paths);
@@ -656,13 +713,6 @@ fn sort_dedup_paths(paths: &mut Vec<PathBuf>) {
             .then_with(|| left.cmp(right))
     });
     paths.dedup_by(|left, right| normalize_path_key(left) == normalize_path_key(right));
-}
-
-fn normalized_path_is_same_or_descendant(root: &str, candidate: &str) -> bool {
-    candidate == root
-        || candidate
-            .strip_prefix(root)
-            .is_some_and(|remainder| remainder.starts_with('/'))
 }
 
 fn path_to_string(path: &Path) -> String {
@@ -873,6 +923,7 @@ mod tests {
         assert_eq!(result.upserts.len(), 2);
     }
 
+    #[cfg(target_os = "windows")]
     #[test]
     fn targeted_result_deduplicates_windows_path_variants_by_shared_path_key() {
         use crate::core::index_entry::normalize_path_key;
@@ -912,6 +963,22 @@ mod tests {
         assert_eq!(result.manifest_upserts.len(), 1);
         assert_eq!(result.manifest_removals.len(), 1);
         assert_eq!(result.upserts[0].path, r"C:\Root\File.md");
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn targeted_result_keeps_case_distinct_unix_backslash_paths() {
+        let mut result = TargetedScanResult {
+            upserts: vec![
+                IndexedEntry::legacy(r"A\B", "B", IndexedEntryKind::File),
+                IndexedEntry::legacy(r"a\b", "b", IndexedEntryKind::File),
+            ],
+            ..TargetedScanResult::default()
+        };
+
+        sort_result(&mut result);
+
+        assert_eq!(result.upserts.len(), 2);
     }
 
     #[test]
@@ -1094,6 +1161,7 @@ mod tests {
     struct CountingIgnorePathProbe {
         read_dir_calls: AtomicUsize,
         read_file_calls: AtomicUsize,
+        global_ignore_path_calls: AtomicUsize,
     }
 
     impl IgnorePathProbe for CountingIgnorePathProbe {
@@ -1115,6 +1183,8 @@ mod tests {
         }
 
         fn global_ignore_path(&self) -> Option<PathBuf> {
+            self.global_ignore_path_calls
+                .fetch_add(1, Ordering::Relaxed);
             None
         }
 
@@ -1151,6 +1221,43 @@ mod tests {
         assert_eq!(probe.read_dir_calls.load(Ordering::Relaxed), 0);
         assert!(probe.read_file_calls.load(Ordering::Relaxed) >= 2);
         assert!(probe.read_file_calls.load(Ordering::Relaxed) <= root.ancestors().count() * 3);
+    }
+
+    #[test]
+    fn targeted_batch_reuses_ancestor_ignore_matchers_for_sibling_files() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path();
+        fs::write(repo.join(".gitignore"), "workspace/ignored-*.md\n").unwrap();
+        let root = repo.join("workspace");
+        fs::create_dir_all(&root).unwrap();
+        let paths: Vec<_> = (0..128)
+            .map(|index| {
+                let path = root.join(format!("file-{index:03}.md"));
+                fs::write(&path, "indexed").unwrap();
+                path
+            })
+            .collect();
+        let probe = Arc::new(CountingIgnorePathProbe::default());
+        let scanner = TargetedIndexScanner::with_scanner(
+            scan_rules(&root),
+            IgnoreScanner::with_path_probe(probe.clone()),
+        );
+
+        let result = scanner.scan_changed_paths(&paths).unwrap();
+
+        assert_eq!(result.upserts.len(), paths.len());
+        assert_eq!(probe.read_dir_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            probe.global_ignore_path_calls.load(Ordering::Relaxed),
+            1,
+            "global ignore discovery should be shared across the batch"
+        );
+        assert!(
+            probe.read_file_calls.load(Ordering::Relaxed) <= root.ancestors().count() * 3,
+            "ignore reads should scale with path depth, got {} for {} files",
+            probe.read_file_calls.load(Ordering::Relaxed),
+            paths.len()
+        );
     }
 
     #[test]
@@ -1256,13 +1363,58 @@ mod tests {
                 .map_err(io::Error::from)
         }
 
-        fn read_dir(&self, path: &Path) -> io::Result<Vec<FileSystemEntry>> {
+        fn visit_dir(
+            &self,
+            path: &Path,
+            is_cancelled: &dyn Fn() -> bool,
+            visitor: &mut dyn FnMut(FileSystemEntry),
+        ) -> TargetedScanResultValue<()> {
             self.enumerated.borrow_mut().push(path.to_path_buf());
-            self.entries
+            let entries = self
+                .entries
                 .get(path)
                 .cloned()
                 .unwrap_or_else(|| Ok(Vec::new()))
-                .map_err(io::Error::from)
+                .map_err(io::Error::from)?;
+            for entry in entries {
+                if is_cancelled() {
+                    return Err(TargetedScanError::Cancelled);
+                }
+                visitor(entry);
+            }
+            Ok(())
+        }
+    }
+
+    struct CancellingDirectoryProbe {
+        entries: Vec<FileSystemEntry>,
+        visited: Cell<usize>,
+        cancelled: Cell<bool>,
+    }
+
+    impl FileSystemProbe for CancellingDirectoryProbe {
+        fn metadata(&self, _path: &Path) -> io::Result<Option<FileSystemMetadata>> {
+            Ok(Some(FileSystemMetadata::directory(Some(11))))
+        }
+
+        fn visit_dir(
+            &self,
+            _path: &Path,
+            is_cancelled: &dyn Fn() -> bool,
+            visitor: &mut dyn FnMut(FileSystemEntry),
+        ) -> TargetedScanResultValue<()> {
+            for entry in &self.entries {
+                if is_cancelled() {
+                    return Err(TargetedScanError::Cancelled);
+                }
+                let visited = self.visited.get() + 1;
+                self.visited.set(visited);
+                visitor(entry.clone());
+                if visited == 3 {
+                    self.cancelled.set(true);
+                }
+            }
+            Ok(())
         }
     }
 
@@ -1278,6 +1430,33 @@ mod tests {
             root: root.to_owned(),
             modified_ms: Some(modified_ms),
         }
+    }
+
+    #[test]
+    fn calibration_cancellation_stops_directory_stream_without_partial_delta() {
+        let probe = CancellingDirectoryProbe {
+            entries: (0..8)
+                .map(|index| {
+                    FileSystemEntry::file(format!("/root/file-{index}.md"), Some(20), Some(5))
+                })
+                .collect(),
+            visited: Cell::new(0),
+            cancelled: Cell::new(false),
+        };
+        let manifest = MemoryManifest {
+            rows: vec![fingerprint("/root", None, "/root", 10)],
+        };
+
+        let result = calibrate_manifest_cancellable(
+            &probe,
+            &manifest,
+            &MemoryKnownEntries::default(),
+            Path::new("/root"),
+            &|| probe.cancelled.get(),
+        );
+
+        assert!(matches!(result, Err(TargetedScanError::Cancelled)));
+        assert_eq!(probe.visited.get(), 3);
     }
 
     #[test]
@@ -1395,6 +1574,23 @@ mod tests {
         assert_eq!(
             result.missing_directories,
             vec![PathBuf::from("/root/gone")]
+        );
+    }
+
+    #[test]
+    fn missing_subtree_collapse_has_linear_ancestor_probes() {
+        let count = 2_000;
+        let paths: Vec<_> = (0..count)
+            .map(|index| PathBuf::from(format!("/root/missing-{index:04}")))
+            .collect();
+
+        let (collapsed, probes) = collapse_missing_directories_with_probe_count(paths);
+
+        assert_eq!(collapsed.len(), count);
+        assert!(
+            probes <= count * 4,
+            "expected at most {} ancestor probes, got {probes}",
+            count * 4
         );
     }
 

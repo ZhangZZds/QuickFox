@@ -7,24 +7,57 @@ pub fn normalize_path_key(path: impl AsRef<Path>) -> String {
 }
 
 pub fn normalize_path_text_key(path: &str) -> String {
+    normalize_path_text_key_for_mode(path, PathComparisonMode::native())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PathComparisonMode {
+    Native,
+    Windows,
+}
+
+impl PathComparisonMode {
+    pub(crate) const fn native() -> Self {
+        if cfg!(target_os = "windows") {
+            Self::Windows
+        } else {
+            Self::Native
+        }
+    }
+}
+
+pub(crate) fn normalize_path_key_for_mode(
+    path: impl AsRef<Path>,
+    mode: PathComparisonMode,
+) -> String {
+    normalize_path_text_key_for_mode(&path.as_ref().to_string_lossy(), mode)
+}
+
+pub(crate) fn normalize_path_text_key_for_mode(path: &str, mode: PathComparisonMode) -> String {
     let normalized = path.replace('\\', "/");
     let normalized = if normalized.len() > 1 {
         normalized.trim_end_matches('/').to_owned()
     } else {
         normalized
     };
-    let bytes = path.as_bytes();
-    let has_windows_drive_prefix =
-        bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
-    let windows_style = cfg!(target_os = "windows")
-        || path.contains('\\')
-        || normalized.starts_with("//")
-        || has_windows_drive_prefix;
-    if windows_style {
+    if mode == PathComparisonMode::Windows {
         normalized.to_lowercase()
     } else {
         normalized
     }
+}
+
+pub(crate) fn path_is_same_or_descendant_for_mode(
+    root: impl AsRef<Path>,
+    candidate: impl AsRef<Path>,
+    mode: PathComparisonMode,
+) -> bool {
+    let root = normalize_path_key_for_mode(root, mode);
+    let candidate = normalize_path_key_for_mode(candidate, mode);
+    candidate == root
+        || candidate
+            .strip_prefix(&root)
+            .is_some_and(|remainder| remainder.starts_with('/'))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -421,6 +454,17 @@ mod tests {
     use serde_json::json;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn unix_backslash_paths_preserve_case() {
+        assert_eq!(normalize_path_text_key(r"A\B"), "A/B");
+        assert_eq!(normalize_path_text_key(r"a\b"), "a/b");
+        assert_ne!(
+            normalize_path_text_key(r"A\B"),
+            normalize_path_text_key(r"a\b")
+        );
+    }
 
     #[test]
     fn entry_metadata_from_path() {

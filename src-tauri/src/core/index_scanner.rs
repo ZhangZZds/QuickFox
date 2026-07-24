@@ -1,12 +1,14 @@
 //! Scanner boundary for the next file indexing pipeline.
 
 use crate::core::index_entry::{
-    IndexFailure, IndexReport, IndexScanStats, IndexedEntry, IndexedEntryKind, ScanEvent,
+    normalize_path_key, normalize_path_key_for_mode, path_is_same_or_descendant_for_mode,
+    IndexFailure, IndexReport, IndexScanStats, IndexedEntry, IndexedEntryKind, PathComparisonMode,
+    ScanEvent,
 };
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::gitignore::{gitconfig_excludes_path, Gitignore, GitignoreBuilder};
 use ignore::{DirEntry, Match, WalkBuilder};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -61,17 +63,31 @@ impl IndexPathRules {
     }
 
     pub fn configured_root_for(&self, path: &Path) -> Option<&Path> {
+        self.configured_root_for_mode(path, PathComparisonMode::native())
+    }
+
+    fn configured_root_for_mode(&self, path: &Path, mode: PathComparisonMode) -> Option<&Path> {
         self.roots
             .iter()
-            .filter(|root| path.starts_with(root))
-            .max_by_key(|root| root.components().count())
+            .filter(|root| path_is_same_or_descendant_for_mode(root, path, mode))
+            .max_by_key(|root| {
+                normalize_path_key_for_mode(root, mode)
+                    .split('/')
+                    .filter(|component| !component.is_empty())
+                    .count()
+            })
             .map(PathBuf::as_path)
     }
 
     pub fn is_forced_or_user_excluded(&self, path: &Path) -> bool {
         let configured_root = self.configured_root_for(path);
+        let configured_root_key = configured_root.map(normalize_path_key);
         path.ancestors()
-            .take_while(|candidate| Some(*candidate) != configured_root)
+            .take_while(|candidate| {
+                configured_root_key
+                    .as_ref()
+                    .is_none_or(|root| normalize_path_key(candidate) != *root)
+            })
             .any(|candidate| {
                 is_forced_excluded(candidate)
                     || is_user_excluded(candidate, &self.exclude_dirs)
@@ -140,6 +156,13 @@ pub struct IgnoreScanner {
     path_probe: Arc<dyn IgnorePathProbe>,
 }
 
+#[derive(Debug, Default)]
+pub(crate) struct IgnoreBatchCache {
+    directory_kinds: HashMap<PathBuf, bool>,
+    matchers: HashMap<(PathBuf, PathBuf), Option<Gitignore>>,
+    global_ignore_path: Option<Option<PathBuf>>,
+}
+
 impl Default for IgnoreScanner {
     fn default() -> Self {
         Self {
@@ -180,7 +203,33 @@ impl IgnoreScanner {
         rules: &IndexPathRules,
         is_cancelled: impl Fn() -> bool,
     ) -> Result<IndexReport, std::io::Error> {
-        if !target.starts_with(configured_root) {
+        let mut cache = IgnoreBatchCache::default();
+        self.scan_subtree_cancellable_cached(
+            target,
+            configured_root,
+            rules,
+            &mut cache,
+            is_cancelled,
+        )
+    }
+
+    pub(crate) fn batch_cache(&self) -> IgnoreBatchCache {
+        IgnoreBatchCache::default()
+    }
+
+    pub(crate) fn scan_subtree_cancellable_cached(
+        &self,
+        target: &Path,
+        configured_root: &Path,
+        rules: &IndexPathRules,
+        cache: &mut IgnoreBatchCache,
+        is_cancelled: impl Fn() -> bool,
+    ) -> Result<IndexReport, std::io::Error> {
+        if !path_is_same_or_descendant_for_mode(
+            configured_root,
+            target,
+            PathComparisonMode::native(),
+        ) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "target is outside its configured index root",
@@ -189,24 +238,57 @@ impl IgnoreScanner {
         if rules.is_excluded(target) {
             return Ok(IndexReport::default());
         }
-        if !target.exists() {
-            let failure = IndexFailure {
-                root: path_to_string(target),
-                message: "target path is not accessible".to_owned(),
-            };
-            return Ok(IndexReport {
-                failures: vec![failure.clone()],
-                scan_stats: IndexScanStats {
-                    failures: 1,
-                    ..IndexScanStats::default()
-                },
-                scan_events: vec![ScanEvent::Failure(failure)],
-                ..IndexReport::default()
-            });
-        }
-        match self.path_is_included_cancellable(target, configured_root, rules, &is_cancelled)? {
+        let target_metadata = match fs::metadata(target) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                let failure = IndexFailure {
+                    root: path_to_string(target),
+                    message: if error.kind() == std::io::ErrorKind::NotFound {
+                        "target path is not accessible".to_owned()
+                    } else {
+                        error.to_string()
+                    },
+                };
+                return Ok(IndexReport {
+                    failures: vec![failure.clone()],
+                    scan_stats: IndexScanStats {
+                        failures: 1,
+                        ..IndexScanStats::default()
+                    },
+                    scan_events: vec![ScanEvent::Failure(failure)],
+                    ..IndexReport::default()
+                });
+            }
+        };
+        match self.path_is_included_cancellable_cached(
+            target,
+            configured_root,
+            rules,
+            target_metadata.is_dir(),
+            cache,
+            &is_cancelled,
+        )? {
             Some(true) => {}
             Some(false) | None => return Ok(IndexReport::default()),
+        }
+
+        if !target_metadata.is_dir() {
+            let mut report = IndexReport {
+                scan_stats: IndexScanStats {
+                    scanned: 1,
+                    ..IndexScanStats::default()
+                },
+                ..IndexReport::default()
+            };
+            if let Some(entry) =
+                indexed_entry_from_metadata(target, configured_root, &target_metadata)
+            {
+                report.entries.push(entry);
+                report.scan_stats.accepted = 1;
+            } else {
+                report.scan_stats.skipped = 1;
+            }
+            return Ok(report);
         }
 
         let mut report = IndexReport::default();
@@ -277,17 +359,41 @@ impl IgnoreScanner {
         rules: &IndexPathRules,
         is_cancelled: &impl Fn() -> bool,
     ) -> Result<Option<bool>, std::io::Error> {
-        if !target.starts_with(configured_root) || rules.is_excluded(target) {
-            return Ok(Some(false));
-        }
-        if !rules.respect_project_ignores || target == configured_root {
-            return Ok(Some(true));
-        }
-        AncestorIgnoreEvaluator::new(self.path_probe.as_ref(), is_cancelled).evaluate_inclusion(
+        let mut cache = IgnoreBatchCache::default();
+        self.path_is_included_cancellable_cached(
+            target,
+            configured_root,
+            rules,
+            target.is_dir(),
+            &mut cache,
+            is_cancelled,
+        )
+    }
+
+    fn path_is_included_cancellable_cached(
+        &self,
+        target: &Path,
+        configured_root: &Path,
+        rules: &IndexPathRules,
+        target_is_dir: bool,
+        cache: &mut IgnoreBatchCache,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<bool>, std::io::Error> {
+        if !path_is_same_or_descendant_for_mode(
             configured_root,
             target,
-            target.is_dir(),
-        )
+            PathComparisonMode::native(),
+        ) || rules.is_excluded(target)
+        {
+            return Ok(Some(false));
+        }
+        if !rules.respect_project_ignores
+            || normalize_path_key(target) == normalize_path_key(configured_root)
+        {
+            return Ok(Some(true));
+        }
+        AncestorIgnoreEvaluator::new(self.path_probe.as_ref(), is_cancelled, cache)
+            .evaluate_inclusion(configured_root, target, target_is_dir)
     }
 }
 
@@ -298,24 +404,26 @@ enum IgnoreDecision {
     Include,
 }
 
-struct AncestorIgnoreEvaluator<'a, P: ?Sized, C> {
-    probe: &'a P,
-    is_cancelled: &'a C,
+struct AncestorIgnoreEvaluator<'a> {
+    probe: &'a dyn IgnorePathProbe,
+    is_cancelled: &'a dyn Fn() -> bool,
+    cache: &'a mut IgnoreBatchCache,
     dot_ignore: Vec<Gitignore>,
     git_ignore: Vec<Gitignore>,
     git_exclude: Vec<Gitignore>,
     global: Option<Gitignore>,
 }
 
-impl<'a, P, C> AncestorIgnoreEvaluator<'a, P, C>
-where
-    P: IgnorePathProbe + ?Sized,
-    C: Fn() -> bool,
-{
-    fn new(probe: &'a P, is_cancelled: &'a C) -> Self {
+impl<'a> AncestorIgnoreEvaluator<'a> {
+    fn new(
+        probe: &'a dyn IgnorePathProbe,
+        is_cancelled: &'a dyn Fn() -> bool,
+        cache: &'a mut IgnoreBatchCache,
+    ) -> Self {
         Self {
             probe,
             is_cancelled,
+            cache,
             dot_ignore: Vec::new(),
             git_ignore: Vec::new(),
             git_exclude: Vec::new(),
@@ -339,12 +447,15 @@ where
         }
         self.load_directory(configured_root)?;
 
-        let relative = target.strip_prefix(configured_root).map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "target is outside its configured index root",
-            )
-        })?;
+        let relative = target
+            .strip_prefix(configured_root)
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                target
+                    .components()
+                    .skip(configured_root.components().count())
+                    .collect()
+            });
         let components: Vec<_> = relative.components().collect();
         let mut current = configured_root.to_path_buf();
         for (index, component) in components.iter().enumerate() {
@@ -368,7 +479,15 @@ where
         if self.cancelled() {
             return Ok(());
         }
-        let Some(path) = self.probe.global_ignore_path() else {
+        let global_ignore_path = match self.cache.global_ignore_path.clone() {
+            Some(path) => path,
+            None => {
+                let path = self.probe.global_ignore_path();
+                self.cache.global_ignore_path = Some(path.clone());
+                path
+            }
+        };
+        let Some(path) = global_ignore_path else {
             return Ok(());
         };
         let root = std::env::current_dir()?;
@@ -381,7 +500,17 @@ where
             return Ok(());
         }
         let git_dir = directory.join(".git");
-        if self.probe.is_directory(&git_dir)? {
+        let is_git_directory = if let Some(is_directory) = self.cache.directory_kinds.get(&git_dir)
+        {
+            *is_directory
+        } else {
+            let is_directory = self.probe.is_directory(&git_dir)?;
+            self.cache
+                .directory_kinds
+                .insert(git_dir.clone(), is_directory);
+            is_directory
+        };
+        if is_git_directory {
             if let Some(matcher) = self.load_matcher(directory, &git_dir.join("info/exclude"))? {
                 self.git_exclude.push(matcher);
             }
@@ -407,11 +536,20 @@ where
         Ok(())
     }
 
-    fn load_matcher(&self, root: &Path, path: &Path) -> Result<Option<Gitignore>, std::io::Error> {
+    fn load_matcher(
+        &mut self,
+        root: &Path,
+        path: &Path,
+    ) -> Result<Option<Gitignore>, std::io::Error> {
         if self.cancelled() {
             return Ok(None);
         }
+        let cache_key = (root.to_path_buf(), path.to_path_buf());
+        if let Some(matcher) = self.cache.matchers.get(&cache_key) {
+            return Ok(matcher.clone());
+        }
         let Some(contents) = self.probe.read_file(path)? else {
+            self.cache.matchers.insert(cache_key, None);
             return Ok(None);
         };
         let mut builder = GitignoreBuilder::new(root);
@@ -423,7 +561,9 @@ where
                 .add_line(Some(path.to_path_buf()), line)
                 .map_err(glob_error_to_io)?;
         }
-        builder.build().map(Some).map_err(glob_error_to_io)
+        let matcher = builder.build().map(Some).map_err(glob_error_to_io)?;
+        self.cache.matchers.insert(cache_key, matcher.clone());
+        Ok(matcher)
     }
 
     fn decision(&self, path: &Path, is_dir: bool) -> IgnoreDecision {
@@ -664,6 +804,23 @@ fn indexed_entry_from_dir_entry(entry: &DirEntry, root: &Path) -> Option<Indexed
         return None;
     };
 
+    Some(IndexedEntry::from_path_metadata(path, root, kind))
+}
+
+fn indexed_entry_from_metadata(
+    path: &Path,
+    root: &Path,
+    metadata: &fs::Metadata,
+) -> Option<IndexedEntry> {
+    let kind = if is_application_path(path) {
+        IndexedEntryKind::Application
+    } else if metadata.is_dir() {
+        IndexedEntryKind::Directory
+    } else if metadata.is_file() {
+        IndexedEntryKind::File
+    } else {
+        return None;
+    };
     Some(IndexedEntry::from_path_metadata(path, root, kind))
 }
 
@@ -1080,6 +1237,49 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn configured_root_matching_supports_explicit_windows_mode() {
+        let windows_root = PathBuf::from(r"C:\Users\Frank");
+        let nested_root = PathBuf::from(r"C:\Users\Frank\Projects");
+        let rules = IndexPathRules::from_plan(&IndexScanPlan {
+            include_roots: vec![windows_root.clone(), nested_root.clone()],
+            ..IndexScanPlan::default()
+        })
+        .unwrap();
+
+        assert_eq!(
+            rules.configured_root_for_mode(
+                Path::new("c:/users/frank/projects/quickfox/file.md"),
+                crate::core::index_entry::PathComparisonMode::Windows,
+            ),
+            Some(nested_root.as_path())
+        );
+        assert_eq!(
+            rules.configured_root_for_mode(
+                Path::new("C:/Users/Frankish/file.md"),
+                crate::core::index_entry::PathComparisonMode::Windows,
+            ),
+            None
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn configured_root_matching_preserves_native_posix_case() {
+        let root = PathBuf::from("/Data");
+        let rules = IndexPathRules::from_plan(&IndexScanPlan {
+            include_roots: vec![root.clone()],
+            ..IndexScanPlan::default()
+        })
+        .unwrap();
+
+        assert_eq!(
+            rules.configured_root_for(Path::new("/Data/file.md")),
+            Some(root.as_path())
+        );
+        assert_eq!(rules.configured_root_for(Path::new("/data/file.md")), None);
     }
 
     #[test]
