@@ -2,8 +2,14 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use crate::core::file_query::FileQuery;
 use crate::core::index_entry::{IndexedEntry, IndexedEntryKind};
+
+#[cfg(test)]
+static COMPACT_INDEX_BUILD_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StringId(usize);
@@ -378,6 +384,9 @@ pub struct CandidateRetrieval {
 
 impl CompactCandidateIndex {
     pub fn from_entries(entries: Vec<IndexedEntry>) -> Self {
+        #[cfg(test)]
+        COMPACT_INDEX_BUILD_COUNT.fetch_add(1, Ordering::Relaxed);
+
         let table = EntryTable::from_entries(entries);
         Self {
             name_tokens: NameTokenIndex::build(&table),
@@ -388,6 +397,16 @@ impl CompactCandidateIndex {
             exact_paths: ExactPathIndex::build(&table),
             table,
         }
+    }
+
+    #[cfg(test)]
+    pub fn reset_build_count() {
+        COMPACT_INDEX_BUILD_COUNT.store(0, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub fn build_count() -> usize {
+        COMPACT_INDEX_BUILD_COUNT.load(Ordering::Relaxed)
     }
 
     pub fn retrieve_ordinary_term(&self, term: &str) -> CandidateRetrieval {

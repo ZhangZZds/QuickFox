@@ -9,6 +9,7 @@ pub mod index_entry;
 pub mod index_scanner;
 pub mod index_update_coordinator;
 pub mod index_watcher;
+pub mod layered_index;
 pub mod platform;
 pub mod providers;
 pub mod search;

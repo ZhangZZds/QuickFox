@@ -1,7 +1,7 @@
 //! Query providers will live here.
 
 use crate::core::actions::{Action, OpenApplication};
-use crate::core::index::SearchIndex;
+use crate::core::index::{FileSearchIndex, SearchIndex};
 use crate::core::search::{QueryRequest, SearchMode, SearchResult, SearchResultKind};
 
 pub trait Provider {
@@ -50,7 +50,7 @@ pub struct FileProvider<'a> {
 }
 
 enum FileProviderIndex<'a> {
-    Borrowed(&'a SearchIndex),
+    Borrowed(&'a dyn FileSearchIndex),
     Owned(Box<SearchIndex>),
     Unavailable(String),
 }
@@ -65,7 +65,7 @@ impl FileProvider<'static> {
 }
 
 impl<'a> FileProvider<'a> {
-    pub fn with_candidate_limit(index: &'a SearchIndex, candidate_limit: usize) -> Self {
+    pub fn with_candidate_limit(index: &'a dyn FileSearchIndex, candidate_limit: usize) -> Self {
         Self {
             index: FileProviderIndex::Borrowed(index),
             candidate_limit,
@@ -87,9 +87,7 @@ impl Provider for FileProvider<'_> {
 
     fn search(&self, query: &QueryRequest) -> Vec<SearchResult> {
         let results = match &self.index {
-            FileProviderIndex::Borrowed(index) => {
-                index.search_with_limit(query, self.candidate_limit)
-            }
+            FileProviderIndex::Borrowed(index) => index.search_files(query, self.candidate_limit),
             FileProviderIndex::Owned(index) => index.search_with_limit(query, self.candidate_limit),
             FileProviderIndex::Unavailable(message) => {
                 if matches!(query.mode, SearchMode::Normal) && !query.text.trim().is_empty() {

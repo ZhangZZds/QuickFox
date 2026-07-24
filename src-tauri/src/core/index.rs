@@ -49,6 +49,11 @@ pub struct SearchIndex {
     content_index: Option<ContentIndex>,
 }
 
+pub trait FileSearchIndex: Send + Sync {
+    fn search_files(&self, query: &QueryRequest, limit: usize) -> Vec<SearchResult>;
+    fn indexed_entry_count(&self) -> usize;
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SearchIndexMemoryEstimate {
     pub entry_count: usize,
@@ -219,19 +224,41 @@ impl SearchIndex {
             .unwrap_or_default()
     }
 
+    pub fn search_with_limit_visible(
+        &self,
+        query: &QueryRequest,
+        limit: usize,
+        is_visible: impl Fn(&IndexedEntry) -> bool,
+    ) -> Vec<SearchResult> {
+        self.search_with_limit_cancellable_visible(query, limit, || false, is_visible)
+            .unwrap_or_default()
+    }
+
     pub fn search_with_limit_cancellable(
         &self,
         query: &QueryRequest,
         limit: usize,
         is_cancelled: impl Fn() -> bool,
     ) -> Option<Vec<SearchResult>> {
+        self.search_with_limit_cancellable_visible(query, limit, is_cancelled, |_| true)
+    }
+
+    pub fn search_with_limit_cancellable_visible(
+        &self,
+        query: &QueryRequest,
+        limit: usize,
+        is_cancelled: impl Fn() -> bool,
+        is_visible: impl Fn(&IndexedEntry) -> bool,
+    ) -> Option<Vec<SearchResult>> {
         if is_cancelled() {
             return None;
         }
 
         match &query.mode {
-            SearchMode::Normal => self.search_normal(&query.text, limit, &is_cancelled),
-            SearchMode::Regex => self.search_regex(&query.text, limit, &is_cancelled),
+            SearchMode::Normal => {
+                self.search_normal(&query.text, limit, &is_cancelled, &is_visible)
+            }
+            SearchMode::Regex => self.search_regex(&query.text, limit, &is_cancelled, &is_visible),
             SearchMode::WebSearch { .. } | SearchMode::Command => Some(Vec::new()),
         }
     }
@@ -248,6 +275,7 @@ impl SearchIndex {
         query: &str,
         limit: usize,
         is_cancelled: &impl Fn() -> bool,
+        is_visible: &impl Fn(&IndexedEntry) -> bool,
     ) -> Option<Vec<SearchResult>> {
         let parsed_query = FileQuery::parse(query);
         if limit == 0
@@ -270,7 +298,7 @@ impl SearchIndex {
         }
 
         if parsed_query.has_content_query() && !parsed_query.has_name_path_constraints() {
-            return Some(self.search_content_only(&parsed_query, limit));
+            return Some(self.search_content_only(&parsed_query, limit, is_visible));
         }
 
         let matcher = FileMatcher::default();
@@ -288,6 +316,9 @@ impl SearchIndex {
             let Some(entry) = self.entries.get(index) else {
                 continue;
             };
+            if !is_visible(entry) {
+                continue;
+            }
             let Some(search_text) = self.search_texts.get(index) else {
                 continue;
             };
@@ -308,7 +339,11 @@ impl SearchIndex {
         if is_cancelled() {
             return None;
         }
-        let content_hits = self.search_content_hits(&parsed_query, Some(&candidate_paths), limit);
+        let content_hits = self.search_content_hits(
+            &parsed_query,
+            Some(&candidate_paths),
+            self.entries.len().max(limit),
+        );
         let hit_by_path: HashMap<_, _> = content_hits
             .into_iter()
             .map(|hit| (hit.path.clone(), hit))
@@ -335,8 +370,20 @@ impl SearchIndex {
         Some(results)
     }
 
-    fn search_content_only(&self, query: &FileQuery, limit: usize) -> Vec<SearchResult> {
-        let hits = self.search_content_hits(query, None, limit);
+    fn search_content_only(
+        &self,
+        query: &FileQuery,
+        limit: usize,
+        is_visible: &impl Fn(&IndexedEntry) -> bool,
+    ) -> Vec<SearchResult> {
+        let visible_paths: HashSet<_> = self
+            .entries
+            .iter()
+            .filter(|entry| is_visible(entry))
+            .map(|entry| entry.path.clone())
+            .collect();
+        let hits =
+            self.search_content_hits(query, Some(&visible_paths), self.entries.len().max(limit));
         let entry_by_path: HashMap<_, _> = self
             .entries
             .iter()
@@ -384,6 +431,7 @@ impl SearchIndex {
         pattern: &str,
         limit: usize,
         is_cancelled: &impl Fn() -> bool,
+        is_visible: &impl Fn(&IndexedEntry) -> bool,
     ) -> Option<Vec<SearchResult>> {
         let regex = match Regex::new(pattern) {
             Ok(regex) => regex,
@@ -404,6 +452,9 @@ impl SearchIndex {
             if index % 1024 == 0 && is_cancelled() {
                 return None;
             }
+            if !is_visible(entry) {
+                continue;
+            }
             if regex.is_match(&entry.name) || regex.is_match(&entry.path) {
                 results.push(entry_to_result(entry));
                 if results.len() >= limit {
@@ -412,6 +463,16 @@ impl SearchIndex {
             }
         }
         Some(results)
+    }
+}
+
+impl FileSearchIndex for SearchIndex {
+    fn search_files(&self, query: &QueryRequest, limit: usize) -> Vec<SearchResult> {
+        self.search_with_limit(query, limit)
+    }
+
+    fn indexed_entry_count(&self) -> usize {
+        self.entries.len()
     }
 }
 
@@ -529,6 +590,7 @@ mod tests {
     use super::*;
     use crate::core::content_index::DEFAULT_MAX_CONTENT_BYTES;
     use std::fs;
+    use std::path::PathBuf;
     use std::time::Instant;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1282,6 +1344,88 @@ mod tests {
             estimate.cached_search_text_bytes >= estimate.entry_string_bytes / 4,
             "cached search text should be visible in memory estimates: {estimate:?}"
         );
+    }
+
+    #[test]
+    fn visibility_filter_precedes_normal_query_limit() {
+        let index = SearchIndex::from_entries(vec![
+            file_entry("/tmp/hidden-item.md"),
+            file_entry("/tmp/visible-item.md"),
+        ]);
+        let parser = crate::core::search::QueryParser::new(Default::default());
+
+        let results = index.search_with_limit_visible(&parser.parse("item"), 1, |entry| {
+            entry.name.starts_with("visible")
+        });
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "visible-item.md");
+    }
+
+    #[test]
+    fn visibility_filter_precedes_regex_query_limit() {
+        let index = SearchIndex::from_entries(vec![
+            file_entry("/tmp/hidden-item.md"),
+            file_entry("/tmp/visible-item.md"),
+        ]);
+        let parser = crate::core::search::QueryParser::new(Default::default());
+
+        let results = index.search_with_limit_visible(&parser.parse("re:item"), 1, |entry| {
+            entry.name.starts_with("visible")
+        });
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "visible-item.md");
+    }
+
+    #[test]
+    fn visibility_filter_precedes_content_only_query_limit() {
+        let root = temp_dir("content-visibility");
+        fs::create_dir_all(&root).unwrap();
+        let hidden = root.join("hidden.md");
+        let visible = root.join("visible.md");
+        fs::write(&hidden, "needle needle needle needle").unwrap();
+        fs::write(&visible, "needle").unwrap();
+        let mut entries = vec![
+            file_entry(&hidden.to_string_lossy()),
+            file_entry(&visible.to_string_lossy()),
+        ];
+        let content_index = ContentIndex::build(
+            &mut entries,
+            ContentIndexOptions {
+                index_dir: root.join("tantivy-content"),
+                max_file_bytes: DEFAULT_MAX_CONTENT_BYTES,
+            },
+        )
+        .unwrap();
+        let index = SearchIndex::from_entries_with_content_index(entries, content_index);
+        let parser = crate::core::search::QueryParser::new(Default::default());
+
+        let results =
+            index.search_with_limit_visible(&parser.parse("content:needle"), 1, |entry| {
+                entry.name == "visible.md"
+            });
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "visible.md");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn update_batch_rebuilds_full_compact_candidate_index() {
+        let mut index = SearchIndex::from_entries(vec![file_entry("/tmp/base.md")]);
+        let builds_before_update = CompactCandidateIndex::build_count();
+        let added = file_entry("/tmp/added.md");
+
+        index.apply_update_batch(
+            &crate::core::index_watcher::IndexUpdateBatch {
+                changed_paths: vec![PathBuf::from(&added.path)],
+                removed_paths: Vec::new(),
+            },
+            vec![added],
+        );
+
+        assert!(CompactCandidateIndex::build_count() > builds_before_update);
     }
 
     #[test]
