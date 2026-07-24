@@ -59,6 +59,10 @@ QuickFox v1.5.0 已将普通 name/path 查询切换到 compact candidate index�
 
 baseline 查询在候选评分前接受 visibility predicate，过滤已被 overlay 替换或 tombstone 屏蔽的 entry；overlay 独立查询。两路结果使用现有结果比较语义合并、去重和截断，保证类型、匹配质量与历史排序不漂移。一次查询捕获同一个 generation 的不可变 view，批次提交通过短锁或 `Arc` 原子替换完成。
 
+内容查询使用同一 layered 可见性语义，但不能通过遍历 baseline 构造隐藏路径集合。`LayeredSearchIndex` 在提交 delta 时生成不可变的 `Arc<ContentVisibilitySnapshot>`，只包含 overlay 精确路径、精确 tombstone 和目录 tombstone；查询只做 `Arc` 克隆，Tantivy 的 path fast field 命中后按精确路径和祖先路径段判断可见性。快照构建成本与 delta 大小相关，不与 baseline 大小相关。
+
+`SearchIndex` 仅在持有 `ContentIndex` 时维护 content hit 到 entry 的稀疏路径 lookup，并且只记录 `ContentIndexState::Indexed` 的 entry。无内容索引的 baseline 和每次重建的 name/path overlay 不分配该 lookup。构造注入复用 attach 流程，增量内容更新后同步 lookup，detach 或替换无内容 entries 时清空 lookup，避免百万级 baseline 的无条件路径副本。
+
 备选是在每个 batch 后调用现有 `apply_update_batch`。它会重建完整 compact index，正是需要消除的 O(N) 成本。备选 SQLite 直接承载每次按键查询会改变 fuzzy 延迟与排序控制，也不采用。
 
 ### 4. SQLite baseline 继续使用完整 batch，新增可重放 journal 与 manifest

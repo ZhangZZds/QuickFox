@@ -45,12 +45,20 @@ impl IndexScanner {
 #[derive(Debug, Default)]
 pub struct SearchIndex {
     entries: Vec<IndexedEntry>,
-    entry_index_by_path: HashMap<String, usize>,
+    content_entry_index_by_path: Option<HashMap<String, usize>>,
     search_texts: Vec<String>,
     compact_candidates: CompactCandidateIndex,
     content_index: Option<ContentIndex>,
     #[cfg(test)]
     content_entry_lookup_probe_count: AtomicUsize,
+    #[cfg(test)]
+    content_visibility_entry_scan_count: AtomicUsize,
+}
+
+enum ContentSearchVisibility {
+    AllVisible,
+    EntryPredicate,
+    PathFilter(ContentPathFilter),
 }
 
 pub trait FileSearchIndex: Send + Sync {
@@ -65,6 +73,7 @@ pub struct SearchIndexMemoryEstimate {
     pub entry_string_bytes: usize,
     pub cached_search_text_bytes: usize,
     pub compact_candidate_bytes: usize,
+    pub path_lookup_entry_count: usize,
     pub path_lookup_bytes: usize,
 }
 
@@ -75,7 +84,7 @@ impl Clone for SearchIndex {
 
         Self {
             entries: self.entries.clone(),
-            entry_index_by_path: self.entry_index_by_path.clone(),
+            content_entry_index_by_path: self.content_entry_index_by_path.clone(),
             search_texts: self.search_texts.clone(),
             compact_candidates: self.compact_candidates.clone(),
             content_index: self.content_index.clone(),
@@ -84,23 +93,29 @@ impl Clone for SearchIndex {
                 self.content_entry_lookup_probe_count
                     .load(Ordering::Relaxed),
             ),
+            #[cfg(test)]
+            content_visibility_entry_scan_count: AtomicUsize::new(
+                self.content_visibility_entry_scan_count
+                    .load(Ordering::Relaxed),
+            ),
         }
     }
 }
 
 impl SearchIndex {
     pub fn from_entries(entries: Vec<IndexedEntry>) -> Self {
-        let entry_index_by_path = build_entry_path_lookup(&entries);
         let search_texts = entries.iter().map(searchable_text).collect();
         let compact_candidates = CompactCandidateIndex::from_entries(entries.clone());
         Self {
             entries,
-            entry_index_by_path,
+            content_entry_index_by_path: None,
             search_texts,
             compact_candidates,
             content_index: None,
             #[cfg(test)]
             content_entry_lookup_probe_count: AtomicUsize::new(0),
+            #[cfg(test)]
+            content_visibility_entry_scan_count: AtomicUsize::new(0),
         }
     }
 
@@ -108,18 +123,9 @@ impl SearchIndex {
         entries: Vec<IndexedEntry>,
         content_index: ContentIndex,
     ) -> Self {
-        let entry_index_by_path = build_entry_path_lookup(&entries);
-        let search_texts = entries.iter().map(searchable_text).collect();
-        let compact_candidates = CompactCandidateIndex::from_entries(entries.clone());
-        Self {
-            entries,
-            entry_index_by_path,
-            search_texts,
-            compact_candidates,
-            content_index: Some(content_index),
-            #[cfg(test)]
-            content_entry_lookup_probe_count: AtomicUsize::new(0),
-        }
+        let mut index = Self::from_entries(entries);
+        index.attach_content_index(content_index);
+        index
     }
 
     pub fn entries(&self) -> &[IndexedEntry] {
@@ -127,6 +133,24 @@ impl SearchIndex {
     }
 
     pub fn memory_estimate(&self) -> SearchIndexMemoryEstimate {
+        let path_lookup_entry_count = self
+            .content_entry_index_by_path
+            .as_ref()
+            .map(HashMap::len)
+            .unwrap_or_default();
+        let path_lookup_bytes = self
+            .content_entry_index_by_path
+            .as_ref()
+            .map(|lookup| {
+                std::mem::size_of::<HashMap<String, usize>>()
+                    .saturating_add(lookup.keys().map(String::capacity).sum())
+                    .saturating_add(
+                        lookup
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<(String, usize)>()),
+                    )
+            })
+            .unwrap_or_default();
         SearchIndexMemoryEstimate {
             entry_count: self.entries.len(),
             entry_struct_bytes: self
@@ -136,14 +160,26 @@ impl SearchIndex {
             entry_string_bytes: self.entries.iter().map(indexed_entry_string_bytes).sum(),
             cached_search_text_bytes: self.search_texts.iter().map(String::capacity).sum(),
             compact_candidate_bytes: self.compact_candidates.estimated_bytes(),
-            path_lookup_bytes: std::mem::size_of::<HashMap<String, usize>>()
-                .saturating_add(self.entry_index_by_path.keys().map(String::capacity).sum())
-                .saturating_add(
-                    self.entry_index_by_path
-                        .capacity()
-                        .saturating_mul(std::mem::size_of::<(String, usize)>()),
-                ),
+            path_lookup_entry_count,
+            path_lookup_bytes,
         }
+    }
+
+    pub(crate) fn attach_content_index(&mut self, content_index: ContentIndex) {
+        self.content_index = Some(content_index);
+        self.rebuild_content_entry_lookup();
+    }
+
+    pub(crate) fn detach_content_index(&mut self) -> Option<ContentIndex> {
+        self.content_entry_index_by_path = None;
+        self.content_index.take()
+    }
+
+    fn rebuild_content_entry_lookup(&mut self) {
+        self.content_entry_index_by_path = self
+            .content_index
+            .as_ref()
+            .map(|_| build_content_entry_path_lookup(&self.entries));
     }
 
     #[cfg(test)]
@@ -170,6 +206,33 @@ impl SearchIndex {
     #[cfg(test)]
     fn content_entry_lookup_probe_count(&self) -> usize {
         self.content_entry_lookup_probe_count
+            .load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn content_entry_lookup_count(&self) -> usize {
+        self.content_entry_index_by_path
+            .as_ref()
+            .map(HashMap::len)
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    fn content_entry_lookup_contains(&self, path: &str) -> bool {
+        self.content_entry_index_by_path
+            .as_ref()
+            .is_some_and(|lookup| lookup.contains_key(path))
+    }
+
+    #[cfg(test)]
+    fn reset_content_visibility_entry_scan_count(&self) {
+        self.content_visibility_entry_scan_count
+            .store(0, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn content_visibility_entry_scan_count(&self) -> usize {
+        self.content_visibility_entry_scan_count
             .load(Ordering::Relaxed)
     }
 
@@ -268,9 +331,9 @@ impl SearchIndex {
                 .cmp(&right.path)
                 .then_with(|| left.name.cmp(&right.name))
         });
-        self.entry_index_by_path = build_entry_path_lookup(&self.entries);
         self.search_texts = self.entries.iter().map(searchable_text).collect();
         self.compact_candidates = CompactCandidateIndex::from_entries(self.entries.clone());
+        self.rebuild_content_entry_lookup();
     }
 
     pub fn search_with_limit(&self, query: &QueryRequest, limit: usize) -> Vec<SearchResult> {
@@ -288,13 +351,36 @@ impl SearchIndex {
             .unwrap_or_default()
     }
 
+    pub(crate) fn search_with_limit_visible_and_content_filter(
+        &self,
+        query: &QueryRequest,
+        limit: usize,
+        content_path_filter: ContentPathFilter,
+        is_visible: impl Fn(&IndexedEntry) -> bool,
+    ) -> Vec<SearchResult> {
+        self.search_with_limit_cancellable_visibility(
+            query,
+            limit,
+            || false,
+            is_visible,
+            ContentSearchVisibility::PathFilter(content_path_filter),
+        )
+        .unwrap_or_default()
+    }
+
     pub fn search_with_limit_cancellable(
         &self,
         query: &QueryRequest,
         limit: usize,
         is_cancelled: impl Fn() -> bool,
     ) -> Option<Vec<SearchResult>> {
-        self.search_with_limit_cancellable_visible(query, limit, is_cancelled, |_| true)
+        self.search_with_limit_cancellable_visibility(
+            query,
+            limit,
+            is_cancelled,
+            |_| true,
+            ContentSearchVisibility::AllVisible,
+        )
     }
 
     pub fn search_with_limit_cancellable_visible(
@@ -304,25 +390,45 @@ impl SearchIndex {
         is_cancelled: impl Fn() -> bool,
         is_visible: impl Fn(&IndexedEntry) -> bool,
     ) -> Option<Vec<SearchResult>> {
+        self.search_with_limit_cancellable_visibility(
+            query,
+            limit,
+            is_cancelled,
+            is_visible,
+            ContentSearchVisibility::EntryPredicate,
+        )
+    }
+
+    fn search_with_limit_cancellable_visibility(
+        &self,
+        query: &QueryRequest,
+        limit: usize,
+        is_cancelled: impl Fn() -> bool,
+        is_visible: impl Fn(&IndexedEntry) -> bool,
+        content_visibility: ContentSearchVisibility,
+    ) -> Option<Vec<SearchResult>> {
         if is_cancelled() {
             return None;
         }
 
         match &query.mode {
-            SearchMode::Normal => {
-                self.search_normal(&query.text, limit, &is_cancelled, &is_visible)
-            }
+            SearchMode::Normal => self.search_normal(
+                &query.text,
+                limit,
+                &is_cancelled,
+                &is_visible,
+                content_visibility,
+            ),
             SearchMode::Regex => self.search_regex(&query.text, limit, &is_cancelled, &is_visible),
             SearchMode::WebSearch { .. } | SearchMode::Command => Some(Vec::new()),
         }
     }
 
     fn replace_entries(&mut self, entries: Vec<IndexedEntry>) {
-        self.entry_index_by_path = build_entry_path_lookup(&entries);
         self.search_texts = entries.iter().map(searchable_text).collect();
         self.compact_candidates = CompactCandidateIndex::from_entries(entries.clone());
         self.entries = entries;
-        self.content_index = None;
+        self.detach_content_index();
     }
 
     fn search_normal(
@@ -331,6 +437,7 @@ impl SearchIndex {
         limit: usize,
         is_cancelled: &impl Fn() -> bool,
         is_visible: &impl Fn(&IndexedEntry) -> bool,
+        content_visibility: ContentSearchVisibility,
     ) -> Option<Vec<SearchResult>> {
         let parsed_query = FileQuery::parse(query);
         if limit == 0
@@ -353,7 +460,12 @@ impl SearchIndex {
         }
 
         if parsed_query.has_content_query() && !parsed_query.has_name_path_constraints() {
-            return Some(self.search_content_only(&parsed_query, limit, is_visible));
+            return Some(self.search_content_only(
+                &parsed_query,
+                limit,
+                is_visible,
+                content_visibility,
+            ));
         }
 
         let matcher = FileMatcher::default();
@@ -425,18 +537,31 @@ impl SearchIndex {
         query: &FileQuery,
         limit: usize,
         is_visible: &impl Fn(&IndexedEntry) -> bool,
+        content_visibility: ContentSearchVisibility,
     ) -> Vec<SearchResult> {
-        let hidden_paths: HashSet<_> = self
-            .entries
-            .iter()
-            .filter(|entry| !is_visible(entry))
-            .map(|entry| entry.path.clone())
-            .collect();
-        let path_filter = if hidden_paths.is_empty() {
-            None
-        } else {
-            let hidden_paths = Arc::new(hidden_paths);
-            Some(Arc::new(move |path: &str| !hidden_paths.contains(path)) as ContentPathFilter)
+        let path_filter = match content_visibility {
+            ContentSearchVisibility::AllVisible => None,
+            ContentSearchVisibility::PathFilter(path_filter) => Some(path_filter),
+            ContentSearchVisibility::EntryPredicate => {
+                let hidden_paths: HashSet<_> = self
+                    .entries
+                    .iter()
+                    .filter(|entry| {
+                        #[cfg(test)]
+                        self.content_visibility_entry_scan_count
+                            .fetch_add(1, Ordering::Relaxed);
+                        !is_visible(entry)
+                    })
+                    .map(|entry| entry.path.clone())
+                    .collect();
+                if hidden_paths.is_empty() {
+                    None
+                } else {
+                    let hidden_paths = Arc::new(hidden_paths);
+                    Some(Arc::new(move |path: &str| !hidden_paths.contains(path))
+                        as ContentPathFilter)
+                }
+            }
         };
         let hits = self.search_content_hits_with_filter(query, path_filter, limit);
         let mut results: Vec<_> = hits
@@ -446,8 +571,9 @@ impl SearchIndex {
                 #[cfg(test)]
                 self.content_entry_lookup_probe_count
                     .fetch_add(1, Ordering::Relaxed);
-                self.entry_index_by_path
-                    .get(&hit.path)
+                self.content_entry_index_by_path
+                    .as_ref()
+                    .and_then(|lookup| lookup.get(&hit.path))
                     .and_then(|index| self.entries.get(*index))
                     .map(|entry| {
                         entry_to_result(entry)
@@ -559,10 +685,11 @@ fn searchable_text(entry: &IndexedEntry) -> String {
     }
 }
 
-fn build_entry_path_lookup(entries: &[IndexedEntry]) -> HashMap<String, usize> {
+fn build_content_entry_path_lookup(entries: &[IndexedEntry]) -> HashMap<String, usize> {
     entries
         .iter()
         .enumerate()
+        .filter(|(_, entry)| entry.content_index_state == ContentIndexState::Indexed)
         .map(|(index, entry)| (entry.path.clone(), index))
         .collect()
 }
@@ -1428,6 +1555,75 @@ mod tests {
     }
 
     #[test]
+    fn content_path_lookup_is_absent_without_content_index() {
+        let entries: Vec<_> = (0..20_000)
+            .map(|index| file_entry(&format!("/tmp/content-memory-{index:05}.md")))
+            .collect();
+        let search_index = SearchIndex::from_entries(entries);
+        let estimate = search_index.memory_estimate();
+
+        assert_eq!(estimate.path_lookup_entry_count, 0);
+        assert_eq!(estimate.path_lookup_bytes, 0);
+        assert_eq!(search_index.content_entry_lookup_count(), 0);
+    }
+
+    #[test]
+    fn content_path_lookup_tracks_attach_update_detach_and_replace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path();
+        let first = root.join("first.md");
+        let skipped = root.join("skipped.bin");
+        let second = root.join("second.md");
+        fs::write(&first, "first needle").unwrap();
+        fs::write(&skipped, b"binary\0payload").unwrap();
+        fs::write(&second, "second needle").unwrap();
+        let options = ContentIndexOptions {
+            index_dir: root.join("tantivy-lifecycle"),
+            max_file_bytes: DEFAULT_MAX_CONTENT_BYTES,
+        };
+        let mut entries = vec![
+            file_entry(&first.to_string_lossy()),
+            file_entry(&skipped.to_string_lossy()),
+        ];
+        let content_index = ContentIndex::build(&mut entries, options.clone()).unwrap();
+        assert_eq!(entries[0].content_index_state, ContentIndexState::Indexed);
+        assert_eq!(
+            entries[1].content_index_state,
+            ContentIndexState::SkippedBinary
+        );
+        let mut search_index = SearchIndex::from_entries(entries);
+
+        assert_eq!(search_index.content_entry_lookup_count(), 0);
+        search_index.attach_content_index(content_index);
+        assert_eq!(search_index.content_entry_lookup_count(), 1);
+        assert!(search_index.content_entry_lookup_contains(&first.to_string_lossy()));
+        assert!(!search_index.content_entry_lookup_contains(&skipped.to_string_lossy()));
+
+        search_index.apply_update_batch_with_content_options(
+            &crate::core::index_watcher::IndexUpdateBatch {
+                changed_paths: vec![second.clone()],
+                removed_paths: vec![first.clone()],
+            },
+            vec![file_entry(&second.to_string_lossy())],
+            Some(&options),
+        );
+
+        assert_eq!(search_index.content_entry_lookup_count(), 1);
+        assert!(!search_index.content_entry_lookup_contains(&first.to_string_lossy()));
+        assert!(search_index.content_entry_lookup_contains(&second.to_string_lossy()));
+
+        let content_index = search_index.detach_content_index().unwrap();
+        assert_eq!(search_index.content_entry_lookup_count(), 0);
+        assert_eq!(search_index.memory_estimate().path_lookup_bytes, 0);
+
+        search_index.attach_content_index(content_index);
+        assert_eq!(search_index.content_entry_lookup_count(), 1);
+        search_index.replace_entries(vec![file_entry("/tmp/replaced.md")]);
+        assert_eq!(search_index.content_entry_lookup_count(), 0);
+        assert!(search_index.content_index.is_none());
+    }
+
+    #[test]
     fn visibility_filter_precedes_normal_query_limit() {
         let index = SearchIndex::from_entries(vec![
             file_entry("/tmp/hidden-item.md"),
@@ -1524,6 +1720,18 @@ mod tests {
         assert_eq!(results[0].title, "shared-visible.md");
         assert_eq!(index.last_content_collector_limit(), 10);
         assert_eq!(index.content_entry_lookup_probe_count(), 0);
+    }
+
+    #[test]
+    fn content_only_default_visibility_does_not_scan_entries() {
+        let (_workspace, index) = large_visibility_content_fixture("default-content-visibility");
+        let parser = crate::core::search::QueryParser::new(Default::default());
+        index.reset_content_visibility_entry_scan_count();
+
+        let results = index.search_with_limit(&parser.parse("content:needle"), 1);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(index.content_visibility_entry_scan_count(), 0);
     }
 
     #[test]

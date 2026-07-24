@@ -1,10 +1,12 @@
 //! Baseline, delta overlay, and tombstone composition for runtime file search.
 
+use crate::core::content_index::ContentPathFilter;
 use crate::core::index::{FileSearchIndex, IndexedEntry, IndexedEntryKind, SearchIndex};
 use crate::core::search::{QueryRequest, SearchResult};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -99,6 +101,54 @@ impl PathTombstones {
     }
 }
 
+#[derive(Debug, Default)]
+struct ContentVisibilitySnapshot {
+    overlay_paths: BTreeSet<String>,
+    exact_tombstones: BTreeSet<String>,
+    directory_tombstones: BTreeSet<String>,
+}
+
+impl ContentVisibilitySnapshot {
+    fn from_delta(
+        overlay_entries: &BTreeMap<String, IndexedEntry>,
+        tombstones: &PathTombstones,
+    ) -> Self {
+        Self {
+            overlay_paths: overlay_entries.keys().cloned().collect(),
+            exact_tombstones: tombstones.exact.clone(),
+            directory_tombstones: tombstones.directories.clone(),
+        }
+    }
+
+    fn path_filter(snapshot: &Arc<Self>) -> ContentPathFilter {
+        let snapshot = Arc::clone(snapshot);
+        Arc::new(move |path: &str| snapshot.is_visible(path))
+    }
+
+    fn is_visible(&self, path: &str) -> bool {
+        let key = normalize_path_text(path);
+        if self.overlay_paths.contains(&key) || self.exact_tombstones.contains(&key) {
+            return false;
+        }
+
+        let mut candidate = Some(key.as_str());
+        while let Some(path) = candidate {
+            if self.directory_tombstones.contains(path) {
+                return false;
+            }
+            candidate = parent_key(path);
+        }
+        true
+    }
+
+    fn estimated_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(string_set_estimated_bytes(&self.overlay_paths))
+            .saturating_add(string_set_estimated_bytes(&self.exact_tombstones))
+            .saturating_add(string_set_estimated_bytes(&self.directory_tombstones))
+    }
+}
+
 #[derive(Debug)]
 pub struct LayeredSearchIndex {
     baseline: SearchIndex,
@@ -106,12 +156,15 @@ pub struct LayeredSearchIndex {
     overlay_entries: BTreeMap<String, IndexedEntry>,
     overlay: SearchIndex,
     tombstones: PathTombstones,
+    content_visibility: Arc<ContentVisibilitySnapshot>,
     generation: u64,
     visible_entry_count: usize,
     #[cfg(test)]
     baseline_probe_count: AtomicUsize,
     #[cfg(test)]
     overlay_compact_build_ids: Vec<usize>,
+    #[cfg(test)]
+    content_visibility_baseline_scan_count: AtomicUsize,
 }
 
 impl Default for LayeredSearchIndex {
@@ -122,24 +175,31 @@ impl Default for LayeredSearchIndex {
 
 impl LayeredSearchIndex {
     pub fn from_baseline(entries: Vec<IndexedEntry>) -> Self {
-        let baseline_by_path: BTreeMap<_, _> = entries
+        Self::from_search_index(SearchIndex::from_entries(entries))
+    }
+
+    pub fn from_search_index(baseline: SearchIndex) -> Self {
+        let baseline_by_path: BTreeMap<_, _> = baseline
+            .entries()
             .iter()
             .map(|entry| (normalize_path_text(&entry.path), entry.kind.clone()))
             .collect();
         let visible_entry_count = baseline_by_path.len();
-        let baseline = SearchIndex::from_entries(entries);
         Self {
             baseline,
             baseline_by_path,
             overlay_entries: BTreeMap::new(),
             overlay: SearchIndex::default(),
             tombstones: PathTombstones::default(),
+            content_visibility: Arc::new(ContentVisibilitySnapshot::default()),
             generation: 0,
             visible_entry_count,
             #[cfg(test)]
             baseline_probe_count: AtomicUsize::new(0),
             #[cfg(test)]
             overlay_compact_build_ids: Vec::new(),
+            #[cfg(test)]
+            content_visibility_baseline_scan_count: AtomicUsize::new(0),
         }
     }
 
@@ -181,6 +241,10 @@ impl LayeredSearchIndex {
         }
 
         self.overlay = SearchIndex::from_entries(self.overlay_entries.values().cloned().collect());
+        self.content_visibility = Arc::new(ContentVisibilitySnapshot::from_delta(
+            &self.overlay_entries,
+            &self.tombstones,
+        ));
         #[cfg(test)]
         {
             self.overlay_compact_build_ids
@@ -202,6 +266,7 @@ impl LayeredSearchIndex {
         self.overlay_entries.clear();
         self.overlay = SearchIndex::default();
         self.tombstones.clear();
+        self.content_visibility = Arc::new(ContentVisibilitySnapshot::default());
         self.generation = generation;
     }
 
@@ -210,11 +275,12 @@ impl LayeredSearchIndex {
             return Vec::new();
         }
 
-        let baseline_results =
-            self.baseline
-                .search_with_limit_visible(query, candidate_budget, |entry| {
-                    self.baseline_entry_is_visible(entry)
-                });
+        let baseline_results = self.baseline.search_with_limit_visible_and_content_filter(
+            query,
+            candidate_budget,
+            ContentVisibilitySnapshot::path_filter(&self.content_visibility),
+            |entry| self.baseline_entry_is_visible(entry),
+        );
         let baseline_has_content_feedback = baseline_results
             .iter()
             .any(|result| result.id == "feedback:content-index-unavailable");
@@ -268,6 +334,20 @@ impl LayeredSearchIndex {
             .saturating_add(overlay_index.compact_candidate_bytes)
             .saturating_add(overlay_index.path_lookup_bytes)
             .saturating_add(self.tombstones.estimated_bytes())
+            .saturating_add(self.content_visibility.estimated_bytes())
+    }
+
+    pub fn estimated_baseline_path_metadata_bytes(&self) -> usize {
+        let entries: usize = self
+            .baseline_by_path
+            .keys()
+            .map(|path| {
+                path.capacity()
+                    .saturating_add(std::mem::size_of::<(String, IndexedEntryKind)>())
+                    .saturating_add(std::mem::size_of::<usize>().saturating_mul(3))
+            })
+            .sum();
+        std::mem::size_of::<BTreeMap<String, IndexedEntryKind>>().saturating_add(entries)
     }
 
     pub fn generation(&self) -> u64 {
@@ -295,6 +375,9 @@ impl LayeredSearchIndex {
     }
 
     fn baseline_entry_is_visible(&self, entry: &IndexedEntry) -> bool {
+        #[cfg(test)]
+        self.content_visibility_baseline_scan_count
+            .fetch_add(1, Ordering::Relaxed);
         let key = normalize_path_text(&entry.path);
         !self.overlay_entries.contains_key(&key) && !self.tombstones.contains(&key)
     }
@@ -362,6 +445,23 @@ impl LayeredSearchIndex {
     #[cfg(test)]
     fn baseline_probe_count(&self) -> usize {
         self.baseline_probe_count.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn reset_content_visibility_baseline_scan_count(&self) {
+        self.content_visibility_baseline_scan_count
+            .store(0, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn content_visibility_baseline_scan_count(&self) -> usize {
+        self.content_visibility_baseline_scan_count
+            .load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn content_visibility_snapshot_id(&self) -> usize {
+        Arc::as_ptr(&self.content_visibility) as usize
     }
 
     fn record_baseline_probe(&self) {
@@ -471,6 +571,17 @@ fn remove_path_scope(paths: &mut BTreeSet<String>, key: &str) {
     }
 }
 
+fn string_set_estimated_bytes(paths: &BTreeSet<String>) -> usize {
+    paths
+        .iter()
+        .map(|path| {
+            path.capacity()
+                .saturating_add(std::mem::size_of::<String>())
+                .saturating_add(std::mem::size_of::<usize>().saturating_mul(3))
+        })
+        .sum()
+}
+
 fn indexed_entry_string_bytes(entry: &IndexedEntry) -> usize {
     entry.path.capacity()
         + entry.name.capacity()
@@ -487,6 +598,10 @@ fn indexed_entry_string_bytes(entry: &IndexedEntry) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{CommittedIndexDelta, LayeredSearchIndex, PathTombstones};
+    use crate::core::content_index::{
+        ContentExtractionResult, ContentIndex, ContentIndexOptions, TextExtractor,
+        DEFAULT_MAX_CONTENT_BYTES,
+    };
     use crate::core::index::{IndexedEntry, IndexedEntryKind, SearchIndex};
     use crate::core::index_watcher::IndexUpdateBatch;
     use crate::core::search::{HistoryScores, QueryRequest, Ranker, SearchMode};
@@ -826,6 +941,34 @@ mod tests {
     }
 
     #[test]
+    fn baseline_path_metadata_memory_is_reported_without_full_entry_copies() {
+        let root = PathBuf::from("/tmp/root");
+        let baseline: Vec<_> = (0..20_000)
+            .map(|index| {
+                entry(
+                    root.join(format!("memory-file-{index:05}.md")),
+                    &root,
+                    IndexedEntryKind::File,
+                )
+            })
+            .collect();
+        let path_bytes: usize = baseline.iter().map(|entry| entry.path.len()).sum();
+        let full_entry_copy_lower_bound = path_bytes.saturating_add(
+            baseline
+                .len()
+                .saturating_mul(std::mem::size_of::<IndexedEntry>()),
+        );
+        let index = LayeredSearchIndex::from_baseline(baseline);
+
+        let metadata_bytes = index.estimated_baseline_path_metadata_bytes();
+        let projected_two_million_bytes = metadata_bytes.saturating_mul(100);
+
+        assert!(metadata_bytes >= path_bytes);
+        assert!(metadata_bytes < full_entry_copy_lower_bound);
+        assert!(projected_two_million_bytes < 512 * 1024 * 1024);
+    }
+
+    #[test]
     fn delta_memory_estimate_includes_all_overlay_search_copies_and_compact_storage() {
         let root = PathBuf::from("/tmp/root");
         let path = format!("/tmp/root/{}.md", "p".repeat(4_096));
@@ -853,6 +996,59 @@ mod tests {
             "estimate={} lower_bound={obvious_duplicate_lower_bound}",
             index.estimated_delta_bytes()
         );
+    }
+
+    #[test]
+    fn content_visibility_snapshot_build_is_independent_of_baseline_size() {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path();
+        let hidden_root = root.join("hidden");
+        let mut entries: Vec<_> = (0..10_001)
+            .map(|index| {
+                entry(
+                    hidden_root.join(format!("shared-hidden-{index:05}.md")),
+                    root,
+                    IndexedEntryKind::File,
+                )
+            })
+            .collect();
+        entries.push(entry(
+            root.join("shared-visible.md"),
+            root,
+            IndexedEntryKind::File,
+        ));
+        let content_index = ContentIndex::build_with_extractor(
+            &mut entries,
+            ContentIndexOptions {
+                index_dir: root.join("tantivy-layered-visibility"),
+                max_file_bytes: DEFAULT_MAX_CONTENT_BYTES,
+            },
+            &LayeredRankedContentExtractor,
+        )
+        .unwrap();
+        let baseline = SearchIndex::from_entries_with_content_index(entries, content_index);
+        let mut index = LayeredSearchIndex::from_search_index(baseline);
+
+        index.apply_delta(CommittedIndexDelta {
+            generation: 1,
+            upserts: Vec::new(),
+            removals: vec![hidden_root],
+        });
+
+        assert_eq!(index.overlay.memory_estimate().path_lookup_entry_count, 0);
+        assert_eq!(index.overlay.memory_estimate().path_lookup_bytes, 0);
+        let snapshot_id = index.content_visibility_snapshot_id();
+        index.reset_content_visibility_baseline_scan_count();
+
+        let content_only = index.search(&request("content:needle"), 1);
+
+        assert_eq!(content_only[0].title, "shared-visible.md");
+        assert_eq!(index.content_visibility_baseline_scan_count(), 0);
+
+        let mixed = index.search(&request("shared content:needle"), 1);
+
+        assert_eq!(mixed[0].title, "shared-visible.md");
+        assert_eq!(index.content_visibility_snapshot_id(), snapshot_id);
     }
 
     #[test]
@@ -944,6 +1140,21 @@ mod tests {
         let mut entry = IndexedEntry::legacy(path.to_string_lossy(), name, kind);
         entry.root = root.to_string_lossy().into_owned();
         entry
+    }
+
+    struct LayeredRankedContentExtractor;
+
+    impl TextExtractor for LayeredRankedContentExtractor {
+        fn extract(&self, path: &Path, _max_bytes: u64) -> ContentExtractionResult {
+            if path
+                .file_name()
+                .is_some_and(|name| name == "shared-visible.md")
+            {
+                ContentExtractionResult::Text("needle".to_owned())
+            } else {
+                ContentExtractionResult::Text("needle ".repeat(32))
+            }
+        }
     }
 
     fn named_entry(path: PathBuf, root: &Path, name: &str) -> IndexedEntry {
