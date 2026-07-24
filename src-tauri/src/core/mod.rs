@@ -6,6 +6,7 @@ pub mod file_matcher;
 pub mod file_query;
 pub mod index;
 pub mod index_entry;
+pub mod index_journal;
 pub mod index_scanner;
 pub mod index_update_coordinator;
 pub mod index_watcher;
