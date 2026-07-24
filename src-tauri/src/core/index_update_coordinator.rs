@@ -16,11 +16,15 @@ pub struct CoordinatorPolicy {
 }
 
 impl CoordinatorPolicy {
-    pub fn production() -> Self {
+    pub const fn new(quiet_window: Duration, max_latency: Duration) -> Self {
         Self {
-            quiet_window: Duration::from_secs(5),
-            max_latency: Duration::from_secs(10),
+            quiet_window,
+            max_latency,
         }
+    }
+
+    pub fn production() -> Self {
+        Self::new(Duration::from_secs(5), Duration::from_secs(10))
     }
 
     pub fn quiet_window(self) -> Duration {
@@ -148,6 +152,17 @@ mod tests {
 
         assert_eq!(policy.quiet_window(), Duration::from_secs(5));
         assert_eq!(policy.max_latency(), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn coordinator_policy_accepts_injected_test_deadlines() {
+        let start = Instant::now();
+        let policy = CoordinatorPolicy::new(Duration::from_millis(10), Duration::from_millis(20));
+        let mut state = CoordinatorState::new(policy);
+        state.push_event(IndexWatchEvent::Write(PathBuf::from("a.txt")), start);
+
+        assert!(!state.should_drain(start + Duration::from_millis(9)));
+        assert!(state.should_drain(start + Duration::from_millis(10)));
     }
 
     #[test]

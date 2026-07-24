@@ -202,18 +202,16 @@ impl IndexEventBatcher {
 pub struct WatcherFailure {
     pub root: PathBuf,
     pub message: String,
+    pub(crate) diagnostic: String,
     pub requires_background_refresh: bool,
 }
 
 impl WatcherFailure {
-    pub fn new(root: PathBuf, error: impl Into<String>) -> Self {
-        let mut error = error.into();
-        if !root.as_os_str().is_empty() {
-            error = error.replace(root.to_string_lossy().as_ref(), "watched root");
-        }
+    pub fn new(root: PathBuf, diagnostic: impl Into<String>) -> Self {
         Self {
             root,
-            message: format!("watcher failed: {error}; falling back to background refresh"),
+            message: "watcher failed; falling back to background refresh".to_owned(),
+            diagnostic: diagnostic.into(),
             requires_background_refresh: true,
         }
     }
@@ -227,21 +225,21 @@ pub struct RuntimeIndexWatcher {
 }
 
 impl RuntimeIndexWatcher {
+    /// Starts the bounded watcher pipeline.
+    ///
+    /// `_legacy_sender` preserves the pre-coordinator call shape until the runtime wiring task
+    /// switches `lib.rs` to consume [`Self::take_inbox`]. It receives no events and should be
+    /// removed together with that migration.
     pub fn watch_roots(
         roots: Vec<PathBuf>,
         _legacy_sender: Sender<Result<IndexWatchEvent, WatcherFailure>>,
     ) -> Result<Self, WatcherFailure> {
         let (callback_sender, inbox) =
             WatchEventInbox::bounded(roots.clone(), DEFAULT_WATCH_CHANNEL_CAPACITY);
-        let mut watcher =
-            notify::recommended_watcher(move |result: notify::Result<Event>| match result {
-                Ok(event) => dispatch_notify_event(event, &callback_sender),
-                Err(error) => {
-                    callback_sender
-                        .record_failure(WatcherFailure::new(PathBuf::new(), error.to_string()));
-                }
-            })
-            .map_err(|error| WatcherFailure::new(PathBuf::new(), error.to_string()))?;
+        let mut watcher = notify::recommended_watcher(move |result: notify::Result<Event>| {
+            dispatch_notify_result(result, &callback_sender);
+        })
+        .map_err(|error| WatcherFailure::new(PathBuf::new(), error.to_string()))?;
 
         for root in &roots {
             watcher
@@ -265,8 +263,32 @@ impl RuntimeIndexWatcher {
     }
 }
 
+fn dispatch_notify_result(result: notify::Result<Event>, sender: &WatchEventSender) {
+    match result {
+        Ok(event) => dispatch_notify_event(event, sender),
+        Err(error) => {
+            let root = error
+                .paths
+                .iter()
+                .filter_map(|path| longest_matching_root(path, &sender.watched_roots))
+                .max_by_key(|root| root.components().count())
+                .cloned()
+                .unwrap_or_default();
+            sender.mark_paths_dirty(error.paths.iter().map(PathBuf::as_path), true);
+            sender.record_failure(WatcherFailure::new(root, error.to_string()));
+        }
+    }
+}
+
 fn dispatch_notify_event(event: Event, sender: &WatchEventSender) {
-    if event.need_rescan() {
+    let uncertain_rename = matches!(
+        event.kind,
+        EventKind::Modify(ModifyKind::Name(RenameMode::Any | RenameMode::Other))
+    ) || matches!(
+        event.kind,
+        EventKind::Modify(ModifyKind::Name(RenameMode::Both)) if event.paths.len() < 2
+    );
+    if event.need_rescan() || uncertain_rename {
         sender.mark_paths_dirty(event.paths.iter().map(PathBuf::as_path), true);
         return;
     }
@@ -294,6 +316,17 @@ pub fn events_from_notify(event: Event) -> Vec<IndexWatchEvent> {
                 to: event.paths[1].clone(),
             }]
         }
+        EventKind::Modify(ModifyKind::Name(RenameMode::From)) => event
+            .paths
+            .into_iter()
+            .map(IndexWatchEvent::Remove)
+            .collect(),
+        EventKind::Modify(ModifyKind::Name(RenameMode::To)) => event
+            .paths
+            .into_iter()
+            .map(IndexWatchEvent::Create)
+            .collect(),
+        EventKind::Modify(ModifyKind::Name(_)) => Vec::new(),
         EventKind::Modify(_) => event
             .paths
             .into_iter()
@@ -356,8 +389,29 @@ mod tests {
 
         assert!(failure.requires_background_refresh);
         assert!(failure.message.contains("watcher failed"));
-        assert!(failure.message.contains("too many open files"));
+        assert!(failure.diagnostic.contains("too many open files"));
         assert!(!failure.message.contains(root.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn runtime_notify_error_keeps_private_path_out_of_message_and_dirties_matching_root() {
+        let private_root = PathBuf::from("/Users/private/QuickFox");
+        let private_path = private_root.join("secret.txt");
+        let unrelated_root = PathBuf::from("/Volumes/other");
+        let (sender, inbox) =
+            WatchEventInbox::bounded(vec![unrelated_root, private_root.clone()], 1);
+        let error = notify::Error::generic("permission denied").add_path(private_path.clone());
+
+        dispatch_notify_result(Err(error), &sender);
+
+        let failure = inbox.take_failure().expect("runtime failure retained");
+        assert!(!failure
+            .message
+            .contains(private_path.to_string_lossy().as_ref()));
+        assert!(failure
+            .diagnostic
+            .contains(private_path.to_string_lossy().as_ref()));
+        assert_eq!(inbox.take_dirty_roots(), BTreeSet::from([private_root]));
     }
 
     #[test]
@@ -421,6 +475,43 @@ mod tests {
             inbox.take_dirty_roots(),
             BTreeSet::from([first_root, second_root])
         );
+    }
+
+    #[test]
+    fn rename_mode_from_becomes_remove() {
+        let path = PathBuf::from("/tmp/quickfox-watch/old.txt");
+        let event = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::From)))
+            .add_path(path.clone());
+
+        assert_eq!(
+            events_from_notify(event),
+            vec![IndexWatchEvent::Remove(path)]
+        );
+    }
+
+    #[test]
+    fn rename_mode_to_becomes_create() {
+        let path = PathBuf::from("/tmp/quickfox-watch/new.txt");
+        let event =
+            Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::To))).add_path(path.clone());
+
+        assert_eq!(
+            events_from_notify(event),
+            vec![IndexWatchEvent::Create(path)]
+        );
+    }
+
+    #[test]
+    fn rename_mode_any_marks_the_matching_root_dirty_without_queuing_a_write() {
+        let root = PathBuf::from("/tmp/quickfox-watch");
+        let path = root.join("uncertain.txt");
+        let (sender, inbox) = WatchEventInbox::bounded(vec![root.clone()], 1);
+        let event = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Any))).add_path(path);
+
+        dispatch_notify_event(event, &sender);
+
+        assert_eq!(inbox.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(inbox.take_dirty_roots(), BTreeSet::from([root]));
     }
 
     #[test]
