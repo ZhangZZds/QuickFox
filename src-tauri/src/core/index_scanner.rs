@@ -333,7 +333,10 @@ where
             return Ok(None);
         }
         self.load_global()?;
-        self.load_containing_repository(configured_root)?;
+        self.load_ancestor_directories(configured_root)?;
+        if self.cancelled() {
+            return Ok(None);
+        }
         self.load_directory(configured_root)?;
 
         let relative = target.strip_prefix(configured_root).map_err(|_| {
@@ -379,7 +382,6 @@ where
         }
         let git_dir = directory.join(".git");
         if self.probe.is_directory(&git_dir)? {
-            self.git_ignore.clear();
             self.git_exclude = self.load_matcher(directory, &git_dir.join("info/exclude"))?;
         }
         if let Some(matcher) = self.load_matcher(directory, &directory.join(".gitignore"))? {
@@ -391,16 +393,14 @@ where
         Ok(())
     }
 
-    fn load_containing_repository(&mut self, configured_root: &Path) -> Result<(), std::io::Error> {
-        for directory in configured_root.ancestors() {
+    fn load_ancestor_directories(&mut self, configured_root: &Path) -> Result<(), std::io::Error> {
+        let mut ancestors: Vec<_> = configured_root.ancestors().skip(1).collect();
+        ancestors.reverse();
+        for directory in ancestors {
             if self.cancelled() {
                 return Ok(());
             }
-            let git_dir = directory.join(".git");
-            if self.probe.is_directory(&git_dir)? {
-                self.git_exclude = self.load_matcher(directory, &git_dir.join("info/exclude"))?;
-                break;
-            }
+            self.load_directory(directory)?;
         }
         Ok(())
     }

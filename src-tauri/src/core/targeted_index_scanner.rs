@@ -1043,6 +1043,33 @@ mod tests {
         assert_targeted_file_matches_full_scan(&root, &file, false);
     }
 
+    #[test]
+    fn targeted_file_matches_gitignore_above_configured_root() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path();
+        fs::create_dir(repo.join(".git")).unwrap();
+        fs::write(repo.join(".gitignore"), "workspace/ignored.md\n").unwrap();
+        let root = repo.join("workspace");
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("ignored.md");
+        fs::write(&file, "ignored").unwrap();
+
+        assert_targeted_file_matches_full_scan(&root, &file, false);
+    }
+
+    #[test]
+    fn targeted_file_matches_dot_ignore_above_configured_root() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path();
+        fs::write(repo.join(".ignore"), "workspace/ignored.md\n").unwrap();
+        let root = repo.join("workspace");
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("ignored.md");
+        fs::write(&file, "ignored").unwrap();
+
+        assert_targeted_file_matches_full_scan(&root, &file, false);
+    }
+
     #[derive(Debug, Default)]
     struct CountingIgnorePathProbe {
         read_dir_calls: AtomicUsize,
@@ -1082,8 +1109,11 @@ mod tests {
     #[test]
     fn targeted_single_file_ignore_decision_never_enumerates_root_or_siblings() {
         let temp = TempDir::new().unwrap();
-        let root = temp.path();
-        fs::write(root.join(".gitignore"), "ignored.md\n").unwrap();
+        let repo = temp.path();
+        fs::write(repo.join(".gitignore"), "workspace/target.md\n").unwrap();
+        fs::write(repo.join(".ignore"), "!workspace/target.md\n").unwrap();
+        let root = repo.join("workspace");
+        fs::create_dir_all(&root).unwrap();
         let target = root.join("target.md");
         fs::write(&target, "target").unwrap();
         for index in 0..512 {
@@ -1091,7 +1121,7 @@ mod tests {
         }
         let probe = Arc::new(CountingIgnorePathProbe::default());
         let scanner = TargetedIndexScanner::with_scanner(
-            scan_rules(root),
+            scan_rules(&root),
             IgnoreScanner::with_path_probe(probe.clone()),
         );
 
@@ -1099,7 +1129,8 @@ mod tests {
 
         assert_eq!(result.upserts.len(), 1);
         assert_eq!(probe.read_dir_calls.load(Ordering::Relaxed), 0);
-        assert!(probe.read_file_calls.load(Ordering::Relaxed) <= 4);
+        assert!(probe.read_file_calls.load(Ordering::Relaxed) >= 2);
+        assert!(probe.read_file_calls.load(Ordering::Relaxed) <= root.ancestors().count() * 3);
     }
 
     #[test]
