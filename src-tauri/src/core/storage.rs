@@ -9,10 +9,21 @@ use crate::core::layered_index::CommittedIndexDelta;
 use crate::core::targeted_index_scanner::{
     DirectoryFingerprint, FileSystemEntryKind, KnownIndexedChild,
 };
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::types::Value;
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+const TARGETED_DIRECT_JOURNAL_SQL: &str = r#"
+    SELECT batches.generation, entries.ordinal, entries.operation, entries.path, entries.entry_json
+    FROM index_delta_entries AS entries INDEXED BY idx_index_delta_entries_parent_batch
+    JOIN index_delta_batches AS batches ON batches.id = entries.batch_id
+    WHERE entries.parent_key = ?2
+      AND (entries.root_key = ?3 OR entries.root_key IS NULL)
+      AND batches.status = 'committed'
+      AND batches.generation > ?1
+"#;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexState {
@@ -1072,7 +1083,17 @@ impl SqliteStorage {
         &self,
         root: &Path,
         directory: &Path,
+        on_query: impl FnMut(),
+    ) -> Result<Vec<KnownIndexedChild>, StorageError> {
+        self.known_direct_indexed_children_with_probes(root, directory, on_query, |_| {})
+    }
+
+    fn known_direct_indexed_children_with_probes(
+        &self,
+        root: &Path,
+        directory: &Path,
         mut on_query: impl FnMut(),
+        mut on_journal_rows: impl FnMut(usize),
     ) -> Result<Vec<KnownIndexedChild>, StorageError> {
         let root_key = normalize_path_key_for_mode(root, self.comparison_mode);
         let directory_key = normalize_path_key_for_mode(directory, self.comparison_mode);
@@ -1137,39 +1158,52 @@ impl SqliteStorage {
         let baseline_generation = baseline_selection
             .map(|(_, generation)| generation)
             .unwrap_or(0);
+        let baseline_generation = generation_to_i64(baseline_generation)?;
+        let mut targeted_rows = Vec::new();
+
         on_query();
-        let mut journal_statement = self.connection.prepare(
-            r#"
-            SELECT entries.operation, entries.path, entries.entry_json
-            FROM index_delta_batches AS batches
-            JOIN index_delta_entries AS entries ON entries.batch_id = batches.id
-            WHERE batches.status = 'committed'
-              AND batches.generation > ?1
-              AND (
-                    (entries.parent_key = ?2 AND (entries.root_key = ?3 OR entries.root_key IS NULL))
-                 OR entries.path = ?2
-                 OR (entries.path = '/' AND substr(?2, 1, 1) = '/')
-                 OR ?2 LIKE entries.path || '/%'
-              )
-            ORDER BY batches.generation ASC, entries.ordinal ASC
-            "#,
-        )?;
-        let journal_rows = journal_statement.query_map(
-            params![
-                generation_to_i64(baseline_generation)?,
-                directory_key,
-                root_key
-            ],
+        let mut direct_statement = self.connection.prepare(TARGETED_DIRECT_JOURNAL_SQL)?;
+        let direct_rows = direct_statement.query_map(
+            params![baseline_generation, directory_key, root_key],
             |row| {
                 Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
                 ))
             },
         )?;
-        for row in journal_rows {
-            let (operation, path, entry_json) = row?;
+        for row in direct_rows {
+            targeted_rows.push(row?);
+        }
+
+        let ancestor_keys = normalized_ancestor_keys(&directory_key);
+        let ancestor_sql = targeted_ancestor_journal_sql(ancestor_keys.len());
+        let mut ancestor_parameters = Vec::with_capacity(ancestor_keys.len() + 1);
+        ancestor_parameters.push(Value::Integer(baseline_generation));
+        ancestor_parameters.extend(ancestor_keys.into_iter().map(Value::Text));
+        on_query();
+        let mut ancestor_statement = self.connection.prepare(&ancestor_sql)?;
+        let ancestor_rows =
+            ancestor_statement.query_map(params_from_iter(ancestor_parameters), |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            })?;
+        for row in ancestor_rows {
+            targeted_rows.push(row?);
+        }
+        targeted_rows.sort_by_key(|row| (row.0, row.1));
+        targeted_rows.dedup_by_key(|row| (row.0, row.1));
+        on_journal_rows(targeted_rows.len());
+
+        for (_, _, operation, path, entry_json) in targeted_rows {
             let key = normalize_path_text_key_for_mode(&path, self.comparison_mode);
             match operation.as_str() {
                 "remove" => {
@@ -2153,6 +2187,33 @@ fn normalized_parent(path: &str) -> Option<&str> {
     } else {
         Some(&path[..separator])
     }
+}
+
+fn normalized_ancestor_keys(path: &str) -> Vec<String> {
+    let mut ancestors = Vec::new();
+    let mut current = Some(path.to_owned());
+    while let Some(path) = current {
+        current = normalized_parent(&path).map(str::to_owned);
+        ancestors.push(path);
+    }
+    ancestors
+}
+
+fn targeted_ancestor_journal_sql(ancestor_count: usize) -> String {
+    let placeholders = (0..ancestor_count)
+        .map(|index| format!("?{}", index + 2))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        r#"
+        SELECT batches.generation, entries.ordinal, entries.operation, entries.path, entries.entry_json
+        FROM index_delta_entries AS entries INDEXED BY idx_index_delta_entries_path
+        JOIN index_delta_batches AS batches ON batches.id = entries.batch_id
+        WHERE entries.path IN ({placeholders})
+          AND batches.status = 'committed'
+          AND batches.generation > ?1
+        "#
+    )
 }
 
 fn path_is_descendant(root: &str, candidate: &str) -> bool {
@@ -3352,7 +3413,94 @@ mod tests {
 
         assert_eq!(children.len(), 1);
         assert_eq!(children[0].path, "/root/direct.md");
-        assert_eq!(query_count.get(), 3);
+        assert_eq!(query_count.get(), 4);
+
+        drop(storage);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn targeted_journal_query_plan_does_not_walk_batches_to_scan_unrelated_entries() {
+        let path = temp_db_path("known-direct-targeted-query-plan");
+        let storage = SqliteStorage::open(path.clone()).unwrap();
+        let direct_explain = format!("EXPLAIN QUERY PLAN {TARGETED_DIRECT_JOURNAL_SQL}");
+        let mut direct_statement = storage.connection.prepare(&direct_explain).unwrap();
+        let direct_rows = direct_statement
+            .query_map(params![0, "/changed/nested", "/"], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap();
+        let direct_plan = direct_rows.collect::<Result<Vec<_>, _>>().unwrap();
+
+        let ancestors = normalized_ancestor_keys("/changed/nested");
+        let ancestor_explain = format!(
+            "EXPLAIN QUERY PLAN {}",
+            targeted_ancestor_journal_sql(ancestors.len())
+        );
+        let mut parameters = vec![Value::Integer(0)];
+        parameters.extend(ancestors.into_iter().map(Value::Text));
+        let mut ancestor_statement = storage.connection.prepare(&ancestor_explain).unwrap();
+        let ancestor_rows = ancestor_statement
+            .query_map(params_from_iter(parameters), |row| row.get::<_, String>(3))
+            .unwrap();
+        let ancestor_plan = ancestor_rows.collect::<Result<Vec<_>, _>>().unwrap();
+
+        assert!(
+            direct_plan
+                .iter()
+                .any(|detail| detail.contains("idx_index_delta_entries_parent_batch")),
+            "direct journal plan must use the parent index: {direct_plan:?}"
+        );
+        assert!(
+            ancestor_plan
+                .iter()
+                .any(|detail| detail.contains("idx_index_delta_entries_path")),
+            "ancestor journal plan must use the path index: {ancestor_plan:?}"
+        );
+
+        drop(direct_statement);
+        drop(ancestor_statement);
+        drop(storage);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn many_unrelated_journal_rows_are_not_returned_for_multiple_changed_directories() {
+        let path = temp_db_path("known-direct-production-scale-targeting");
+        let storage = SqliteStorage::open(path.clone()).unwrap();
+        let baseline = (0..5)
+            .map(|ordinal| {
+                let mut entry = indexed_entry(&format!("/root/changed-{ordinal}/direct.md"));
+                entry.parent = format!("/root/changed-{ordinal}");
+                entry
+            })
+            .collect::<Vec<_>>();
+        storage.save_completed_index_batch(10, &baseline).unwrap();
+        for generation in 1..=5_000 {
+            let mut entry = indexed_entry(&format!("/other/dir-{generation}/file.md"));
+            entry.root = "/other".to_owned();
+            entry.parent = format!("/other/dir-{generation}");
+            storage
+                .commit_incremental_batch(&committed_delta(generation, entry, Vec::new()), &[], &[])
+                .unwrap();
+        }
+        let query_count = Cell::new(0);
+        let journal_rows = Cell::new(0);
+
+        for ordinal in 0..5 {
+            let children = storage
+                .known_direct_indexed_children_with_probes(
+                    Path::new("/root"),
+                    Path::new(&format!("/root/changed-{ordinal}")),
+                    || query_count.set(query_count.get() + 1),
+                    |rows| journal_rows.set(journal_rows.get() + rows),
+                )
+                .unwrap();
+            assert_eq!(children.len(), 1);
+        }
+
+        assert_eq!(query_count.get(), 20);
+        assert_eq!(journal_rows.get(), 0);
 
         drop(storage);
         let _ = fs::remove_file(path);
