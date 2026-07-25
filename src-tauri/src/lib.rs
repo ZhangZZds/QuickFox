@@ -24,8 +24,8 @@ use crate::core::providers::{
     WebSearchEngine, WebSearchProvider,
 };
 use crate::core::runtime_indexing::{
-    baseline_refresh_event_for_delta_state, start_runtime_indexing, RuntimeIndexingEvent,
-    RuntimeIndexingHandle, RuntimeIndexingOptions,
+    baseline_refresh_event_for_delta_state, start_runtime_indexing, BaselineRefreshReason,
+    RuntimeIndexingEvent, RuntimeIndexingHandle, RuntimeIndexingOptions,
 };
 use crate::core::search::{HistoryScores, QueryParser, QueryParserConfig, Ranker, SearchResult};
 use crate::core::storage::SqliteStorage;
@@ -54,6 +54,7 @@ struct QuickFoxRuntime {
     index_lifecycle: IndexLifecycle,
     runtime_indexing: Option<RuntimeIndexingHandle>,
     incremental_status: RuntimeIncrementalStatus,
+    manifest_ready: bool,
 }
 
 struct QuickFoxAppState {
@@ -825,7 +826,7 @@ fn start_background_index_refresh<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: &QuickFoxAppState,
 ) -> Result<IndexStatus, String> {
-    let (config, generation, baseline_generation, previous_runtime_indexing) = {
+    let (config, generation, previous_runtime_indexing) = {
         let mut runtime = state
             .runtime
             .lock()
@@ -839,18 +840,33 @@ fn start_background_index_refresh<R: tauri::Runtime>(
         }
         let has_existing_index = runtime.index.entry_count() > 0;
         let generation = runtime.index_lifecycle.start_refresh(has_existing_index);
-        let baseline_generation = runtime.index.generation();
         let previous_runtime_indexing = runtime.runtime_indexing.take();
         (
             runtime.config.clone(),
             generation,
-            baseline_generation,
             previous_runtime_indexing,
         )
     };
     if let Some(previous_runtime_indexing) = previous_runtime_indexing {
         previous_runtime_indexing.stop();
     }
+    let baseline_generation = if let Some(storage) = storage_store() {
+        match storage.highest_committed_generation() {
+            Ok(generation) => generation,
+            Err(error) => {
+                let message = error.to_string();
+                let _ = apply_failed_index_refresh(state, generation, message.clone());
+                return Err(message);
+            }
+        }
+    } else {
+        state
+            .runtime
+            .lock()
+            .expect("quickfox runtime lock poisoned")
+            .index
+            .generation()
+    };
     let status = {
         state
             .runtime
@@ -973,6 +989,7 @@ fn start_background_index_refresh<R: tauri::Runtime>(
                         if let Some(status) = apply_completed_index_refresh(
                             &state,
                             generation,
+                            baseline_generation,
                             final_payload,
                             completed_at_ms,
                         ) {
@@ -1064,6 +1081,7 @@ fn start_background_index_refresh<R: tauri::Runtime>(
                                 if let Some(status) = apply_completed_content_index_refresh(
                                     &state,
                                     generation,
+                                    baseline_generation,
                                     content_index,
                                     content_payload,
                                     content_completed_at_ms,
@@ -1126,6 +1144,7 @@ fn persist_and_activate_baseline(
 fn apply_completed_index_refresh(
     state: &QuickFoxAppState,
     generation: u64,
+    baseline_generation: u64,
     payload: impl Into<IndexRefreshPayload>,
     completed_at_ms: i64,
 ) -> Option<IndexStatus> {
@@ -1141,11 +1160,11 @@ fn apply_completed_index_refresh(
     {
         return None;
     }
-    let index_generation = runtime.index.generation();
     let baseline = build_search_index_for_config(&runtime.config, payload.entries);
     runtime
         .index
-        .replace_baseline_search_index(baseline, index_generation);
+        .replace_baseline_search_index(baseline, baseline_generation);
+    runtime.manifest_ready = true;
     runtime.last_report = payload.summary;
     Some(runtime.index_status())
 }
@@ -1153,6 +1172,7 @@ fn apply_completed_index_refresh(
 fn apply_completed_content_index_refresh(
     state: &QuickFoxAppState,
     generation: u64,
+    baseline_generation: u64,
     content_index: SearchIndex,
     payload: impl Into<IndexRefreshPayload>,
     completed_at_ms: i64,
@@ -1169,10 +1189,10 @@ fn apply_completed_content_index_refresh(
     {
         return None;
     }
-    let index_generation = runtime.index.generation();
     runtime
         .index
-        .replace_baseline_search_index(content_index, index_generation);
+        .replace_baseline_search_index(content_index, baseline_generation);
+    runtime.manifest_ready = true;
     runtime.last_report = payload.summary;
     Some(runtime.index_status())
 }
@@ -1190,29 +1210,33 @@ fn restart_runtime_incremental_indexing<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: &QuickFoxAppState,
 ) -> Result<(), String> {
-    let (previous, config, roots, initial_generation) = {
+    let (previous, config, roots, initial_generation, should_start) = {
         let mut runtime = state
             .runtime
             .lock()
             .expect("quickfox runtime lock poisoned");
         let previous = runtime.runtime_indexing.take();
         runtime.incremental_status.enabled = runtime.config.index.watcher_enabled;
-        runtime.incremental_status.state = if runtime.config.index.watcher_enabled {
-            IncrementalState::Preparing
-        } else {
-            IncrementalState::Disabled
-        };
+        let roots = runtime_watch_roots(&runtime.config, &runtime.index);
+        let should_start =
+            runtime.config.index.watcher_enabled && runtime.manifest_ready && !roots.is_empty();
+        if !runtime.config.index.watcher_enabled {
+            runtime.incremental_status.state = IncrementalState::Disabled;
+        } else if should_start {
+            runtime.incremental_status.state = IncrementalState::Preparing;
+        }
         (
             previous,
             runtime.config.clone(),
-            runtime_watch_roots(&runtime.config, &runtime.index),
+            roots,
             runtime.index.generation(),
+            should_start,
         )
     };
     if let Some(previous) = previous {
         previous.stop();
     }
-    if !config.index.watcher_enabled || roots.is_empty() {
+    if !should_start {
         return Ok(());
     }
 
@@ -1304,13 +1328,16 @@ fn publish_runtime_indexing_event<R: tauri::Runtime>(
                 runtime.incremental_status = incremental_status;
                 runtime.index_status()
             }
-            RuntimeIndexingEvent::BaselineRefreshRequired { .. } => {
+            RuntimeIndexingEvent::BaselineRefreshRequired { reason } => {
                 request_refresh = true;
-                state
+                let mut runtime = state
                     .runtime
                     .lock()
-                    .expect("quickfox runtime lock poisoned")
-                    .index_status()
+                    .expect("quickfox runtime lock poisoned");
+                if baseline_refresh_requires_manifest_rebuild(reason) {
+                    runtime.manifest_ready = false;
+                }
+                runtime.index_status()
             }
         };
         let _ = dispatch.emit("quickfox://index-status", status);
@@ -1318,6 +1345,15 @@ fn publish_runtime_indexing_event<R: tauri::Runtime>(
             let _ = start_background_index_refresh(dispatch.clone(), &state);
         }
     });
+}
+
+fn baseline_refresh_requires_manifest_rebuild(reason: BaselineRefreshReason) -> bool {
+    matches!(
+        reason,
+        BaselineRefreshReason::CalibrationFailed
+            | BaselineRefreshReason::DirtyRoots
+            | BaselineRefreshReason::WatcherFailure
+    )
 }
 
 fn stop_runtime_incremental_indexing(state: &QuickFoxAppState) {
@@ -1407,26 +1443,40 @@ fn build_runtime() -> QuickFoxRuntime {
     let config = load_startup_config();
     if let Some(storage) = storage_store() {
         let recovery = recover_layered_index(&storage);
-        let lifecycle = if recovery.baseline_available() {
-            IndexLifecycle::from_ready(recovery.baseline_entry_count(), current_time_ms())
-        } else {
-            IndexLifecycle::default()
-        };
-        let mut incremental_status = RuntimeIncrementalStatus::default();
-        if let Some(code) = recovery.degradation_code() {
-            incremental_status.state = IncrementalState::Degraded;
-            incremental_status.degradation_code = Some(code);
-        }
-        return QuickFoxRuntime {
-            config,
-            index: recovery.index,
-            last_report: IndexReport::default(),
-            index_lifecycle: lifecycle,
-            runtime_indexing: None,
-            incremental_status,
-        };
+        return build_runtime_from_recovery(config, recovery);
     }
     build_runtime_from_snapshot(config, load_latest_index_snapshot())
+}
+
+fn build_runtime_from_recovery(
+    config: QuickFoxConfig,
+    recovery: crate::core::index_journal::IndexRecovery,
+) -> QuickFoxRuntime {
+    let lifecycle = if recovery.baseline_available() {
+        IndexLifecycle::from_ready(recovery.baseline_entry_count(), current_time_ms())
+    } else {
+        IndexLifecycle::default()
+    };
+    let mut incremental_status = RuntimeIncrementalStatus::default();
+    if let Some(code) = recovery.degradation_code() {
+        incremental_status.state = IncrementalState::Degraded;
+        incremental_status.degradation_code = Some(code);
+    }
+    let configured_roots: Vec<PathBuf> = build_scan_options(&config)
+        .include_dirs
+        .into_iter()
+        .filter(|root| root.is_dir())
+        .collect();
+    let manifest_ready = recovery.manifest_covers_roots(&configured_roots);
+    QuickFoxRuntime {
+        config,
+        index: recovery.index,
+        last_report: IndexReport::default(),
+        index_lifecycle: lifecycle,
+        runtime_indexing: None,
+        incremental_status,
+        manifest_ready,
+    }
 }
 
 fn load_latest_index_snapshot() -> Option<crate::core::storage::IndexSnapshot> {
@@ -1465,6 +1515,7 @@ fn build_runtime_from_snapshot(
         last_report: report,
         runtime_indexing: None,
         incremental_status: RuntimeIncrementalStatus::default(),
+        manifest_ready: false,
     }
 }
 
@@ -2211,6 +2262,7 @@ pub fn run() {
                     runtime.index_status().kind,
                     crate::core::index::IndexStatusKind::Ready
                 ) && runtime.incremental_status.degradation_code.is_none()
+                    && runtime.manifest_ready
             };
             if recovered_incremental_ready {
                 let _ = restart_runtime_incremental_indexing(app.handle().clone(), &state);
@@ -2249,7 +2301,10 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::layered_index::CommittedIndexDelta;
     use std::fs;
+    use std::sync::Arc;
+    use std::time::Duration;
 
     #[test]
     fn execute_action_refuses_unconfirmed_commands() {
@@ -2352,6 +2407,7 @@ mod tests {
             index_lifecycle: IndexLifecycle::default(),
             runtime_indexing: None,
             incremental_status: RuntimeIncrementalStatus::default(),
+            manifest_ready: true,
         };
 
         assert_eq!(
@@ -2384,6 +2440,7 @@ mod tests {
             index_lifecycle: IndexLifecycle::from_ready(1, 123),
             runtime_indexing: None,
             incremental_status: RuntimeIncrementalStatus::default(),
+            manifest_ready: true,
         };
 
         assert_eq!(runtime.index_status().entry_count, 2);
@@ -2422,6 +2479,173 @@ mod tests {
     }
 
     #[test]
+    fn legacy_baseline_with_empty_manifest_stays_searchable_while_runtime_prepares_rebuild() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = SqliteStorage::open(temp.path().join("legacy.sqlite")).unwrap();
+        let entry = IndexedEntry::from_path_metadata(
+            "/root/legacy.md",
+            "/root",
+            crate::core::index::IndexedEntryKind::File,
+        );
+        let baseline_id = storage
+            .save_completed_index_batch(10, std::slice::from_ref(&entry))
+            .unwrap();
+        storage.activate_baseline(baseline_id, 0).unwrap();
+
+        let recovery = recover_layered_index(&storage);
+        let runtime = build_runtime_from_recovery(
+            QuickFoxConfig::default_with_index_dirs(vec!["/root".to_owned()]),
+            recovery,
+        );
+
+        assert_eq!(runtime.index.entries(), &[entry]);
+        assert_eq!(
+            runtime.index_status().kind,
+            crate::core::index::IndexStatusKind::Ready
+        );
+        assert_eq!(
+            runtime.incremental_status.state,
+            IncrementalState::Preparing
+        );
+        assert!(!runtime.manifest_ready);
+        assert!(runtime.runtime_indexing.is_none());
+    }
+
+    #[test]
+    fn recovered_manifest_must_cover_newly_configured_roots_before_watcher_start() {
+        let temp = tempfile::tempdir().unwrap();
+        let old_root = temp.path().join("old-root");
+        let new_root = temp.path().join("new-root");
+        fs::create_dir_all(&old_root).unwrap();
+        fs::create_dir_all(&new_root).unwrap();
+        let old_file = old_root.join("old.md");
+        fs::write(&old_file, "old").unwrap();
+        let storage = SqliteStorage::open(temp.path().join("configured-roots.sqlite")).unwrap();
+        let baseline_id = storage
+            .save_completed_index_batch(
+                10,
+                &[IndexedEntry::from_path_metadata(
+                    &old_file,
+                    &old_root,
+                    crate::core::index::IndexedEntryKind::File,
+                )],
+            )
+            .unwrap();
+        storage.activate_baseline(baseline_id, 0).unwrap();
+        storage
+            .replace_directory_manifest(
+                &old_root,
+                &[crate::core::targeted_index_scanner::DirectoryFingerprint {
+                    path: old_root.to_string_lossy().into_owned(),
+                    parent: None,
+                    root: old_root.to_string_lossy().into_owned(),
+                    modified_ms: None,
+                }],
+            )
+            .unwrap();
+
+        let recovery = recover_layered_index(&storage);
+        assert!(recovery.manifest_ready());
+        let runtime = build_runtime_from_recovery(
+            QuickFoxConfig::default_with_index_dirs(vec![new_root.to_string_lossy().into_owned()]),
+            recovery,
+        );
+
+        assert!(!runtime.manifest_ready);
+        assert_eq!(
+            runtime.incremental_status.state,
+            IncrementalState::Preparing
+        );
+    }
+
+    #[test]
+    fn legacy_manifest_rebuild_atomically_enables_runtime_watcher() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("watched-root");
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("legacy.md");
+        fs::write(&file, "legacy").unwrap();
+        let database_path = temp.path().join("legacy-rebuild.sqlite");
+        let storage = SqliteStorage::open(database_path.clone()).unwrap();
+        let entries = vec![IndexedEntry::from_path_metadata(
+            &file,
+            &root,
+            crate::core::index::IndexedEntryKind::File,
+        )];
+        let legacy_id = storage.save_completed_index_batch(1, &entries).unwrap();
+        storage.activate_baseline(legacy_id, 0).unwrap();
+        let config =
+            QuickFoxConfig::default_with_index_dirs(vec![root.to_string_lossy().into_owned()]);
+
+        let before = build_runtime_from_recovery(config.clone(), recover_layered_index(&storage));
+        assert!(!before.manifest_ready);
+        assert!(before.runtime_indexing.is_none());
+
+        let rebuilt_id = storage.save_completed_index_batch(2, &entries).unwrap();
+        let manifest = baseline_manifest_from_entries(&entries, std::slice::from_ref(&root));
+        storage
+            .activate_baseline_with_manifest_and_clear_incremental_state(rebuilt_id, 0, &manifest)
+            .unwrap();
+        let after = build_runtime_from_recovery(config.clone(), recover_layered_index(&storage));
+        assert!(after.manifest_ready);
+
+        let roots = runtime_watch_roots(&after.config, &after.index);
+        let watcher = RuntimeIndexWatcher::watch_roots(roots.clone()).unwrap();
+        let options = build_scan_options(&config);
+        let rules = IndexPathRules::from_plan(&IndexScanPlan {
+            include_roots: roots.clone(),
+            exclude_dirs: options.exclude_dirs,
+            exclude_patterns: options.exclude_patterns,
+            respect_project_ignores: options.respect_project_ignores,
+            stage: None,
+        })
+        .unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let published = Arc::clone(&events);
+        let handle = start_runtime_indexing(
+            watcher,
+            TargetedIndexScanner::new(rules),
+            Box::new(SqliteStorage::open(database_path).unwrap()),
+            RuntimeIndexingOptions {
+                roots,
+                policy: crate::core::index_update_coordinator::CoordinatorPolicy::new(
+                    Duration::from_millis(10),
+                    Duration::from_millis(25),
+                ),
+                initial_generation: after.index.generation(),
+            },
+            move |event| published.lock().unwrap().push(event),
+        )
+        .unwrap();
+        thread::sleep(Duration::from_millis(75));
+        handle.stop();
+
+        assert!(events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            RuntimeIndexingEvent::Status(RuntimeIncrementalStatus {
+                state: IncrementalState::Watching,
+                ..
+            })
+        )));
+    }
+
+    #[test]
+    fn dirty_or_failed_runtime_refresh_requires_manifest_rebuild_before_restart() {
+        assert!(baseline_refresh_requires_manifest_rebuild(
+            BaselineRefreshReason::CalibrationFailed
+        ));
+        assert!(baseline_refresh_requires_manifest_rebuild(
+            BaselineRefreshReason::DirtyRoots
+        ));
+        assert!(baseline_refresh_requires_manifest_rebuild(
+            BaselineRefreshReason::WatcherFailure
+        ));
+        assert!(!baseline_refresh_requires_manifest_rebuild(
+            BaselineRefreshReason::DeltaSafetyLimit
+        ));
+    }
+
+    #[test]
     fn completed_index_refresh_returns_status_for_frontend_event() {
         let state = QuickFoxAppState {
             runtime: Mutex::new(QuickFoxRuntime {
@@ -2431,6 +2655,7 @@ mod tests {
                 index_lifecycle: IndexLifecycle::default(),
                 runtime_indexing: None,
                 incremental_status: RuntimeIncrementalStatus::default(),
+                manifest_ready: true,
             }),
             window_state: Mutex::new(LauncherWindowState::default()),
             global_hotkey_status: Mutex::new(pending_global_hotkey_status()),
@@ -2443,6 +2668,7 @@ mod tests {
         let status = apply_completed_index_refresh(
             &state,
             generation,
+            0,
             IndexReport {
                 entries: vec![crate::core::index::IndexedEntry {
                     path: "/tmp/notes.md".to_owned(),
@@ -2467,6 +2693,65 @@ mod tests {
     }
 
     #[test]
+    fn refresh_baseline_generation_absorbs_a_committed_but_queued_runtime_publish() {
+        let queued_delta = CommittedIndexDelta {
+            generation: 1,
+            upserts: vec![IndexedEntry::legacy(
+                "/tmp/new.md",
+                "new.md",
+                crate::core::index::IndexedEntryKind::File,
+            )],
+            removals: vec![PathBuf::from("/tmp/old.md")],
+        };
+        let state = QuickFoxAppState {
+            runtime: Mutex::new(QuickFoxRuntime {
+                config: QuickFoxConfig::default_with_index_dirs(vec!["/tmp".to_owned()]),
+                index: LayeredSearchIndex::from_baseline(vec![IndexedEntry::legacy(
+                    "/tmp/old.md",
+                    "old.md",
+                    crate::core::index::IndexedEntryKind::File,
+                )]),
+                last_report: IndexReport::default(),
+                index_lifecycle: IndexLifecycle::default(),
+                runtime_indexing: None,
+                incremental_status: RuntimeIncrementalStatus::default(),
+                manifest_ready: false,
+            }),
+            window_state: Mutex::new(LauncherWindowState::default()),
+            global_hotkey_status: Mutex::new(pending_global_hotkey_status()),
+        };
+        let refresh_generation = state
+            .runtime
+            .lock()
+            .unwrap()
+            .index_lifecycle
+            .start_refresh(true);
+
+        apply_completed_index_refresh(
+            &state,
+            refresh_generation,
+            1,
+            IndexReport {
+                entries: queued_delta.upserts.clone(),
+                ..IndexReport::default()
+            },
+            123,
+        )
+        .unwrap();
+        state
+            .runtime
+            .lock()
+            .unwrap()
+            .index
+            .apply_delta(queued_delta);
+
+        let runtime = state.runtime.lock().unwrap();
+        assert_eq!(runtime.index.generation(), 1);
+        assert_eq!(runtime.index.entries().len(), 1);
+        assert_eq!(runtime.index.entries()[0].name, "new.md");
+    }
+
+    #[test]
     fn completed_index_refresh_delays_configured_content_index() {
         let root = tempfile::tempdir().unwrap();
         let file = root.path().join("AGENTS.md");
@@ -2487,6 +2772,7 @@ mod tests {
                 index_lifecycle: IndexLifecycle::default(),
                 runtime_indexing: None,
                 incremental_status: RuntimeIncrementalStatus::default(),
+                manifest_ready: true,
             }),
             window_state: Mutex::new(LauncherWindowState::default()),
             global_hotkey_status: Mutex::new(pending_global_hotkey_status()),
@@ -2499,6 +2785,7 @@ mod tests {
         apply_completed_index_refresh(
             &state,
             generation,
+            0,
             IndexReport {
                 entries: vec![crate::core::index::IndexedEntry::from_path_metadata(
                     &file,
@@ -2547,6 +2834,7 @@ mod tests {
                 index_lifecycle: IndexLifecycle::default(),
                 runtime_indexing: None,
                 incremental_status: RuntimeIncrementalStatus::default(),
+                manifest_ready: true,
             }),
             window_state: Mutex::new(LauncherWindowState::default()),
             global_hotkey_status: Mutex::new(pending_global_hotkey_status()),
@@ -2603,6 +2891,7 @@ mod tests {
                 index_lifecycle: IndexLifecycle::default(),
                 runtime_indexing: None,
                 incremental_status: RuntimeIncrementalStatus::default(),
+                manifest_ready: true,
             }),
             window_state: Mutex::new(LauncherWindowState::default()),
             global_hotkey_status: Mutex::new(pending_global_hotkey_status()),
@@ -2645,6 +2934,7 @@ mod tests {
         apply_completed_index_refresh(
             &state,
             generation,
+            0,
             IndexReport {
                 entries: vec![crate::core::index::IndexedEntry::legacy(
                     "/tmp/done.md",
@@ -2721,6 +3011,7 @@ mod tests {
                 index_lifecycle: IndexLifecycle::default(),
                 runtime_indexing: None,
                 incremental_status: RuntimeIncrementalStatus::default(),
+                manifest_ready: true,
             }),
             window_state: Mutex::new(LauncherWindowState::default()),
             global_hotkey_status: Mutex::new(pending_global_hotkey_status()),
@@ -2774,6 +3065,7 @@ mod tests {
                 index_lifecycle: IndexLifecycle::default(),
                 runtime_indexing: None,
                 incremental_status: RuntimeIncrementalStatus::default(),
+                manifest_ready: true,
             }),
             window_state: Mutex::new(LauncherWindowState::default()),
             global_hotkey_status: Mutex::new(pending_global_hotkey_status()),
@@ -2826,6 +3118,7 @@ mod tests {
                 index_lifecycle: IndexLifecycle::default(),
                 runtime_indexing: None,
                 incremental_status: RuntimeIncrementalStatus::default(),
+                manifest_ready: true,
             }),
             window_state: Mutex::new(LauncherWindowState::default()),
             global_hotkey_status: Mutex::new(pending_global_hotkey_status()),
@@ -2858,6 +3151,7 @@ mod tests {
                 index_lifecycle: IndexLifecycle::from_ready(1, 123),
                 runtime_indexing: None,
                 incremental_status: RuntimeIncrementalStatus::default(),
+                manifest_ready: true,
             }),
             window_state: Mutex::new(LauncherWindowState::default()),
             global_hotkey_status: Mutex::new(pending_global_hotkey_status()),
@@ -2908,6 +3202,7 @@ mod tests {
             index_lifecycle: IndexLifecycle::from_ready(1, 123),
             runtime_indexing: None,
             incremental_status: RuntimeIncrementalStatus::default(),
+            manifest_ready: true,
         };
 
         assert_eq!(
@@ -3195,6 +3490,7 @@ mod tests {
             index_lifecycle: IndexLifecycle::from_ready(1, 123),
             runtime_indexing: None,
             incremental_status: RuntimeIncrementalStatus::default(),
+            manifest_ready: true,
         };
         runtime.config.index.watcher_enabled = false;
         runtime.incremental_status.enabled = false;

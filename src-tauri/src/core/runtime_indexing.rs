@@ -1,5 +1,6 @@
 //! Tauri-neutral runtime incremental indexing service.
 
+use crate::core::index_entry::{path_is_same_or_descendant_for_mode, PathComparisonMode};
 use crate::core::index_entry::{IncrementalState, IndexDegradationCode, RuntimeIncrementalStatus};
 use crate::core::index_journal::IndexJournalRepository;
 use crate::core::index_update_coordinator::{
@@ -7,7 +8,9 @@ use crate::core::index_update_coordinator::{
 };
 use crate::core::index_watcher::{RuntimeIndexWatcher, WatchEventInbox, WatcherFailure};
 use crate::core::layered_index::CommittedIndexDelta;
-use crate::core::targeted_index_scanner::{TargetedIndexScanner, TargetedScanError};
+use crate::core::targeted_index_scanner::{
+    TargetedIndexScanner, TargetedScanError, TargetedScanResult,
+};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, SyncSender, TryRecvError};
@@ -30,6 +33,7 @@ pub enum BaselineRefreshReason {
     DeltaSafetyLimit,
     DirtyRoots,
     WatcherFailure,
+    CalibrationFailed,
 }
 
 #[derive(Debug, Clone)]
@@ -87,6 +91,42 @@ fn start_runtime_indexing_from_parts(
     options: RuntimeIndexingOptions,
     publish: impl Fn(RuntimeIndexingEvent) + Send + 'static,
 ) -> Result<RuntimeIndexingHandle, String> {
+    start_runtime_indexing_with_scanner(
+        watcher,
+        inbox,
+        Box::new(scanner),
+        journal,
+        options,
+        publish,
+    )
+}
+
+trait RuntimeBatchScanner: Send {
+    fn scan_batch_cancellable(
+        &self,
+        batch: crate::core::index_update_coordinator::CoordinatorBatch,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<TargetedScanResult, TargetedScanError>;
+}
+
+impl RuntimeBatchScanner for TargetedIndexScanner {
+    fn scan_batch_cancellable(
+        &self,
+        batch: crate::core::index_update_coordinator::CoordinatorBatch,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<TargetedScanResult, TargetedScanError> {
+        TargetedIndexScanner::scan_batch_cancellable(self, batch, is_cancelled)
+    }
+}
+
+fn start_runtime_indexing_with_scanner(
+    watcher: Option<RuntimeIndexWatcher>,
+    inbox: WatchEventInbox,
+    scanner: Box<dyn RuntimeBatchScanner>,
+    journal: Box<dyn IndexJournalRepository + Send>,
+    options: RuntimeIndexingOptions,
+    publish: impl Fn(RuntimeIndexingEvent) + Send + 'static,
+) -> Result<RuntimeIndexingHandle, String> {
     let shutdown = CoordinatorShutdown::default();
     let worker_shutdown = shutdown.clone();
     let (stop, stop_receiver) = mpsc::sync_channel(1);
@@ -108,7 +148,9 @@ fn start_runtime_indexing_from_parts(
                 publish: Box::new(publish),
                 shutdown: worker_shutdown,
                 stop_receiver,
-                _roots: options.roots,
+                roots: options.roots,
+                degraded_roots: std::collections::BTreeSet::new(),
+                baseline_refresh_requested: false,
             }
             .run();
         })
@@ -124,7 +166,7 @@ fn start_runtime_indexing_from_parts(
 struct RuntimeIndexingService {
     _watcher: Option<RuntimeIndexWatcher>,
     inbox: WatchEventInbox,
-    scanner: TargetedIndexScanner,
+    scanner: Box<dyn RuntimeBatchScanner>,
     journal: Box<dyn IndexJournalRepository + Send>,
     coordinator: CoordinatorState,
     next_generation: u64,
@@ -132,7 +174,9 @@ struct RuntimeIndexingService {
     publish: Box<dyn Fn(RuntimeIndexingEvent) + Send>,
     shutdown: CoordinatorShutdown,
     stop_receiver: mpsc::Receiver<()>,
-    _roots: Vec<PathBuf>,
+    roots: Vec<PathBuf>,
+    degraded_roots: std::collections::BTreeSet<PathBuf>,
+    baseline_refresh_requested: bool,
 }
 
 impl RuntimeIndexingService {
@@ -178,6 +222,7 @@ impl RuntimeIndexingService {
 
         let now = Instant::now();
         for root in dirty_roots {
+            self.degraded_roots.insert(root.clone());
             self.coordinator.mark_dirty_root(root, now);
         }
         self.status.state = IncrementalState::Degraded;
@@ -187,18 +232,18 @@ impl RuntimeIndexingService {
             .or(degradation)
             .or(Some(IndexDegradationCode::WatcherOverflow));
         self.update_pending_status();
-        (self.publish)(RuntimeIndexingEvent::BaselineRefreshRequired {
-            reason: if failure.is_some() {
-                BaselineRefreshReason::WatcherFailure
-            } else {
-                BaselineRefreshReason::DirtyRoots
-            },
+        self.request_baseline_refresh(if failure.is_some() {
+            BaselineRefreshReason::WatcherFailure
+        } else {
+            BaselineRefreshReason::DirtyRoots
         });
     }
 
     fn commit_ready_batch(&mut self) {
         let batch = self.coordinator.drain();
-        let dirty_root_count = batch.dirty_roots.len();
+        let mut dirty_roots = self.degraded_roots.clone();
+        dirty_roots.extend(batch.dirty_roots.iter().cloned());
+        let dirty_root_count = dirty_roots.len();
         let entry_count = batch
             .changed_paths
             .len()
@@ -213,15 +258,31 @@ impl RuntimeIndexingService {
         let started = Instant::now();
         let scanned = match self
             .scanner
-            .scan_batch_cancellable(batch, || self.shutdown.is_requested())
+            .scan_batch_cancellable(batch, &|| self.shutdown.is_requested())
         {
             Ok(scanned) => scanned,
             Err(TargetedScanError::Cancelled) => return,
             Err(TargetedScanError::Io(_)) => {
-                self.publish_degraded(IndexDegradationCode::CalibrationFailed);
+                self.degraded_roots.extend(self.roots.iter().cloned());
+                self.publish_calibration_failure(self.degraded_roots.len());
                 return;
             }
         };
+        let failed_roots = self.failed_configured_roots(&scanned.failures);
+        let failed_root_count = failed_roots.len();
+        self.degraded_roots.extend(failed_roots.iter().cloned());
+        dirty_roots.extend(failed_roots);
+        let has_successful_delta = !scanned.upserts.is_empty() || !scanned.removals.is_empty();
+        if !has_successful_delta {
+            if failed_root_count > 0 {
+                self.publish_calibration_failure(dirty_roots.len());
+            } else {
+                self.status.pending_events = 0;
+                self.status.dirty_roots = dirty_root_count;
+                self.publish_status();
+            }
+            return;
+        }
         let delta = CommittedIndexDelta {
             generation: self.next_generation,
             upserts: scanned.upserts,
@@ -237,9 +298,13 @@ impl RuntimeIndexingService {
             .is_err()
         {
             self.publish_degraded(IndexDegradationCode::JournalWriteFailed);
+            if failed_root_count > 0 {
+                self.publish_calibration_failure(dirty_roots.len());
+            }
             return;
         }
 
+        let dirty_root_count = dirty_roots.len();
         self.status.state = if dirty_root_count == 0 {
             IncrementalState::Watching
         } else {
@@ -255,11 +320,14 @@ impl RuntimeIndexingService {
         (self.publish)(RuntimeIndexingEvent::DeltaCommitted(delta));
         self.next_generation = self.next_generation.saturating_add(1);
         self.publish_status();
+        if failed_root_count > 0 {
+            self.publish_calibration_failure(dirty_root_count);
+        }
     }
 
     fn update_pending_status(&mut self) {
         let pending_events = self.coordinator.pending_event_count();
-        let dirty_roots = self.coordinator.dirty_root_count();
+        let dirty_roots = self.degraded_roots.len();
         if self.status.pending_events == pending_events && self.status.dirty_roots == dirty_roots {
             return;
         }
@@ -272,8 +340,47 @@ impl RuntimeIndexingService {
         self.status.state = IncrementalState::Degraded;
         self.status.degradation_code = Some(code);
         self.status.pending_events = self.coordinator.pending_event_count();
-        self.status.dirty_roots = self.coordinator.dirty_root_count();
+        self.status.dirty_roots = self.degraded_roots.len();
         self.publish_status();
+    }
+
+    fn failed_configured_roots(
+        &self,
+        failures: &[crate::core::index_entry::IndexFailure],
+    ) -> std::collections::BTreeSet<PathBuf> {
+        let mode = PathComparisonMode::native();
+        let mut roots: std::collections::BTreeSet<PathBuf> = failures
+            .iter()
+            .filter_map(|failure| {
+                let failed_path = std::path::Path::new(&failure.root);
+                self.roots
+                    .iter()
+                    .filter(|root| path_is_same_or_descendant_for_mode(root, failed_path, mode))
+                    .max_by_key(|root| root.components().count())
+            })
+            .cloned()
+            .collect();
+        if !failures.is_empty() && roots.is_empty() {
+            roots.extend(self.roots.iter().cloned());
+        }
+        roots
+    }
+
+    fn publish_calibration_failure(&mut self, dirty_root_count: usize) {
+        self.status.state = IncrementalState::Degraded;
+        self.status.degradation_code = Some(IndexDegradationCode::CalibrationFailed);
+        self.status.pending_events = 0;
+        self.status.dirty_roots = dirty_root_count;
+        self.publish_status();
+        self.request_baseline_refresh(BaselineRefreshReason::CalibrationFailed);
+    }
+
+    fn request_baseline_refresh(&mut self, reason: BaselineRefreshReason) {
+        if self.baseline_refresh_requested {
+            return;
+        }
+        self.baseline_refresh_requested = true;
+        (self.publish)(RuntimeIndexingEvent::BaselineRefreshRequired { reason });
     }
 
     fn publish_status(&self) {
@@ -300,18 +407,87 @@ pub fn baseline_refresh_event_for_delta_state(
 mod tests {
     use super::*;
     use crate::core::index::FileSearchIndex;
+    use crate::core::index_entry::{IndexFailure, IndexedEntry, IndexedEntryKind};
     use crate::core::index_journal::recover_layered_index;
     use crate::core::index_scanner::{IndexPathRules, IndexScanPlan};
     use crate::core::index_watcher::{IndexWatchEvent, WatchEventInbox, WatchEventSender};
     use crate::core::layered_index::LayeredSearchIndex;
     use crate::core::search::{QueryRequest, SearchMode, SearchResult};
     use crate::core::storage::SqliteStorage;
+    use crate::core::targeted_index_scanner::baseline_manifest_from_entries;
     use rusqlite::Connection;
+    use std::collections::VecDeque;
     use std::fs;
+    use std::io;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tempfile::TempDir;
+
+    struct FixedScanner(Mutex<VecDeque<Result<TargetedScanResult, TargetedScanError>>>);
+
+    impl FixedScanner {
+        fn returning(result: TargetedScanResult) -> Self {
+            Self(Mutex::new(VecDeque::from([Ok(result)])))
+        }
+
+        fn returning_many(results: impl IntoIterator<Item = TargetedScanResult>) -> Self {
+            Self(Mutex::new(
+                results.into_iter().map(Ok).collect::<VecDeque<_>>(),
+            ))
+        }
+
+        fn failing(error: io::Error) -> Self {
+            Self(Mutex::new(VecDeque::from([Err(TargetedScanError::Io(
+                error,
+            ))])))
+        }
+    }
+
+    impl RuntimeBatchScanner for FixedScanner {
+        fn scan_batch_cancellable(
+            &self,
+            _batch: crate::core::index_update_coordinator::CoordinatorBatch,
+            _is_cancelled: &dyn Fn() -> bool,
+        ) -> Result<TargetedScanResult, TargetedScanError> {
+            self.0.lock().unwrap().pop_front().expect("scripted scan")
+        }
+    }
+
+    fn start_fixed_scanner(
+        root: &TempDir,
+        scanner: impl RuntimeBatchScanner + 'static,
+    ) -> (
+        WatchEventSender,
+        RuntimeIndexingHandle,
+        Arc<Mutex<Vec<RuntimeIndexingEvent>>>,
+        PathBuf,
+    ) {
+        let database_path = root.path().join("fixed-scanner.sqlite");
+        let storage = SqliteStorage::open(database_path.clone()).unwrap();
+        let baseline_id = storage.save_completed_index_batch(1, &[]).unwrap();
+        storage
+            .activate_baseline_and_clear_incremental_state(baseline_id, 0)
+            .unwrap();
+        let roots = vec![root.path().to_path_buf()];
+        let (sender, inbox) = WatchEventInbox::bounded(roots.clone(), 4);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let published = Arc::clone(&events);
+        let handle = start_runtime_indexing_with_scanner(
+            None,
+            inbox,
+            Box::new(scanner),
+            Box::new(storage),
+            RuntimeIndexingOptions {
+                roots,
+                policy: CoordinatorPolicy::new(Duration::ZERO, Duration::ZERO),
+                initial_generation: 0,
+            },
+            move |event| published.lock().unwrap().push(event),
+        )
+        .unwrap();
+        (sender, handle, events, database_path)
+    }
 
     struct RuntimeIndexingHarness {
         root: TempDir,
@@ -553,6 +729,56 @@ mod tests {
     }
 
     #[test]
+    fn worker_commit_queued_publish_refresh_handoff_clears_journal_without_duplicate_replay() {
+        let harness = RuntimeIndexingHarness::new_with_apply(false);
+        let path = harness.create_file("handoff.md");
+        harness.push(IndexWatchEvent::Create(path));
+        harness.advance(Duration::from_millis(100));
+        let queued_delta = harness
+            .take_published_delta()
+            .expect("worker committed delta");
+        assert!(harness.search("handoff").is_empty());
+        harness.stop();
+
+        let storage = SqliteStorage::open(harness.database_path.clone()).unwrap();
+        let stable_generation = storage.highest_committed_generation().unwrap();
+        assert_eq!(stable_generation, queued_delta.generation);
+        let refreshed_entries = queued_delta.upserts.clone();
+        let refreshed_id = storage
+            .save_completed_index_batch(2, &refreshed_entries)
+            .unwrap();
+        let manifest = baseline_manifest_from_entries(
+            &refreshed_entries,
+            &[harness.root.path().to_path_buf()],
+        );
+        storage
+            .activate_baseline_with_manifest_and_clear_incremental_state(
+                refreshed_id,
+                stable_generation,
+                &manifest,
+            )
+            .unwrap();
+        harness
+            .index
+            .lock()
+            .unwrap()
+            .replace_baseline(refreshed_entries, stable_generation);
+        harness.index.lock().unwrap().apply_delta(queued_delta);
+
+        assert!(storage.committed_index_deltas_after(0).unwrap().is_empty());
+        assert_eq!(harness.search("handoff").len(), 1);
+        let recovery = recover_layered_index(&storage);
+        assert_eq!(recovery.index.generation(), stable_generation);
+        assert_eq!(
+            recovery
+                .index
+                .search_files(&QueryRequest::new("handoff", SearchMode::Normal), 20)
+                .len(),
+            1
+        );
+    }
+
+    #[test]
     fn replay_after_memory_apply_is_idempotent() {
         let harness = RuntimeIndexingHarness::new();
         let path = harness.create_file("idempotent.md");
@@ -611,7 +837,275 @@ mod tests {
         handle.stop();
 
         assert!(exited.load(Ordering::Acquire));
-        assert!(started.elapsed() <= Duration::from_secs(1));
+        assert!(started.elapsed() <= Duration::from_millis(250));
+    }
+
+    #[test]
+    fn partial_not_found_scan_commits_successes_then_marks_root_dirty_once() {
+        let root = tempfile::tempdir().unwrap();
+        let accepted = root.path().join("accepted.md");
+        fs::write(&accepted, "accepted").unwrap();
+        let failed = root.path().join("missing.md");
+        let scanner = FixedScanner::returning(TargetedScanResult {
+            upserts: vec![IndexedEntry::from_path_metadata(
+                &accepted,
+                root.path(),
+                IndexedEntryKind::File,
+            )],
+            failures: vec![IndexFailure {
+                root: failed.to_string_lossy().into_owned(),
+                message: "not found".to_owned(),
+            }],
+            ..TargetedScanResult::default()
+        });
+        let (sender, handle, events, database_path) = start_fixed_scanner(&root, scanner);
+
+        assert_eq!(
+            sender.try_send(IndexWatchEvent::Write(accepted)),
+            crate::core::index_watcher::WatchSendOutcome::Queued
+        );
+        thread::sleep(Duration::from_millis(100));
+        handle.stop();
+        let events = events.lock().unwrap();
+
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, RuntimeIndexingEvent::DeltaCommitted(_)))
+                .count(),
+            1
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeIndexingEvent::Status(RuntimeIncrementalStatus {
+                dirty_roots: 1,
+                degradation_code: Some(IndexDegradationCode::CalibrationFailed),
+                ..
+            })
+        )));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    RuntimeIndexingEvent::BaselineRefreshRequired {
+                        reason: BaselineRefreshReason::CalibrationFailed
+                    }
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            SqliteStorage::open(database_path)
+                .unwrap()
+                .committed_index_deltas_after(0)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn all_permission_failures_keep_old_view_and_do_not_advance_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let old_path = root.path().join("old.md");
+        fs::write(&old_path, "old").unwrap();
+        let mut old_view = LayeredSearchIndex::default();
+        old_view.replace_baseline(
+            vec![IndexedEntry::from_path_metadata(
+                &old_path,
+                root.path(),
+                IndexedEntryKind::File,
+            )],
+            0,
+        );
+        let scanner = FixedScanner::returning(TargetedScanResult {
+            failures: vec![IndexFailure {
+                root: root.path().join("locked").to_string_lossy().into_owned(),
+                message: "permission denied".to_owned(),
+            }],
+            ..TargetedScanResult::default()
+        });
+        let (sender, handle, events, database_path) = start_fixed_scanner(&root, scanner);
+
+        assert_eq!(
+            sender.try_send(IndexWatchEvent::Write(root.path().join("locked"))),
+            crate::core::index_watcher::WatchSendOutcome::Queued
+        );
+        thread::sleep(Duration::from_millis(100));
+        handle.stop();
+
+        let events = events.lock().unwrap();
+        assert!(events
+            .iter()
+            .all(|event| !matches!(event, RuntimeIndexingEvent::DeltaCommitted(_))));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeIndexingEvent::Status(RuntimeIncrementalStatus {
+                dirty_roots: 1,
+                degradation_code: Some(IndexDegradationCode::CalibrationFailed),
+                ..
+            })
+        )));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    RuntimeIndexingEvent::BaselineRefreshRequired {
+                        reason: BaselineRefreshReason::CalibrationFailed
+                    }
+                ))
+                .count(),
+            1
+        );
+        assert!(SqliteStorage::open(database_path)
+            .unwrap()
+            .committed_index_deltas_after(0)
+            .unwrap()
+            .is_empty());
+        assert_eq!(old_view.generation(), 0);
+        assert_eq!(
+            old_view
+                .search_files(&QueryRequest::new("old", SearchMode::Normal), 20)
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn repeated_scan_failures_keep_root_dirty_and_request_one_refresh_per_service_lifetime() {
+        let root = tempfile::tempdir().unwrap();
+        let failure_result = || TargetedScanResult {
+            failures: vec![IndexFailure {
+                root: root.path().join("locked").to_string_lossy().into_owned(),
+                message: "permission denied".to_owned(),
+            }],
+            ..TargetedScanResult::default()
+        };
+        let scanner = FixedScanner::returning_many([failure_result(), failure_result()]);
+        let (sender, handle, events, _database_path) = start_fixed_scanner(&root, scanner);
+
+        for name in ["first", "second"] {
+            assert_eq!(
+                sender.try_send(IndexWatchEvent::Write(root.path().join(name))),
+                crate::core::index_watcher::WatchSendOutcome::Queued
+            );
+            thread::sleep(Duration::from_millis(75));
+        }
+        handle.stop();
+        let events = events.lock().unwrap();
+
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    RuntimeIndexingEvent::BaselineRefreshRequired {
+                        reason: BaselineRefreshReason::CalibrationFailed
+                    }
+                ))
+                .count(),
+            1
+        );
+        let final_status = events
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeIndexingEvent::Status(status) => Some(status),
+                _ => None,
+            })
+            .next_back()
+            .unwrap();
+        assert_eq!(final_status.dirty_roots, 1);
+        assert_eq!(
+            final_status.degradation_code,
+            Some(IndexDegradationCode::CalibrationFailed)
+        );
+    }
+
+    #[test]
+    fn scan_io_error_marks_all_roots_dirty_and_requests_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        let scanner = FixedScanner::failing(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "permission denied",
+        ));
+        let (sender, handle, events, database_path) = start_fixed_scanner(&root, scanner);
+
+        assert_eq!(
+            sender.try_send(IndexWatchEvent::Write(root.path().join("locked"))),
+            crate::core::index_watcher::WatchSendOutcome::Queued
+        );
+        thread::sleep(Duration::from_millis(100));
+        handle.stop();
+        let events = events.lock().unwrap();
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeIndexingEvent::Status(RuntimeIncrementalStatus {
+                dirty_roots: 1,
+                degradation_code: Some(IndexDegradationCode::CalibrationFailed),
+                ..
+            })
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeIndexingEvent::BaselineRefreshRequired {
+                reason: BaselineRefreshReason::CalibrationFailed
+            }
+        )));
+        assert!(SqliteStorage::open(database_path)
+            .unwrap()
+            .committed_index_deltas_after(0)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn stopping_during_scan_cancels_and_joins_within_budget() {
+        struct CancellableScanner {
+            entered: Arc<AtomicBool>,
+            cancelled: Arc<AtomicBool>,
+        }
+
+        impl RuntimeBatchScanner for CancellableScanner {
+            fn scan_batch_cancellable(
+                &self,
+                _batch: crate::core::index_update_coordinator::CoordinatorBatch,
+                is_cancelled: &dyn Fn() -> bool,
+            ) -> Result<TargetedScanResult, TargetedScanError> {
+                self.entered.store(true, Ordering::Release);
+                while !is_cancelled() {
+                    thread::yield_now();
+                }
+                self.cancelled.store(true, Ordering::Release);
+                Err(TargetedScanError::Cancelled)
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let entered = Arc::new(AtomicBool::new(false));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let scanner = CancellableScanner {
+            entered: Arc::clone(&entered),
+            cancelled: Arc::clone(&cancelled),
+        };
+        let (sender, handle, _events, _database_path) = start_fixed_scanner(&root, scanner);
+        assert_eq!(
+            sender.try_send(IndexWatchEvent::Write(root.path().join("busy"))),
+            crate::core::index_watcher::WatchSendOutcome::Queued
+        );
+        let wait_started = Instant::now();
+        while !entered.load(Ordering::Acquire) && wait_started.elapsed() < Duration::from_secs(1) {
+            thread::yield_now();
+        }
+        assert!(entered.load(Ordering::Acquire));
+
+        let stop_started = Instant::now();
+        handle.stop();
+
+        assert!(cancelled.load(Ordering::Acquire));
+        assert!(stop_started.elapsed() <= Duration::from_millis(250));
     }
 
     #[test]

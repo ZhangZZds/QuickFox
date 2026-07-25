@@ -760,6 +760,29 @@ impl SqliteStorage {
         self.committed_index_deltas_after_with_query_probe(generation, || {})
     }
 
+    pub fn highest_committed_generation(&self) -> Result<u64, StorageError> {
+        let journal_generation = self.connection.query_row(
+            "SELECT MAX(generation) FROM index_delta_batches WHERE status = 'committed'",
+            [],
+            |row| row.get::<_, Option<i64>>(0),
+        )?;
+        let journal_generation = journal_generation
+            .map(|generation| {
+                u64::try_from(generation).map_err(|_| {
+                    StorageError::InvalidJournal(
+                        "journal generation must not be negative".to_owned(),
+                    )
+                })
+            })
+            .transpose()?
+            .unwrap_or(0);
+        let persisted_generation = self
+            .runtime_state()?
+            .map(|state| state.last_generation)
+            .unwrap_or(0);
+        Ok(journal_generation.max(persisted_generation))
+    }
+
     fn committed_index_deltas_after_with_query_probe(
         &self,
         generation: u64,
@@ -939,6 +962,18 @@ impl SqliteStorage {
 
     pub fn validate_directory_manifest(&self) -> Result<(), StorageError> {
         validate_persisted_manifest_tree(&self.connection, self.comparison_mode)
+    }
+
+    pub fn directory_manifest_roots(&self) -> Result<Vec<PathBuf>, StorageError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT DISTINCT root FROM index_directory_manifest ORDER BY root")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let mut roots = Vec::new();
+        for root in rows {
+            roots.push(PathBuf::from(root?));
+        }
+        Ok(roots)
     }
 
     pub fn clear_incremental_state_through(&self, generation: u64) -> Result<(), StorageError> {
@@ -3365,6 +3400,49 @@ mod tests {
         assert_eq!(
             storage.active_index_snapshot().unwrap().unwrap().entries[0].path,
             "/root/baseline.md"
+        );
+
+        drop(storage);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn highest_committed_generation_includes_queued_publish_before_refresh_handoff() {
+        let path = temp_db_path("refresh-generation-handoff");
+        let storage = SqliteStorage::open(path.clone()).unwrap();
+        let old_id = storage
+            .save_completed_index_batch(1, &[indexed_entry("/root/old.md")])
+            .unwrap();
+        storage.activate_baseline(old_id, 0).unwrap();
+        storage
+            .commit_incremental_batch(
+                &committed_delta(1, indexed_entry("/root/new.md"), Vec::new()),
+                &[],
+                &[],
+            )
+            .unwrap();
+
+        let stable_generation = storage.highest_committed_generation().unwrap();
+        assert_eq!(stable_generation, 1);
+        let refreshed_id = storage
+            .save_completed_index_batch(2, &[indexed_entry("/root/new.md")])
+            .unwrap();
+        storage
+            .activate_baseline_with_manifest_and_clear_incremental_state(
+                refreshed_id,
+                stable_generation,
+                &[fingerprint("/root", None, "/root", 2)],
+            )
+            .unwrap();
+
+        assert!(storage.committed_index_deltas_after(0).unwrap().is_empty());
+        assert_eq!(
+            storage
+                .runtime_state()
+                .unwrap()
+                .unwrap()
+                .baseline_generation,
+            stable_generation
         );
 
         drop(storage);

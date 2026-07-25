@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const MAX_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const MAX_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CoordinatorPolicy {

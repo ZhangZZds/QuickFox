@@ -26,6 +26,9 @@ pub struct IndexRecovery {
     pub fallback_reason: Option<IndexFallbackReason>,
     baseline_entry_count: usize,
     baseline_available: bool,
+    manifest_ready: bool,
+    needs_manifest_rebuild: bool,
+    manifest_roots: std::collections::BTreeSet<String>,
 }
 
 impl IndexRecovery {
@@ -44,6 +47,21 @@ impl IndexRecovery {
     pub fn fallback_reason(&self) -> Option<IndexFallbackReason> {
         self.fallback_reason
     }
+
+    pub fn manifest_ready(&self) -> bool {
+        self.manifest_ready
+    }
+
+    pub fn needs_manifest_rebuild(&self) -> bool {
+        self.needs_manifest_rebuild
+    }
+
+    pub fn manifest_covers_roots(&self, roots: &[PathBuf]) -> bool {
+        self.manifest_ready
+            && roots
+                .iter()
+                .all(|root| self.manifest_roots.contains(&normalize_path_key(root)))
+    }
 }
 
 pub trait IndexJournalRepository {
@@ -54,6 +72,8 @@ pub trait IndexJournalRepository {
     fn latest_completed_recovery_baseline(&self) -> Result<IncrementalRecoveryBaseline, String>;
 
     fn validate_directory_manifest(&self) -> Result<(), String>;
+
+    fn directory_manifest_roots(&self) -> Result<Vec<PathBuf>, String>;
 
     fn commit_incremental_batch(
         &mut self,
@@ -66,6 +86,8 @@ pub trait IndexJournalRepository {
         &self,
         generation: u64,
     ) -> Result<Vec<CommittedIndexDelta>, String>;
+
+    fn highest_committed_generation(&self) -> Result<u64, String>;
 
     fn replace_directory_manifest(
         &mut self,
@@ -112,6 +134,10 @@ impl IndexJournalRepository for SqliteStorage {
         SqliteStorage::validate_directory_manifest(self).map_err(|error| error.to_string())
     }
 
+    fn directory_manifest_roots(&self) -> Result<Vec<PathBuf>, String> {
+        SqliteStorage::directory_manifest_roots(self).map_err(|error| error.to_string())
+    }
+
     fn commit_incremental_batch(
         &mut self,
         delta: &CommittedIndexDelta,
@@ -128,6 +154,10 @@ impl IndexJournalRepository for SqliteStorage {
     ) -> Result<Vec<CommittedIndexDelta>, String> {
         SqliteStorage::committed_index_deltas_after(self, generation)
             .map_err(|error| error.to_string())
+    }
+
+    fn highest_committed_generation(&self) -> Result<u64, String> {
+        SqliteStorage::highest_committed_generation(self).map_err(|error| error.to_string())
     }
 
     fn replace_directory_manifest(
@@ -225,6 +255,11 @@ pub fn recover_layered_index(repository: &(impl IndexJournalRepository + ?Sized)
     let requires_full_refresh = baseline.requires_full_refresh;
     let baseline_generation = baseline.generation;
     let baseline = baseline.entries;
+    let baseline_roots: std::collections::BTreeSet<PathBuf> = baseline
+        .iter()
+        .filter(|entry| !entry.root.is_empty())
+        .map(|entry| PathBuf::from(&entry.root))
+        .collect();
     let baseline_entry_count = baseline.len();
     if requires_full_refresh {
         return baseline_only_recovery(
@@ -236,9 +271,23 @@ pub fn recover_layered_index(repository: &(impl IndexJournalRepository + ?Sized)
             IndexFallbackReason::FullRefreshFallback,
         );
     }
+    let manifest_roots = match repository.directory_manifest_roots() {
+        Ok(roots) => roots,
+        Err(_) => {
+            return failed_manifest_recovery(baseline, baseline_generation, baseline_entry_count);
+        }
+    };
     if repository.validate_directory_manifest().is_err() {
         return failed_manifest_recovery(baseline, baseline_generation, baseline_entry_count);
     }
+    let manifest_root_keys: std::collections::BTreeSet<String> =
+        manifest_roots.iter().map(normalize_path_key).collect();
+    let manifest_ready = !manifest_root_keys.is_empty()
+        && baseline_roots.iter().all(|root| {
+            repository
+                .directory_manifest_for_root(root)
+                .is_ok_and(|rows| !rows.is_empty())
+        });
     let deltas = match repository.committed_index_deltas_after(baseline_generation) {
         Ok(deltas) => deltas,
         Err(_) => {
@@ -262,6 +311,9 @@ pub fn recover_layered_index(repository: &(impl IndexJournalRepository + ?Sized)
         fallback_reason: None,
         baseline_entry_count,
         baseline_available: true,
+        manifest_ready,
+        needs_manifest_rebuild: !manifest_ready,
+        manifest_roots: manifest_root_keys,
     }
 }
 
@@ -286,6 +338,9 @@ fn unavailable_recovery() -> IndexRecovery {
         fallback_reason: None,
         baseline_entry_count: 0,
         baseline_available: false,
+        manifest_ready: false,
+        needs_manifest_rebuild: false,
+        manifest_roots: std::collections::BTreeSet::new(),
     }
 }
 
@@ -336,6 +391,9 @@ fn baseline_only_recovery(
         fallback_reason: Some(fallback_reason),
         baseline_entry_count,
         baseline_available,
+        manifest_ready: false,
+        needs_manifest_rebuild: baseline_available,
+        manifest_roots: std::collections::BTreeSet::new(),
     }
 }
 
@@ -441,6 +499,10 @@ mod tests {
             Ok(())
         }
 
+        fn directory_manifest_roots(&self) -> Result<Vec<PathBuf>, String> {
+            Ok(vec![PathBuf::from("/root")])
+        }
+
         fn commit_incremental_batch(
             &mut self,
             _delta: &CommittedIndexDelta,
@@ -457,6 +519,10 @@ mod tests {
             Ok(Vec::new())
         }
 
+        fn highest_committed_generation(&self) -> Result<u64, String> {
+            Ok(0)
+        }
+
         fn replace_directory_manifest(
             &mut self,
             _root: &Path,
@@ -467,9 +533,14 @@ mod tests {
 
         fn directory_manifest_for_root(
             &self,
-            _root: &Path,
+            root: &Path,
         ) -> Result<Vec<DirectoryFingerprint>, String> {
-            unreachable!("recovery does not read one manifest root")
+            Ok(vec![DirectoryFingerprint {
+                path: root.to_string_lossy().into_owned(),
+                parent: None,
+                root: root.to_string_lossy().into_owned(),
+                modified_ms: None,
+            }])
         }
 
         fn known_direct_indexed_children(
@@ -881,6 +952,26 @@ mod tests {
             search_titles(&recovery.index, "baseline"),
             vec!["baseline.md"]
         );
+
+        drop(storage);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn legacy_baseline_without_manifest_remains_searchable_but_requires_manifest_rebuild() {
+        let path = temp_db_path("legacy-empty-manifest");
+        let storage = SqliteStorage::open(path.clone()).unwrap();
+        let baseline_id = storage
+            .save_completed_index_batch(10, &[entry("/root/legacy.md")])
+            .unwrap();
+        storage.activate_baseline(baseline_id, 0).unwrap();
+
+        let recovery = recover_layered_index(&storage);
+
+        assert_eq!(search_titles(&recovery.index, "legacy"), vec!["legacy.md"]);
+        assert!(!recovery.manifest_ready());
+        assert!(recovery.needs_manifest_rebuild());
+        assert_eq!(recovery.degradation_code(), None);
 
         drop(storage);
         let _ = fs::remove_file(path);
