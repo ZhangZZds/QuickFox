@@ -2,7 +2,7 @@
 
 - [ ] 1.1 增加失败测试，证明当前 watcher receiver 被丢弃后创建事件不会更新运行期搜索结果
 - [x] 1.2 增加失败性能测试，证明现有 `apply_update_batch` 会重建完整 compact candidate index
-- [ ] 1.3 建立 `index_update_coordinator`、`targeted_index_scanner`、`layered_index` 和 `index_journal` 模块边界，保持 `lib.rs` 只负责 Tauri/runtime 接线
+- [x] 1.3 建立 `index_update_coordinator`、`targeted_index_scanner`、`layered_index` 和 `index_journal` 模块边界，保持 `lib.rs` 只负责 Tauri/runtime 接线
 
 ## 2. 有界 watcher 事件协调器
 
@@ -15,7 +15,7 @@
 
 - [x] 3.1 按 TDD 实现单文件 create/write、remove 和 rename 的 targeted scan 操作，并复用现有包含/排除规则
 - [x] 3.2 按 TDD 实现新建目录的局部子树扫描以及删除目录的 subtree tombstone
-- [ ] 3.3 为 SQLite 增加 directory manifest schema、迁移和 repository API，保存目录指纹及父子关系
+- [x] 3.3 为 SQLite 增加 directory manifest schema、迁移和 repository API，保存目录指纹及父子关系
 - [x] 3.4 按 TDD 实现 manifest 校准：检查已知目录指纹，只枚举变化目录，并生成新增、变化和缺失 delta
 - [x] 3.5 验证部分权限失败保留未确认删除的 baseline entry，并继续校准其他目录
 
@@ -29,9 +29,9 @@
 
 ## 5. Delta journal、恢复与基线安全阈值
 
-- [ ] 5.1 为 SQLite 增加 delta batch/entry 和 runtime state schema，保持旧 `index_batches/index_entries` baseline 可读
-- [ ] 5.2 按 TDD 实现 journal 事务提交、未提交批次忽略、generation 顺序和 path-key 幂等重放
-- [ ] 5.3 按 TDD 实现启动加载 baseline 后重放 journal，并在 journal 损坏时保留 baseline、记录 fallback 原因
+- [x] 5.1 为 SQLite 增加 delta batch/entry 和 runtime state schema，保持旧 `index_batches/index_entries` baseline 可读
+- [x] 5.2 按 TDD 实现 journal 事务提交、未提交批次忽略、generation 顺序和 path-key 幂等重放
+- [x] 5.3 按 TDD 实现启动加载 baseline 后重放 journal，并在 journal 损坏时保留 baseline、记录 fallback 原因
 - [ ] 5.4 实现“journal 先提交、内存 generation 后切换”的 runtime commit，并覆盖两个边界之间崩溃的恢复测试
 - [ ] 5.5 实现 overlay+tombstone 达到 50,000 条或 64 MiB 时安排现有后台全量刷新，成功后清理已合并增量状态
 
