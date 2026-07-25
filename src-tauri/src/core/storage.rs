@@ -1148,6 +1148,7 @@ impl SqliteStorage {
               AND (
                     (entries.parent_key = ?2 AND (entries.root_key = ?3 OR entries.root_key IS NULL))
                  OR entries.path = ?2
+                 OR (entries.path = '/' AND substr(?2, 1, 1) = '/')
                  OR ?2 LIKE entries.path || '/%'
               )
             ORDER BY batches.generation ASC, entries.ordinal ASC
@@ -3352,6 +3353,102 @@ mod tests {
         assert_eq!(children.len(), 1);
         assert_eq!(children[0].path, "/root/direct.md");
         assert_eq!(query_count.get(), 3);
+
+        drop(storage);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn posix_root_removal_clears_known_children_of_a_nested_directory() {
+        let path = temp_db_path("known-direct-posix-root-removal");
+        let storage = SqliteStorage::open(path.clone()).unwrap();
+        let mut child = indexed_entry("/nested/direct.md");
+        child.root = "/".to_owned();
+        child.parent = "/nested".to_owned();
+        storage.save_completed_index_batch(10, &[child]).unwrap();
+        storage
+            .commit_incremental_batch(
+                &CommittedIndexDelta {
+                    generation: 1,
+                    upserts: Vec::new(),
+                    removals: vec![PathBuf::from("/")],
+                },
+                &[],
+                &[],
+            )
+            .unwrap();
+
+        let children = storage
+            .known_direct_indexed_children(Path::new("/"), Path::new("/nested"))
+            .unwrap();
+
+        assert!(children.is_empty());
+
+        drop(storage);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn posix_root_file_upsert_clears_known_children_of_a_nested_directory() {
+        let path = temp_db_path("known-direct-posix-root-upsert");
+        let storage = SqliteStorage::open(path.clone()).unwrap();
+        let mut child = indexed_entry("/nested/direct.md");
+        child.root = "/".to_owned();
+        child.parent = "/nested".to_owned();
+        storage.save_completed_index_batch(10, &[child]).unwrap();
+        let mut root_file = indexed_entry("/placeholder");
+        root_file.path = "/".to_owned();
+        root_file.name = "/".to_owned();
+        root_file.root = "/".to_owned();
+        root_file.parent.clear();
+        storage
+            .commit_incremental_batch(
+                &CommittedIndexDelta {
+                    generation: 1,
+                    upserts: vec![root_file],
+                    removals: Vec::new(),
+                },
+                &[],
+                &[],
+            )
+            .unwrap();
+
+        let children = storage
+            .known_direct_indexed_children(Path::new("/"), Path::new("/nested"))
+            .unwrap();
+
+        assert!(children.is_empty());
+
+        drop(storage);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn targeted_journal_ancestor_lookup_respects_path_segment_boundaries() {
+        let path = temp_db_path("known-direct-ancestor-segment-boundary");
+        let storage = SqliteStorage::open(path.clone()).unwrap();
+        let mut child = indexed_entry("/foobar/direct.md");
+        child.root = "/".to_owned();
+        child.parent = "/foobar".to_owned();
+        storage.save_completed_index_batch(10, &[child]).unwrap();
+        storage
+            .commit_incremental_batch(
+                &CommittedIndexDelta {
+                    generation: 1,
+                    upserts: Vec::new(),
+                    removals: vec![PathBuf::from("/foo")],
+                },
+                &[],
+                &[],
+            )
+            .unwrap();
+
+        let children = storage
+            .known_direct_indexed_children(Path::new("/"), Path::new("/foobar"))
+            .unwrap();
+
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].path, "/foobar/direct.md");
 
         drop(storage);
         let _ = fs::remove_file(path);
