@@ -255,20 +255,42 @@ impl LayeredSearchIndex {
     }
 
     pub fn replace_baseline(&mut self, entries: Vec<IndexedEntry>, generation: u64) {
+        self.replace_baseline_search_index(SearchIndex::from_entries(entries), generation);
+    }
+
+    pub fn replace_baseline_search_index(&mut self, baseline: SearchIndex, generation: u64) {
         if generation < self.generation {
             return;
         }
-        self.baseline_by_path = entries
+        self.baseline_by_path = baseline
+            .entries()
             .iter()
             .map(|entry| (normalize_path_text_key(&entry.path), entry.kind.clone()))
             .collect();
         self.visible_entry_count = self.baseline_by_path.len();
-        self.baseline = SearchIndex::from_entries(entries);
+        self.baseline = baseline;
         self.overlay_entries.clear();
         self.overlay = SearchIndex::default();
         self.tombstones.clear();
         self.content_visibility = Arc::new(ContentVisibilitySnapshot::default());
         self.generation = generation;
+    }
+
+    pub fn watched_roots(&self) -> Vec<PathBuf> {
+        self.baseline
+            .entries()
+            .iter()
+            .chain(self.overlay_entries.values())
+            .filter(|entry| !entry.root.is_empty())
+            .map(|entry| PathBuf::from(&entry.root))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub fn entries(&self) -> &[IndexedEntry] {
+        self.baseline.entries()
     }
 
     pub fn search(&self, query: &QueryRequest, candidate_budget: usize) -> Vec<SearchResult> {

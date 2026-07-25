@@ -975,6 +975,27 @@ impl SqliteStorage {
         Ok(())
     }
 
+    pub fn activate_baseline_with_manifest_and_clear_incremental_state(
+        &self,
+        baseline_id: i64,
+        baseline_generation: u64,
+        manifest: &[DirectoryFingerprint],
+    ) -> Result<(), StorageError> {
+        validate_manifest_rows(manifest, self.comparison_mode)?;
+        validate_manifest_tree_rows(manifest, self.comparison_mode)?;
+        let transaction = self.connection.unchecked_transaction()?;
+        activate_baseline_in_transaction(&transaction, baseline_id, baseline_generation)?;
+        transaction.execute("DELETE FROM index_directory_manifest", [])?;
+        upsert_manifest_rows(&transaction, manifest, self.comparison_mode)?;
+        validate_persisted_manifest_tree(&transaction, self.comparison_mode)?;
+        transaction.execute(
+            "DELETE FROM index_delta_batches WHERE generation <= ?1",
+            params![generation_to_i64(baseline_generation)?],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn save_runtime_state(&self, state: &IncrementalRuntimeState) -> Result<(), StorageError> {
         if state.baseline_generation > state.last_generation {
             return Err(StorageError::InvalidJournal(
@@ -3312,7 +3333,11 @@ mod tests {
         assert_eq!(storage.committed_index_deltas_after(0).unwrap().len(), 3);
 
         storage
-            .activate_baseline_and_clear_incremental_state(baseline_id, 2)
+            .activate_baseline_with_manifest_and_clear_incremental_state(
+                baseline_id,
+                2,
+                &[fingerprint("/root", None, "/root", 10)],
+            )
             .unwrap();
 
         assert_eq!(
@@ -3328,6 +3353,12 @@ mod tests {
         assert_eq!(state.active_baseline_id, Some(baseline_id));
         assert_eq!(state.baseline_generation, 2);
         assert_eq!(state.last_generation, 2);
+        assert_eq!(
+            storage
+                .directory_manifest_for_root(Path::new("/root"))
+                .unwrap(),
+            vec![fingerprint("/root", None, "/root", 10)]
+        );
         storage
             .save_completed_index_batch(20, &[indexed_entry("/root/not-active.md")])
             .unwrap();

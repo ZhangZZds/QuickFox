@@ -4,11 +4,17 @@ use crate::core::actions::{Action, OpenApplication};
 use crate::core::config::{ConfigStore, IndexPerformanceMode, QuickFoxConfig};
 use crate::core::content_index::{ContentIndex, ContentIndexOptions};
 use crate::core::index::{
-    IndexLifecycle, IndexReport, IndexScanOptions, IndexScanner, IndexStatus, SearchIndex,
+    FileSearchIndex, IndexLifecycle, IndexReport, IndexScanOptions, IndexScanner, IndexStatus,
+    SearchIndex,
 };
-use crate::core::index_entry::{ContentIndexState, IndexScanStats, IndexedEntry, ScanEvent};
-use crate::core::index_scanner::{IndexScanPlan, IndexScanStage};
-use crate::core::index_watcher::{roots_from_entries, RuntimeIndexWatcher, WatcherFailure};
+use crate::core::index_entry::{
+    ContentIndexState, IncrementalState, IndexDegradationCode, IndexScanStats, IndexedEntry,
+    RuntimeIncrementalStatus, ScanEvent,
+};
+use crate::core::index_journal::recover_layered_index;
+use crate::core::index_scanner::{IndexPathRules, IndexScanPlan, IndexScanStage};
+use crate::core::index_watcher::{RuntimeIndexWatcher, WatcherFailure};
+use crate::core::layered_index::LayeredSearchIndex;
 use crate::core::platform::{
     CommandSafetyChecker, CommandSafetyDecision, DevelopmentToolAdapter, HotkeyKey, HotkeyState,
     KeyPress, LauncherWindowEffect, LauncherWindowState, ProcessCommand, WakeShortcut,
@@ -17,8 +23,13 @@ use crate::core::providers::{
     CalculatorProvider, CommandProvider, CommandProviderConfig, FileProvider, ProviderRegistry,
     WebSearchEngine, WebSearchProvider,
 };
+use crate::core::runtime_indexing::{
+    baseline_refresh_event_for_delta_state, start_runtime_indexing, RuntimeIndexingEvent,
+    RuntimeIndexingHandle, RuntimeIndexingOptions,
+};
 use crate::core::search::{HistoryScores, QueryParser, QueryParserConfig, Ranker, SearchResult};
 use crate::core::storage::SqliteStorage;
+use crate::core::targeted_index_scanner::{baseline_manifest_from_entries, TargetedIndexScanner};
 use keytap::{EventKind, Key, Tap};
 use serde::Serialize;
 use std::path::PathBuf;
@@ -26,7 +37,7 @@ use std::process::Command;
 use std::sync::Mutex;
 use std::thread;
 use tauri::image::Image;
-use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
+use tauri::{Emitter, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 use tauri_plugin_opener::OpenerExt;
 
 #[cfg(target_os = "linux")]
@@ -38,11 +49,11 @@ use crate::core::platform::WindowsTerminalAdapter;
 
 struct QuickFoxRuntime {
     config: QuickFoxConfig,
-    index: SearchIndex,
+    index: LayeredSearchIndex,
     last_report: IndexReport,
     index_lifecycle: IndexLifecycle,
-    index_watcher: Option<RuntimeIndexWatcher>,
-    watcher_failure_summary: Option<String>,
+    runtime_indexing: Option<RuntimeIndexingHandle>,
+    incremental_status: RuntimeIncrementalStatus,
 }
 
 struct QuickFoxAppState {
@@ -726,7 +737,7 @@ fn build_query_parser_config(config: &QuickFoxConfig) -> QueryParserConfig {
 
 fn build_provider_registry<'a>(
     config: &QuickFoxConfig,
-    index: &'a SearchIndex,
+    index: &'a dyn FileSearchIndex,
     index_status: &IndexStatus,
 ) -> ProviderRegistry<'a> {
     let mut registry = ProviderRegistry::default();
@@ -773,7 +784,7 @@ fn perform_search(config: &QuickFoxConfig, index: &SearchIndex, query: &str) -> 
 
 fn perform_search_with_index_status(
     config: &QuickFoxConfig,
-    index: &SearchIndex,
+    index: &dyn FileSearchIndex,
     index_status: &IndexStatus,
     query: &str,
 ) -> Vec<SearchResult> {
@@ -790,8 +801,8 @@ fn perform_search_with_index_status(
     ranked
 }
 
-fn file_index_is_available(index: &SearchIndex, status: &IndexStatus) -> bool {
-    !index.entries().is_empty()
+fn file_index_is_available(index: &dyn FileSearchIndex, status: &IndexStatus) -> bool {
+    index.indexed_entry_count() > 0
         || matches!(
             status.kind,
             crate::core::index::IndexStatusKind::Ready
@@ -814,15 +825,32 @@ fn start_background_index_refresh<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: &QuickFoxAppState,
 ) -> Result<IndexStatus, String> {
-    let (config, generation) = {
+    let (config, generation, baseline_generation, previous_runtime_indexing) = {
         let mut runtime = state
             .runtime
             .lock()
             .expect("quickfox runtime lock poisoned");
-        let has_existing_index = !runtime.index.entries().is_empty();
+        if matches!(
+            runtime.index_status().kind,
+            crate::core::index::IndexStatusKind::Building
+                | crate::core::index::IndexStatusKind::Refreshing
+        ) {
+            return Ok(runtime.index_status());
+        }
+        let has_existing_index = runtime.index.entry_count() > 0;
         let generation = runtime.index_lifecycle.start_refresh(has_existing_index);
-        (runtime.config.clone(), generation)
+        let baseline_generation = runtime.index.generation();
+        let previous_runtime_indexing = runtime.runtime_indexing.take();
+        (
+            runtime.config.clone(),
+            generation,
+            baseline_generation,
+            previous_runtime_indexing,
+        )
     };
+    if let Some(previous_runtime_indexing) = previous_runtime_indexing {
+        previous_runtime_indexing.stop();
+    }
     let status = {
         state
             .runtime
@@ -884,7 +912,17 @@ fn start_background_index_refresh<R: tauri::Runtime>(
                             if let Some(status) =
                                 apply_failed_index_refresh(&state, generation, message)
                             {
+                                let index_remains_available = !matches!(
+                                    status.availability,
+                                    crate::core::index::IndexAvailability::Unavailable
+                                );
                                 let _ = app_for_state.emit("quickfox://index-status", status);
+                                if index_remains_available {
+                                    let _ = restart_runtime_incremental_indexing(
+                                        app_for_state.clone(),
+                                        &state,
+                                    );
+                                }
                             }
                         });
                         break;
@@ -903,11 +941,32 @@ fn start_background_index_refresh<R: tauri::Runtime>(
                 let content_entries = final_payload.entries.clone();
                 let should_build_content_index =
                     should_build_content_index_for_config(&config, &content_entries);
-                update_result = {
-                    if let Some(storage) = storage_store() {
-                        let _ = storage
-                            .save_completed_index_batch(completed_at_ms, &final_payload.entries);
-                    }
+                let persistence = persist_and_activate_baseline(
+                    completed_at_ms,
+                    &final_payload.entries,
+                    baseline_generation,
+                    &config,
+                );
+                update_result = if let Err(error) = persistence {
+                    let app_for_state = app_for_update.clone();
+                    app_for_update.run_on_main_thread(move || {
+                        let state = app_for_state.state::<QuickFoxAppState>();
+                        if let Some(status) = apply_failed_index_refresh(&state, generation, error)
+                        {
+                            let index_remains_available = !matches!(
+                                status.availability,
+                                crate::core::index::IndexAvailability::Unavailable
+                            );
+                            let _ = app_for_state.emit("quickfox://index-status", status);
+                            if index_remains_available {
+                                let _ = restart_runtime_incremental_indexing(
+                                    app_for_state.clone(),
+                                    &state,
+                                );
+                            }
+                        }
+                    })
+                } else {
                     let app_for_state = app_for_update.clone();
                     app_for_update.run_on_main_thread(move || {
                         let state = app_for_state.state::<QuickFoxAppState>();
@@ -918,6 +977,12 @@ fn start_background_index_refresh<R: tauri::Runtime>(
                             completed_at_ms,
                         ) {
                             let _ = app_for_state.emit("quickfox://index-status", status);
+                            if !should_build_content_index {
+                                let _ = restart_runtime_incremental_indexing(
+                                    app_for_state.clone(),
+                                    &state,
+                                );
+                            }
                         }
                     })
                 };
@@ -962,30 +1027,55 @@ fn start_background_index_refresh<R: tauri::Runtime>(
                             failures: Vec::new(),
                             ..Default::default()
                         };
-                        if let Some(storage) = storage_store() {
-                            let _ = storage.save_completed_index_batch(
-                                content_completed_at_ms,
-                                &content_entries,
-                            );
-                        }
+                        let persistence = persist_and_activate_baseline(
+                            content_completed_at_ms,
+                            &content_entries,
+                            baseline_generation,
+                            &config,
+                        );
                         let content_payload = IndexRefreshPayload {
                             entries: content_entries,
                             summary: content_report,
                         };
                         let app_for_update = app.clone();
                         let app_for_state = app_for_update.clone();
-                        update_result = app_for_update.run_on_main_thread(move || {
-                            let state = app_for_state.state::<QuickFoxAppState>();
-                            if let Some(status) = apply_completed_content_index_refresh(
-                                &state,
-                                generation,
-                                content_index,
-                                content_payload,
-                                content_completed_at_ms,
-                            ) {
-                                let _ = app_for_state.emit("quickfox://index-status", status);
-                            }
-                        });
+                        update_result = if let Err(error) = persistence {
+                            app_for_update.run_on_main_thread(move || {
+                                let state = app_for_state.state::<QuickFoxAppState>();
+                                if let Some(status) =
+                                    apply_failed_index_refresh(&state, generation, error)
+                                {
+                                    let index_remains_available = !matches!(
+                                        status.availability,
+                                        crate::core::index::IndexAvailability::Unavailable
+                                    );
+                                    let _ = app_for_state.emit("quickfox://index-status", status);
+                                    if index_remains_available {
+                                        let _ = restart_runtime_incremental_indexing(
+                                            app_for_state.clone(),
+                                            &state,
+                                        );
+                                    }
+                                }
+                            })
+                        } else {
+                            app_for_update.run_on_main_thread(move || {
+                                let state = app_for_state.state::<QuickFoxAppState>();
+                                if let Some(status) = apply_completed_content_index_refresh(
+                                    &state,
+                                    generation,
+                                    content_index,
+                                    content_payload,
+                                    content_completed_at_ms,
+                                ) {
+                                    let _ = app_for_state.emit("quickfox://index-status", status);
+                                    let _ = restart_runtime_incremental_indexing(
+                                        app_for_state.clone(),
+                                        &state,
+                                    );
+                                }
+                            })
+                        };
                     }
                 }
             }
@@ -997,6 +1087,40 @@ fn start_background_index_refresh<R: tauri::Runtime>(
         .map_err(|error| error.to_string())?;
 
     Ok(status)
+}
+
+fn persist_and_activate_baseline(
+    completed_at_ms: i64,
+    entries: &[IndexedEntry],
+    baseline_generation: u64,
+    config: &QuickFoxConfig,
+) -> Result<(), String> {
+    let Some(storage) = storage_store() else {
+        return Ok(());
+    };
+    let baseline_id = storage
+        .save_completed_index_batch(completed_at_ms, entries)
+        .map_err(|error| error.to_string())?;
+    let mut roots: std::collections::BTreeSet<PathBuf> = entries
+        .iter()
+        .filter(|entry| !entry.root.is_empty())
+        .map(|entry| PathBuf::from(&entry.root))
+        .collect();
+    roots.extend(
+        build_scan_options(config)
+            .include_dirs
+            .into_iter()
+            .filter(|root| root.is_dir()),
+    );
+    let roots: Vec<_> = roots.into_iter().collect();
+    let manifest = baseline_manifest_from_entries(entries, &roots);
+    storage
+        .activate_baseline_with_manifest_and_clear_incremental_state(
+            baseline_id,
+            baseline_generation,
+            &manifest,
+        )
+        .map_err(|error| error.to_string())
 }
 
 fn apply_completed_index_refresh(
@@ -1017,14 +1141,12 @@ fn apply_completed_index_refresh(
     {
         return None;
     }
-    runtime.index = build_search_index_for_config(&runtime.config, payload.entries);
+    let index_generation = runtime.index.generation();
+    let baseline = build_search_index_for_config(&runtime.config, payload.entries);
+    runtime
+        .index
+        .replace_baseline_search_index(baseline, index_generation);
     runtime.last_report = payload.summary;
-    match start_runtime_index_watcher(&mut runtime) {
-        Ok(()) => {}
-        Err(failure) => {
-            let _ = record_watcher_failure(&mut runtime, failure);
-        }
-    }
     Some(runtime.index_status())
 }
 
@@ -1047,35 +1169,167 @@ fn apply_completed_content_index_refresh(
     {
         return None;
     }
-    runtime.index = content_index;
+    let index_generation = runtime.index.generation();
+    runtime
+        .index
+        .replace_baseline_search_index(content_index, index_generation);
     runtime.last_report = payload.summary;
     Some(runtime.index_status())
 }
 
-fn start_runtime_index_watcher(runtime: &mut QuickFoxRuntime) -> Result<(), WatcherFailure> {
-    if !runtime.config.index.watcher_enabled {
-        runtime.index_watcher = None;
-        runtime.watcher_failure_summary = None;
+fn record_watcher_failure(runtime: &mut QuickFoxRuntime, failure: WatcherFailure) -> IndexStatus {
+    let _ = failure;
+    runtime.incremental_status.enabled = runtime.config.index.watcher_enabled;
+    runtime.incremental_status.state = IncrementalState::Degraded;
+    runtime.incremental_status.degradation_code =
+        Some(IndexDegradationCode::WatcherInitializationFailed);
+    runtime.index_status()
+}
+
+fn restart_runtime_incremental_indexing<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: &QuickFoxAppState,
+) -> Result<(), String> {
+    let (previous, config, roots, initial_generation) = {
+        let mut runtime = state
+            .runtime
+            .lock()
+            .expect("quickfox runtime lock poisoned");
+        let previous = runtime.runtime_indexing.take();
+        runtime.incremental_status.enabled = runtime.config.index.watcher_enabled;
+        runtime.incremental_status.state = if runtime.config.index.watcher_enabled {
+            IncrementalState::Preparing
+        } else {
+            IncrementalState::Disabled
+        };
+        (
+            previous,
+            runtime.config.clone(),
+            runtime_watch_roots(&runtime.config, &runtime.index),
+            runtime.index.generation(),
+        )
+    };
+    if let Some(previous) = previous {
+        previous.stop();
+    }
+    if !config.index.watcher_enabled || roots.is_empty() {
         return Ok(());
     }
 
-    let roots = roots_from_entries(runtime.index.entries());
-    if roots.is_empty() {
-        runtime.index_watcher = None;
-        runtime.watcher_failure_summary = None;
-        return Ok(());
-    }
-
-    let (sender, _receiver) = std::sync::mpsc::channel();
-    let watcher = RuntimeIndexWatcher::watch_roots(roots, sender)?;
-    runtime.index_watcher = Some(watcher);
-    runtime.watcher_failure_summary = None;
+    let watcher = match RuntimeIndexWatcher::watch_roots(roots.clone()) {
+        Ok(watcher) => watcher,
+        Err(failure) => {
+            let status = {
+                let mut runtime = state
+                    .runtime
+                    .lock()
+                    .expect("quickfox runtime lock poisoned");
+                record_watcher_failure(&mut runtime, failure)
+            };
+            let _ = app.emit("quickfox://index-status", status);
+            return Err("runtime index watcher initialization failed".to_owned());
+        }
+    };
+    let options = build_scan_options(&config);
+    let rules = IndexPathRules::from_plan(&IndexScanPlan {
+        include_roots: roots.clone(),
+        exclude_dirs: options.exclude_dirs,
+        exclude_patterns: options.exclude_patterns,
+        respect_project_ignores: options.respect_project_ignores,
+        stage: None,
+    })
+    .map_err(|error| error.to_string())?;
+    let scanner = TargetedIndexScanner::new(rules);
+    let journal =
+        storage_store().ok_or_else(|| "index journal storage is unavailable".to_owned())?;
+    let publish_app = app.clone();
+    let handle = start_runtime_indexing(
+        watcher,
+        scanner,
+        Box::new(journal),
+        RuntimeIndexingOptions {
+            roots,
+            policy: crate::core::index_update_coordinator::CoordinatorPolicy::production(),
+            initial_generation,
+        },
+        move |event| publish_runtime_indexing_event(publish_app.clone(), event),
+    )
+    .map_err(|error| error.message)?;
+    state
+        .runtime
+        .lock()
+        .expect("quickfox runtime lock poisoned")
+        .runtime_indexing = Some(handle);
     Ok(())
 }
 
-fn record_watcher_failure(runtime: &mut QuickFoxRuntime, failure: WatcherFailure) -> IndexStatus {
-    runtime.watcher_failure_summary = Some(failure.message);
-    runtime.index_status()
+fn runtime_watch_roots(config: &QuickFoxConfig, index: &LayeredSearchIndex) -> Vec<PathBuf> {
+    let mut roots: std::collections::BTreeSet<_> = index.watched_roots().into_iter().collect();
+    roots.extend(
+        build_scan_options(config)
+            .include_dirs
+            .into_iter()
+            .filter(|root| root.is_dir()),
+    );
+    roots.into_iter().collect()
+}
+
+fn publish_runtime_indexing_event<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    event: RuntimeIndexingEvent,
+) {
+    let dispatch = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        let state = dispatch.state::<QuickFoxAppState>();
+        let mut request_refresh = false;
+        let status = match event {
+            RuntimeIndexingEvent::DeltaCommitted(delta) => {
+                let mut runtime = state
+                    .runtime
+                    .lock()
+                    .expect("quickfox runtime lock poisoned");
+                runtime.index.apply_delta(delta);
+                request_refresh = baseline_refresh_event_for_delta_state(
+                    runtime.index.delta_entry_count(),
+                    runtime.index.estimated_delta_bytes(),
+                )
+                .is_some();
+                runtime.index_status()
+            }
+            RuntimeIndexingEvent::Status(incremental_status) => {
+                let mut runtime = state
+                    .runtime
+                    .lock()
+                    .expect("quickfox runtime lock poisoned");
+                runtime.incremental_status = incremental_status;
+                runtime.index_status()
+            }
+            RuntimeIndexingEvent::BaselineRefreshRequired { .. } => {
+                request_refresh = true;
+                state
+                    .runtime
+                    .lock()
+                    .expect("quickfox runtime lock poisoned")
+                    .index_status()
+            }
+        };
+        let _ = dispatch.emit("quickfox://index-status", status);
+        if request_refresh {
+            let _ = start_background_index_refresh(dispatch.clone(), &state);
+        }
+    });
+}
+
+fn stop_runtime_incremental_indexing(state: &QuickFoxAppState) {
+    let handle = state
+        .runtime
+        .lock()
+        .expect("quickfox runtime lock poisoned")
+        .runtime_indexing
+        .take();
+    if let Some(handle) = handle {
+        handle.stop();
+    }
 }
 
 fn apply_index_refresh_progress(
@@ -1100,7 +1354,12 @@ fn apply_index_refresh_progress(
     ) {
         return None;
     }
-    runtime.index = SearchIndex::from_entries(payload.entries);
+    if runtime.index.entry_count() == 0 {
+        let index_generation = runtime.index.generation();
+        runtime
+            .index
+            .replace_baseline(payload.entries, index_generation);
+    }
     runtime.last_report = payload.summary;
     Some(runtime.index_status())
 }
@@ -1146,6 +1405,27 @@ fn should_persist_index_checkpoint(stage: &str, is_final: bool) -> bool {
 
 fn build_runtime() -> QuickFoxRuntime {
     let config = load_startup_config();
+    if let Some(storage) = storage_store() {
+        let recovery = recover_layered_index(&storage);
+        let lifecycle = if recovery.baseline_available() {
+            IndexLifecycle::from_ready(recovery.baseline_entry_count(), current_time_ms())
+        } else {
+            IndexLifecycle::default()
+        };
+        let mut incremental_status = RuntimeIncrementalStatus::default();
+        if let Some(code) = recovery.degradation_code() {
+            incremental_status.state = IncrementalState::Degraded;
+            incremental_status.degradation_code = Some(code);
+        }
+        return QuickFoxRuntime {
+            config,
+            index: recovery.index,
+            last_report: IndexReport::default(),
+            index_lifecycle: lifecycle,
+            runtime_indexing: None,
+            incremental_status,
+        };
+    }
     build_runtime_from_snapshot(config, load_latest_index_snapshot())
 }
 
@@ -1161,13 +1441,19 @@ fn build_runtime_from_snapshot(
         let entry_count = snapshot.entries.len();
         let completed_at_ms = snapshot.completed_at_ms;
         (
-            build_search_index_for_config(&config, snapshot.entries),
+            LayeredSearchIndex::from_search_index(build_search_index_for_config(
+                &config,
+                snapshot.entries,
+            )),
             IndexLifecycle::from_ready(entry_count, completed_at_ms),
             IndexReport::default(),
         )
     } else {
         (
-            build_search_index_for_config(&config, Vec::new()),
+            LayeredSearchIndex::from_search_index(build_search_index_for_config(
+                &config,
+                Vec::new(),
+            )),
             IndexLifecycle::default(),
             IndexReport::default(),
         )
@@ -1177,8 +1463,8 @@ fn build_runtime_from_snapshot(
         index,
         index_lifecycle,
         last_report: report,
-        index_watcher: None,
-        watcher_failure_summary: None,
+        runtime_indexing: None,
+        incremental_status: RuntimeIncrementalStatus::default(),
     }
 }
 
@@ -1281,10 +1567,34 @@ fn content_index_base_dir() -> PathBuf {
 impl QuickFoxRuntime {
     fn index_status(&self) -> IndexStatus {
         let mut status = self.index_lifecycle.status().clone();
-        if let Some(message) = &self.watcher_failure_summary {
-            status.message = Some(message.clone());
+        status.entry_count = self.index.entry_count();
+        status.incremental = self.incremental_status.clone();
+        if status.message.is_none() {
+            status.message = status
+                .incremental
+                .degradation_code
+                .map(incremental_degradation_summary)
+                .map(str::to_owned);
         }
         status
+    }
+}
+
+fn incremental_degradation_summary(code: IndexDegradationCode) -> &'static str {
+    match code {
+        IndexDegradationCode::WatcherInitializationFailed => {
+            "自动增量监听初始化失败，文件搜索仍使用最近可用索引"
+        }
+        IndexDegradationCode::WatcherRuntimeFailed => {
+            "自动增量监听运行失败，文件搜索仍使用最近可用索引"
+        }
+        IndexDegradationCode::WatcherOverflow | IndexDegradationCode::ChannelOverflow => {
+            "文件变化过多，正在安排索引恢复"
+        }
+        IndexDegradationCode::JournalWriteFailed => "增量索引保存失败，未应用本次文件变化",
+        IndexDegradationCode::JournalReplayFailed => "增量索引恢复失败，文件搜索仍使用最近可用基线",
+        IndexDegradationCode::CalibrationFailed => "增量索引校准失败，文件搜索仍使用最近可用索引",
+        IndexDegradationCode::FullRefreshFallback => "增量索引不可用，正在安排完整刷新",
     }
 }
 
@@ -1891,7 +2201,22 @@ pub fn run() {
             }
 
             start_global_double_shift_listener(app.handle().clone());
-            let _ = start_background_index_refresh(app.handle().clone(), &app.state());
+            let state = app.state::<QuickFoxAppState>();
+            let recovered_incremental_ready = {
+                let runtime = state
+                    .runtime
+                    .lock()
+                    .expect("quickfox runtime lock poisoned");
+                matches!(
+                    runtime.index_status().kind,
+                    crate::core::index::IndexStatusKind::Ready
+                ) && runtime.incremental_status.degradation_code.is_none()
+            };
+            if recovered_incremental_ready {
+                let _ = restart_runtime_incremental_indexing(app.handle().clone(), &state);
+            } else {
+                let _ = start_background_index_refresh(app.handle().clone(), &state);
+            }
 
             Ok(())
         })
@@ -1912,8 +2237,13 @@ pub fn run() {
             recent_input_history,
             clear_input_history
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running QuickFox");
+        .build(tauri::generate_context!())
+        .expect("error while building QuickFox")
+        .run(|app, event| {
+            if matches!(event, RunEvent::Exit | RunEvent::ExitRequested { .. }) {
+                stop_runtime_incremental_indexing(&app.state::<QuickFoxAppState>());
+            }
+        });
 }
 
 #[cfg(test)]
@@ -2017,17 +2347,46 @@ mod tests {
     fn runtime_reports_current_index_status() {
         let runtime = QuickFoxRuntime {
             config: QuickFoxConfig::default_with_index_dirs(vec!["/tmp".to_owned()]),
-            index: SearchIndex::default(),
+            index: LayeredSearchIndex::default(),
             last_report: IndexReport::default(),
             index_lifecycle: IndexLifecycle::default(),
-            index_watcher: None,
-            watcher_failure_summary: None,
+            runtime_indexing: None,
+            incremental_status: RuntimeIncrementalStatus::default(),
         };
 
         assert_eq!(
             runtime.index_status().kind,
             crate::core::index::IndexStatusKind::Unbuilt
         );
+    }
+
+    #[test]
+    fn runtime_status_uses_layered_visible_entry_count_after_delta() {
+        let mut index =
+            LayeredSearchIndex::from_baseline(vec![crate::core::index::IndexedEntry::legacy(
+                "/tmp/base.md",
+                "base.md",
+                crate::core::index::IndexedEntryKind::File,
+            )]);
+        index.apply_delta(crate::core::layered_index::CommittedIndexDelta {
+            generation: 1,
+            upserts: vec![crate::core::index::IndexedEntry::legacy(
+                "/tmp/new.md",
+                "new.md",
+                crate::core::index::IndexedEntryKind::File,
+            )],
+            removals: Vec::new(),
+        });
+        let runtime = QuickFoxRuntime {
+            config: QuickFoxConfig::default_with_index_dirs(vec!["/tmp".to_owned()]),
+            index,
+            last_report: IndexReport::default(),
+            index_lifecycle: IndexLifecycle::from_ready(1, 123),
+            runtime_indexing: None,
+            incremental_status: RuntimeIncrementalStatus::default(),
+        };
+
+        assert_eq!(runtime.index_status().entry_count, 2);
     }
 
     #[test]
@@ -2067,11 +2426,11 @@ mod tests {
         let state = QuickFoxAppState {
             runtime: Mutex::new(QuickFoxRuntime {
                 config: QuickFoxConfig::default_with_index_dirs(vec!["/tmp".to_owned()]),
-                index: SearchIndex::default(),
+                index: LayeredSearchIndex::default(),
                 last_report: IndexReport::default(),
                 index_lifecycle: IndexLifecycle::default(),
-                index_watcher: None,
-                watcher_failure_summary: None,
+                runtime_indexing: None,
+                incremental_status: RuntimeIncrementalStatus::default(),
             }),
             window_state: Mutex::new(LauncherWindowState::default()),
             global_hotkey_status: Mutex::new(pending_global_hotkey_status()),
@@ -2123,11 +2482,11 @@ mod tests {
         let state = QuickFoxAppState {
             runtime: Mutex::new(QuickFoxRuntime {
                 config: config.clone(),
-                index: SearchIndex::default(),
+                index: LayeredSearchIndex::default(),
                 last_report: IndexReport::default(),
                 index_lifecycle: IndexLifecycle::default(),
-                index_watcher: None,
-                watcher_failure_summary: None,
+                runtime_indexing: None,
+                incremental_status: RuntimeIncrementalStatus::default(),
             }),
             window_state: Mutex::new(LauncherWindowState::default()),
             global_hotkey_status: Mutex::new(pending_global_hotkey_status()),
@@ -2183,11 +2542,11 @@ mod tests {
         let state = QuickFoxAppState {
             runtime: Mutex::new(QuickFoxRuntime {
                 config: QuickFoxConfig::default_with_index_dirs(vec!["/tmp".to_owned()]),
-                index: SearchIndex::default(),
+                index: LayeredSearchIndex::default(),
                 last_report: IndexReport::default(),
                 index_lifecycle: IndexLifecycle::default(),
-                index_watcher: None,
-                watcher_failure_summary: None,
+                runtime_indexing: None,
+                incremental_status: RuntimeIncrementalStatus::default(),
             }),
             window_state: Mutex::new(LauncherWindowState::default()),
             global_hotkey_status: Mutex::new(pending_global_hotkey_status()),
@@ -2239,11 +2598,11 @@ mod tests {
         let state = QuickFoxAppState {
             runtime: Mutex::new(QuickFoxRuntime {
                 config: QuickFoxConfig::default_with_index_dirs(vec!["/tmp".to_owned()]),
-                index: SearchIndex::default(),
+                index: LayeredSearchIndex::default(),
                 last_report: IndexReport::default(),
                 index_lifecycle: IndexLifecycle::default(),
-                index_watcher: None,
-                watcher_failure_summary: None,
+                runtime_indexing: None,
+                incremental_status: RuntimeIncrementalStatus::default(),
             }),
             window_state: Mutex::new(LauncherWindowState::default()),
             global_hotkey_status: Mutex::new(pending_global_hotkey_status()),
@@ -2357,11 +2716,11 @@ mod tests {
         let state = QuickFoxAppState {
             runtime: Mutex::new(QuickFoxRuntime {
                 config: QuickFoxConfig::default_with_index_dirs(vec!["/tmp".to_owned()]),
-                index: SearchIndex::default(),
+                index: LayeredSearchIndex::default(),
                 last_report: IndexReport::default(),
                 index_lifecycle: IndexLifecycle::default(),
-                index_watcher: None,
-                watcher_failure_summary: None,
+                runtime_indexing: None,
+                incremental_status: RuntimeIncrementalStatus::default(),
             }),
             window_state: Mutex::new(LauncherWindowState::default()),
             global_hotkey_status: Mutex::new(pending_global_hotkey_status()),
@@ -2404,15 +2763,17 @@ mod tests {
         let state = QuickFoxAppState {
             runtime: Mutex::new(QuickFoxRuntime {
                 config: QuickFoxConfig::default_with_index_dirs(vec!["/tmp".to_owned()]),
-                index: SearchIndex::from_entries(vec![crate::core::index::IndexedEntry::legacy(
-                    "/tmp/notes.md",
-                    "notes.md",
-                    crate::core::index::IndexedEntryKind::File,
-                )]),
+                index: LayeredSearchIndex::from_baseline(vec![
+                    crate::core::index::IndexedEntry::legacy(
+                        "/tmp/notes.md",
+                        "notes.md",
+                        crate::core::index::IndexedEntryKind::File,
+                    ),
+                ]),
                 last_report: IndexReport::default(),
                 index_lifecycle: IndexLifecycle::default(),
-                index_watcher: None,
-                watcher_failure_summary: None,
+                runtime_indexing: None,
+                incremental_status: RuntimeIncrementalStatus::default(),
             }),
             window_state: Mutex::new(LauncherWindowState::default()),
             global_hotkey_status: Mutex::new(pending_global_hotkey_status()),
@@ -2460,11 +2821,11 @@ mod tests {
         let state = QuickFoxAppState {
             runtime: Mutex::new(QuickFoxRuntime {
                 config: QuickFoxConfig::default_with_index_dirs(vec!["/tmp".to_owned()]),
-                index: SearchIndex::default(),
+                index: LayeredSearchIndex::default(),
                 last_report: IndexReport::default(),
                 index_lifecycle: IndexLifecycle::default(),
-                index_watcher: None,
-                watcher_failure_summary: None,
+                runtime_indexing: None,
+                incremental_status: RuntimeIncrementalStatus::default(),
             }),
             window_state: Mutex::new(LauncherWindowState::default()),
             global_hotkey_status: Mutex::new(pending_global_hotkey_status()),
@@ -2486,15 +2847,17 @@ mod tests {
         let state = QuickFoxAppState {
             runtime: Mutex::new(QuickFoxRuntime {
                 config: QuickFoxConfig::default_with_index_dirs(vec!["/tmp".to_owned()]),
-                index: SearchIndex::from_entries(vec![crate::core::index::IndexedEntry::legacy(
-                    "/tmp/notes.md",
-                    "notes.md",
-                    crate::core::index::IndexedEntryKind::File,
-                )]),
+                index: LayeredSearchIndex::from_baseline(vec![
+                    crate::core::index::IndexedEntry::legacy(
+                        "/tmp/notes.md",
+                        "notes.md",
+                        crate::core::index::IndexedEntryKind::File,
+                    ),
+                ]),
                 last_report: IndexReport::default(),
                 index_lifecycle: IndexLifecycle::from_ready(1, 123),
-                index_watcher: None,
-                watcher_failure_summary: None,
+                runtime_indexing: None,
+                incremental_status: RuntimeIncrementalStatus::default(),
             }),
             window_state: Mutex::new(LauncherWindowState::default()),
             global_hotkey_status: Mutex::new(pending_global_hotkey_status()),
@@ -2513,7 +2876,14 @@ mod tests {
 
         assert_eq!(status.kind, crate::core::index::IndexStatusKind::Ready);
         assert_eq!(status.entry_count, 1);
-        assert!(status.message.unwrap().contains("background refresh"));
+        assert_eq!(
+            status.incremental.degradation_code,
+            Some(IndexDegradationCode::WatcherInitializationFailed)
+        );
+        assert_eq!(
+            status.message.as_deref(),
+            Some("自动增量监听初始化失败，文件搜索仍使用最近可用索引")
+        );
         assert_eq!(state.runtime.lock().unwrap().index.entries().len(), 1);
     }
 
@@ -2522,12 +2892,12 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let file = root.path().join("notes.md");
         fs::write(&file, "notes").unwrap();
-        let mut runtime = QuickFoxRuntime {
+        let runtime = QuickFoxRuntime {
             config: QuickFoxConfig::default_with_index_dirs(vec![root
                 .path()
                 .to_string_lossy()
                 .to_string()]),
-            index: SearchIndex::from_entries(vec![
+            index: LayeredSearchIndex::from_baseline(vec![
                 crate::core::index::IndexedEntry::from_path_metadata(
                     &file,
                     root.path(),
@@ -2536,14 +2906,29 @@ mod tests {
             ]),
             last_report: IndexReport::default(),
             index_lifecycle: IndexLifecycle::from_ready(1, 123),
-            index_watcher: None,
-            watcher_failure_summary: None,
+            runtime_indexing: None,
+            incremental_status: RuntimeIncrementalStatus::default(),
         };
 
-        start_runtime_index_watcher(&mut runtime).unwrap();
+        assert_eq!(
+            runtime.index.watched_roots(),
+            vec![root.path().to_path_buf()]
+        );
+    }
 
-        let roots = runtime.index_watcher.as_ref().unwrap().watched_roots();
-        assert_eq!(roots, &[root.path().to_path_buf()]);
+    #[test]
+    fn completed_empty_baseline_still_watches_configured_root_for_first_file() {
+        let root = tempfile::tempdir().unwrap();
+        let config = QuickFoxConfig::default_with_index_dirs(vec![root
+            .path()
+            .to_string_lossy()
+            .to_string()]);
+        let index = LayeredSearchIndex::default();
+
+        assert_eq!(
+            runtime_watch_roots(&config, &index),
+            vec![root.path().to_path_buf()]
+        );
     }
 
     #[test]
@@ -2614,6 +2999,7 @@ mod tests {
             accepted: 0,
             skipped: 0,
             failures: 0,
+            incremental: crate::core::index_entry::RuntimeIncrementalStatus::default(),
         };
 
         let calculator_results =
@@ -2791,10 +3177,10 @@ mod tests {
     }
 
     #[test]
-    fn disabled_watcher_skips_runtime_watcher_start() {
+    fn disabled_incremental_status_keeps_runtime_index_available() {
         let mut runtime = QuickFoxRuntime {
             config: QuickFoxConfig::default_with_index_dirs(vec!["/tmp".to_owned()]),
-            index: SearchIndex::from_entries(vec![crate::core::index::IndexedEntry {
+            index: LayeredSearchIndex::from_baseline(vec![crate::core::index::IndexedEntry {
                 path: "/tmp/report.md".to_owned(),
                 name: "report.md".to_owned(),
                 kind: crate::core::index::IndexedEntryKind::File,
@@ -2806,15 +3192,17 @@ mod tests {
                 )
             }]),
             last_report: IndexReport::default(),
-            index_lifecycle: IndexLifecycle::default(),
-            index_watcher: None,
-            watcher_failure_summary: None,
+            index_lifecycle: IndexLifecycle::from_ready(1, 123),
+            runtime_indexing: None,
+            incremental_status: RuntimeIncrementalStatus::default(),
         };
         runtime.config.index.watcher_enabled = false;
+        runtime.incremental_status.enabled = false;
+        runtime.incremental_status.state = IncrementalState::Disabled;
 
-        start_runtime_index_watcher(&mut runtime).unwrap();
-
-        assert!(runtime.index_watcher.is_none());
+        assert_eq!(runtime.index_status().entry_count, 1);
+        assert_eq!(runtime.index.entry_count(), 1);
+        assert!(runtime.runtime_indexing.is_none());
     }
 
     #[test]

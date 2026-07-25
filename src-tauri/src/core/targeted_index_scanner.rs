@@ -588,6 +588,41 @@ fn directory_fingerprint(entry: &IndexedEntry) -> DirectoryFingerprint {
     }
 }
 
+pub fn baseline_manifest_from_entries(
+    entries: &[IndexedEntry],
+    roots: &[PathBuf],
+) -> Vec<DirectoryFingerprint> {
+    let root_keys: BTreeSet<_> = roots.iter().map(normalize_path_key).collect();
+    let mut rows: BTreeMap<String, DirectoryFingerprint> = BTreeMap::new();
+    for root in roots.iter().filter(|root| root.is_dir()) {
+        let root_text = root.to_string_lossy().into_owned();
+        let modified_ms = fs::metadata(root)
+            .ok()
+            .and_then(|metadata| metadata_from_std(&metadata).modified_ms);
+        rows.insert(
+            normalize_path_key(root),
+            DirectoryFingerprint {
+                path: root_text.clone(),
+                parent: None,
+                root: root_text,
+                modified_ms,
+            },
+        );
+    }
+    for entry in entries {
+        if !root_keys.contains(&normalize_path_text_key(&entry.root)) {
+            continue;
+        }
+        if entry.kind == IndexedEntryKind::Directory || Path::new(&entry.path).is_dir() {
+            rows.insert(
+                normalize_path_text_key(&entry.path),
+                directory_fingerprint(entry),
+            );
+        }
+    }
+    rows.into_values().collect()
+}
+
 fn merge_result(target: &mut TargetedScanResult, source: TargetedScanResult) {
     target.upserts.extend(source.upserts);
     target.removals.extend(source.removals);
@@ -1834,5 +1869,17 @@ mod tests {
             result.new_directories,
             vec![PathBuf::from("/root/Tool.app")]
         );
+    }
+
+    #[test]
+    fn completed_empty_baseline_builds_a_root_manifest_row() {
+        let root = tempfile::tempdir().unwrap();
+
+        let manifest = baseline_manifest_from_entries(&[], &[root.path().to_path_buf()]);
+
+        assert_eq!(manifest.len(), 1);
+        assert_eq!(manifest[0].path, root.path().to_string_lossy());
+        assert_eq!(manifest[0].root, root.path().to_string_lossy());
+        assert_eq!(manifest[0].parent, None);
     }
 }

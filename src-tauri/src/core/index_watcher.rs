@@ -1,12 +1,11 @@
 //! Runtime index watcher boundary.
 
+use crate::core::index_entry::IndexDegradationCode;
 use notify::event::{ModifyKind, RenameMode};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{
-    self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, TrySendError,
-};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -31,6 +30,7 @@ pub enum WatchSendOutcome {
 struct WatchInboxState {
     dirty_roots: BTreeSet<PathBuf>,
     latest_failure: Option<WatcherFailure>,
+    latest_degradation: Option<IndexDegradationCode>,
 }
 
 #[derive(Debug, Clone)]
@@ -46,6 +46,7 @@ impl WatchEventSender {
             Ok(()) => WatchSendOutcome::Queued,
             Err(TrySendError::Full(event)) => {
                 self.mark_event_roots_dirty(&event);
+                self.record_degradation(IndexDegradationCode::ChannelOverflow);
                 WatchSendOutcome::Overflowed
             }
             Err(TrySendError::Disconnected(_)) => WatchSendOutcome::Disconnected,
@@ -60,6 +61,11 @@ impl WatchEventSender {
             state.dirty_roots.insert(failure.root.clone());
         }
         state.latest_failure = Some(failure);
+        state.latest_degradation = Some(IndexDegradationCode::WatcherRuntimeFailed);
+    }
+
+    fn record_degradation(&self, code: IndexDegradationCode) {
+        self.lock_state().latest_degradation = Some(code);
     }
 
     fn mark_event_roots_dirty(&self, event: &IndexWatchEvent) {
@@ -125,6 +131,10 @@ impl WatchEventInbox {
 
     pub fn take_failure(&self) -> Option<WatcherFailure> {
         self.lock_state().latest_failure.take()
+    }
+
+    pub fn take_degradation_code(&self) -> Option<IndexDegradationCode> {
+        self.lock_state().latest_degradation.take()
     }
 
     fn lock_state(&self) -> std::sync::MutexGuard<'_, WatchInboxState> {
@@ -196,6 +206,12 @@ impl IndexEventBatcher {
     pub fn is_empty(&self) -> bool {
         self.changed_paths.is_empty() && self.removed_paths.is_empty()
     }
+
+    pub fn len(&self) -> usize {
+        self.changed_paths
+            .len()
+            .saturating_add(self.removed_paths.len())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -225,15 +241,7 @@ pub struct RuntimeIndexWatcher {
 }
 
 impl RuntimeIndexWatcher {
-    /// Starts the bounded watcher pipeline.
-    ///
-    /// `_legacy_sender` preserves the pre-coordinator call shape until the runtime wiring task
-    /// switches `lib.rs` to consume [`Self::take_inbox`]. It receives no events and should be
-    /// removed together with that migration.
-    pub fn watch_roots(
-        roots: Vec<PathBuf>,
-        _legacy_sender: Sender<Result<IndexWatchEvent, WatcherFailure>>,
-    ) -> Result<Self, WatcherFailure> {
+    pub fn watch_roots(roots: Vec<PathBuf>) -> Result<Self, WatcherFailure> {
         let (callback_sender, inbox) =
             WatchEventInbox::bounded(roots.clone(), DEFAULT_WATCH_CHANNEL_CAPACITY);
         let mut watcher = notify::recommended_watcher(move |result: notify::Result<Event>| {
@@ -290,6 +298,7 @@ fn dispatch_notify_event(event: Event, sender: &WatchEventSender) {
     );
     if event.need_rescan() || uncertain_rename {
         sender.mark_paths_dirty(event.paths.iter().map(PathBuf::as_path), true);
+        sender.record_degradation(IndexDegradationCode::WatcherOverflow);
         return;
     }
 
@@ -412,6 +421,10 @@ mod tests {
             .diagnostic
             .contains(private_path.to_string_lossy().as_ref()));
         assert_eq!(inbox.take_dirty_roots(), BTreeSet::from([private_root]));
+        assert_eq!(
+            inbox.take_degradation_code(),
+            Some(IndexDegradationCode::WatcherRuntimeFailed)
+        );
     }
 
     #[test]
@@ -452,10 +465,8 @@ mod tests {
     #[test]
     fn runtime_watcher_owns_an_inbox_until_it_is_taken() {
         let root = tempfile::tempdir().unwrap();
-        let (legacy_sender, _legacy_receiver) = std::sync::mpsc::channel();
         let mut watcher =
-            RuntimeIndexWatcher::watch_roots(vec![root.path().to_path_buf()], legacy_sender)
-                .unwrap();
+            RuntimeIndexWatcher::watch_roots(vec![root.path().to_path_buf()]).unwrap();
 
         assert!(watcher.take_inbox().is_some());
         assert!(watcher.take_inbox().is_none());
@@ -474,6 +485,10 @@ mod tests {
         assert_eq!(
             inbox.take_dirty_roots(),
             BTreeSet::from([first_root, second_root])
+        );
+        assert_eq!(
+            inbox.take_degradation_code(),
+            Some(IndexDegradationCode::WatcherOverflow)
         );
     }
 

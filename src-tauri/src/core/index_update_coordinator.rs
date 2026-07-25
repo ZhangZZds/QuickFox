@@ -106,6 +106,14 @@ impl CoordinatorState {
         self.events.is_empty() && self.dirty_roots.is_empty()
     }
 
+    pub fn pending_event_count(&self) -> usize {
+        self.events.len()
+    }
+
+    pub fn dirty_root_count(&self) -> usize {
+        self.dirty_roots.len()
+    }
+
     fn observe(&mut self, observed_at: Instant) {
         self.first_event_at = Some(
             self.first_event_at

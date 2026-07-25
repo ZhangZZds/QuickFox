@@ -244,6 +244,55 @@ pub enum IndexAvailability {
     Complete,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum IndexDegradationCode {
+    WatcherInitializationFailed,
+    WatcherRuntimeFailed,
+    WatcherOverflow,
+    ChannelOverflow,
+    JournalWriteFailed,
+    JournalReplayFailed,
+    CalibrationFailed,
+    FullRefreshFallback,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum IncrementalState {
+    Disabled,
+    Preparing,
+    Watching,
+    Degraded,
+    Calibrating,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeIncrementalStatus {
+    pub enabled: bool,
+    pub state: IncrementalState,
+    pub pending_events: usize,
+    pub dirty_roots: usize,
+    pub last_batch_entries: usize,
+    pub last_batch_duration_ms: u64,
+    pub degradation_code: Option<IndexDegradationCode>,
+}
+
+impl Default for RuntimeIncrementalStatus {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            state: IncrementalState::Preparing,
+            pending_events: 0,
+            dirty_roots: 0,
+            last_batch_entries: 0,
+            last_batch_duration_ms: 0,
+            degradation_code: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IndexStatus {
@@ -266,6 +315,8 @@ pub struct IndexStatus {
     pub skipped: usize,
     #[serde(default)]
     pub failures: usize,
+    #[serde(default)]
+    pub incremental: RuntimeIncrementalStatus,
 }
 
 fn default_index_availability() -> IndexAvailability {
@@ -295,6 +346,7 @@ impl Default for IndexLifecycle {
                 accepted: 0,
                 skipped: 0,
                 failures: 0,
+                incremental: RuntimeIncrementalStatus::default(),
             },
         }
     }
@@ -317,6 +369,7 @@ impl IndexLifecycle {
                 accepted: 0,
                 skipped: 0,
                 failures: 0,
+                incremental: RuntimeIncrementalStatus::default(),
             },
         }
     }
@@ -395,6 +448,7 @@ impl IndexLifecycle {
             accepted: self.status.accepted,
             skipped: self.status.skipped,
             failures: self.status.failures,
+            incremental: self.status.incremental.clone(),
         };
         true
     }
@@ -561,6 +615,7 @@ mod tests {
             accepted: 7,
             skipped: 3,
             failures: 1,
+            incremental: RuntimeIncrementalStatus::default(),
         };
 
         let value = serde_json::to_value(status).unwrap();
@@ -641,6 +696,25 @@ mod tests {
             lifecycle.status().availability,
             IndexAvailability::QuickAvailable
         );
+    }
+
+    #[test]
+    fn runtime_incremental_status_serializes_structured_degradation_without_paths() {
+        let status = RuntimeIncrementalStatus {
+            enabled: true,
+            state: IncrementalState::Degraded,
+            pending_events: 7,
+            dirty_roots: 2,
+            last_batch_entries: 3,
+            last_batch_duration_ms: 11,
+            degradation_code: Some(IndexDegradationCode::ChannelOverflow),
+        };
+
+        let json = serde_json::to_string(&status).unwrap();
+
+        assert!(json.contains("\"state\":\"degraded\""));
+        assert!(json.contains("\"degradationCode\":\"channelOverflow\""));
+        assert!(!json.contains("/private/root"));
     }
 
     fn temp_dir(label: &str) -> std::path::PathBuf {

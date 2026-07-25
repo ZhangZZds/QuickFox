@@ -1,6 +1,7 @@
 //! Persistent incremental-index journal and recovery boundary.
 
 use crate::core::index::IndexedEntry;
+pub use crate::core::index_entry::IndexDegradationCode;
 use crate::core::index_entry::{normalize_path_key, normalize_path_text_key};
 use crate::core::layered_index::{CommittedIndexDelta, LayeredSearchIndex};
 use crate::core::storage::{IncrementalRecoveryBaseline, IncrementalRuntimeState, SqliteStorage};
@@ -10,19 +11,6 @@ use crate::core::targeted_index_scanner::{
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum IndexDegradationCode {
-    WatcherInitializationFailed,
-    WatcherRuntimeFailed,
-    WatcherOverflow,
-    ChannelOverflow,
-    JournalWriteFailed,
-    JournalReplayFailed,
-    CalibrationFailed,
-    FullRefreshFallback,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
