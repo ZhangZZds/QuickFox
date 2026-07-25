@@ -234,9 +234,20 @@ pub fn recover_layered_index(repository: &(impl IndexJournalRepository + ?Sized)
     if !baseline.available {
         return unavailable_recovery();
     }
+    let requires_full_refresh = baseline.requires_full_refresh;
     let baseline_generation = baseline.generation;
     let baseline = baseline.entries;
     let baseline_entry_count = baseline.len();
+    if requires_full_refresh {
+        return baseline_only_recovery(
+            baseline,
+            baseline_generation,
+            baseline_entry_count,
+            true,
+            IndexDegradationCode::JournalReplayFailed,
+            IndexFallbackReason::FullRefreshFallback,
+        );
+    }
     if repository.validate_directory_manifest().is_err() {
         return failed_manifest_recovery(baseline, baseline_generation, baseline_entry_count);
     }
@@ -422,6 +433,7 @@ mod tests {
                 entries: vec![entry("/root/active.md")],
                 generation: 0,
                 available: true,
+                requires_full_refresh: false,
             })
         }
 
@@ -433,6 +445,7 @@ mod tests {
                 entries: vec![entry("/root/latest.md")],
                 generation: 0,
                 available: true,
+                requires_full_refresh: false,
             })
         }
 
@@ -659,6 +672,41 @@ mod tests {
             vec!["from-journal.md"]
         );
         assert_eq!(recovery.index.generation(), 1);
+
+        drop(storage);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn missing_active_baseline_falls_back_to_latest_completed_baseline_as_degraded() {
+        let path = temp_db_path("missing-active-baseline");
+        let storage = SqliteStorage::open(path.clone()).unwrap();
+        storage
+            .save_completed_index_batch(10, &[entry("/root/latest.md")])
+            .unwrap();
+        storage
+            .save_runtime_state(&IncrementalRuntimeState {
+                active_baseline_id: None,
+                baseline_generation: 0,
+                last_generation: 0,
+                degradation_code: None,
+                baseline_refresh_reason: None,
+            })
+            .unwrap();
+
+        let recovery = recover_layered_index(&storage);
+
+        assert!(recovery.baseline_available());
+        assert_eq!(recovery.baseline_entry_count(), 1);
+        assert_eq!(search_titles(&recovery.index, "latest"), vec!["latest.md"]);
+        assert_eq!(
+            recovery.degradation_code(),
+            Some(IndexDegradationCode::JournalReplayFailed)
+        );
+        assert_eq!(
+            recovery.fallback_reason(),
+            Some(IndexFallbackReason::FullRefreshFallback)
+        );
 
         drop(storage);
         let _ = fs::remove_file(path);
