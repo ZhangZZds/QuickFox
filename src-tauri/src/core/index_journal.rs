@@ -223,35 +223,13 @@ pub fn replay_deltas(
 }
 
 pub fn recover_layered_index(repository: &(impl IndexJournalRepository + ?Sized)) -> IndexRecovery {
-    let legacy_baseline = match repository.latest_completed_recovery_baseline() {
-        Ok(baseline) => baseline,
-        Err(_) => {
-            return failed_recovery(Vec::new(), 0, 0, false);
-        }
-    };
     match repository.incremental_schema_is_ready() {
         Ok(true) => {}
-        Ok(false) | Err(_) => {
-            let baseline_entry_count = legacy_baseline.entries.len();
-            return failed_recovery(
-                legacy_baseline.entries,
-                legacy_baseline.generation,
-                baseline_entry_count,
-                legacy_baseline.available,
-            );
-        }
+        Ok(false) | Err(_) => return latest_baseline_fallback(repository),
     }
     let baseline = match repository.incremental_recovery_baseline() {
         Ok(baseline) => baseline,
-        Err(_) => {
-            let baseline_entry_count = legacy_baseline.entries.len();
-            return failed_recovery(
-                legacy_baseline.entries,
-                legacy_baseline.generation,
-                baseline_entry_count,
-                legacy_baseline.available,
-            );
-        }
+        Err(_) => return latest_baseline_fallback(repository),
     };
     if !baseline.available {
         return unavailable_recovery();
@@ -286,6 +264,20 @@ pub fn recover_layered_index(repository: &(impl IndexJournalRepository + ?Sized)
         baseline_entry_count,
         baseline_available: true,
     }
+}
+
+fn latest_baseline_fallback(repository: &(impl IndexJournalRepository + ?Sized)) -> IndexRecovery {
+    let baseline = match repository.latest_completed_recovery_baseline() {
+        Ok(baseline) => baseline,
+        Err(_) => return failed_recovery(Vec::new(), 0, 0, false),
+    };
+    let baseline_entry_count = baseline.entries.len();
+    failed_recovery(
+        baseline.entries,
+        baseline.generation,
+        baseline_entry_count,
+        baseline.available,
+    )
 }
 
 fn unavailable_recovery() -> IndexRecovery {
@@ -400,9 +392,159 @@ mod tests {
     use crate::core::search::QueryParser;
     use crate::core::storage::SqliteStorage;
     use rusqlite::{params, Connection};
+    use std::cell::Cell;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct CountingRecoveryRepository {
+        active_loads: Cell<usize>,
+        latest_loads: Cell<usize>,
+    }
+
+    impl CountingRecoveryRepository {
+        fn new() -> Self {
+            Self {
+                active_loads: Cell::new(0),
+                latest_loads: Cell::new(0),
+            }
+        }
+    }
+
+    impl IndexJournalRepository for CountingRecoveryRepository {
+        fn incremental_schema_is_ready(&self) -> Result<bool, String> {
+            Ok(true)
+        }
+
+        fn incremental_recovery_baseline(&self) -> Result<IncrementalRecoveryBaseline, String> {
+            self.active_loads.set(self.active_loads.get() + 1);
+            Ok(IncrementalRecoveryBaseline {
+                entries: vec![entry("/root/active.md")],
+                generation: 0,
+                available: true,
+            })
+        }
+
+        fn latest_completed_recovery_baseline(
+            &self,
+        ) -> Result<IncrementalRecoveryBaseline, String> {
+            self.latest_loads.set(self.latest_loads.get() + 1);
+            Ok(IncrementalRecoveryBaseline {
+                entries: vec![entry("/root/latest.md")],
+                generation: 0,
+                available: true,
+            })
+        }
+
+        fn validate_directory_manifest(&self) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn commit_incremental_batch(
+            &mut self,
+            _delta: &CommittedIndexDelta,
+            _manifest_upserts: &[DirectoryFingerprint],
+            _manifest_removals: &[PathBuf],
+        ) -> Result<(), String> {
+            unreachable!("recovery does not commit")
+        }
+
+        fn committed_index_deltas_after(
+            &self,
+            _generation: u64,
+        ) -> Result<Vec<CommittedIndexDelta>, String> {
+            Ok(Vec::new())
+        }
+
+        fn replace_directory_manifest(
+            &mut self,
+            _root: &Path,
+            _rows: &[DirectoryFingerprint],
+        ) -> Result<(), String> {
+            unreachable!("recovery does not replace manifests")
+        }
+
+        fn directory_manifest_for_root(
+            &self,
+            _root: &Path,
+        ) -> Result<Vec<DirectoryFingerprint>, String> {
+            unreachable!("recovery does not read one manifest root")
+        }
+
+        fn known_direct_indexed_children(
+            &self,
+            _root: &Path,
+            _directory: &Path,
+        ) -> Result<Vec<KnownIndexedChild>, String> {
+            unreachable!("recovery does not read direct children")
+        }
+
+        fn clear_incremental_state_through(&mut self, _generation: u64) -> Result<(), String> {
+            unreachable!("recovery does not clear journal state")
+        }
+
+        fn activate_baseline_and_clear_incremental_state(
+            &mut self,
+            _baseline_id: i64,
+            _baseline_generation: u64,
+        ) -> Result<(), String> {
+            unreachable!("recovery does not activate baselines")
+        }
+
+        fn runtime_state(&self) -> Result<Option<IncrementalRuntimeState>, String> {
+            unreachable!("recovery baseline loading owns runtime-state access")
+        }
+
+        fn save_runtime_state(&mut self, _state: &IncrementalRuntimeState) -> Result<(), String> {
+            unreachable!("recovery does not save runtime state")
+        }
+    }
+
+    #[test]
+    fn ready_schema_loads_only_the_active_baseline() {
+        let repository = CountingRecoveryRepository::new();
+
+        let recovery = recover_layered_index(&repository);
+
+        assert_eq!(repository.active_loads.get(), 1);
+        assert_eq!(repository.latest_loads.get(), 0);
+        assert_eq!(search_titles(&recovery.index, "active"), vec!["active.md"]);
+        assert!(search_titles(&recovery.index, "latest").is_empty());
+    }
+
+    #[test]
+    fn corrupt_unactivated_latest_snapshot_does_not_block_active_recovery() {
+        let path = temp_db_path("corrupt-unactivated-latest");
+        let storage = SqliteStorage::open(path.clone()).unwrap();
+        let active_id = storage
+            .save_completed_index_batch(10, &[entry("/root/active.md")])
+            .unwrap();
+        storage.activate_baseline(active_id, 0).unwrap();
+        let latest_id = storage
+            .save_completed_index_batch(20, &[entry("/root/unactivated.md")])
+            .unwrap();
+        drop(storage);
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "UPDATE index_entries SET depth = 'broken' WHERE batch_id = ?1",
+                params![latest_id],
+            )
+            .unwrap();
+        drop(connection);
+        let storage = SqliteStorage::open(path.clone()).unwrap();
+
+        let recovery = recover_layered_index(&storage);
+
+        assert!(recovery.baseline_available());
+        assert_eq!(recovery.baseline_entry_count(), 1);
+        assert_eq!(search_titles(&recovery.index, "active"), vec!["active.md"]);
+        assert!(search_titles(&recovery.index, "unactivated").is_empty());
+        assert_eq!(recovery.degradation_code(), None);
+
+        drop(storage);
+        let _ = fs::remove_file(path);
+    }
 
     #[test]
     fn committed_generation_replay_is_ordered_and_idempotent_by_path() {
