@@ -1,6 +1,6 @@
 ## 1. 回归基线与模块边界
 
-- [ ] 1.1 增加失败测试，证明当前 watcher receiver 被丢弃后创建事件不会更新运行期搜索结果
+- [x] 1.1 增加失败测试，证明当前 watcher receiver 被丢弃后创建事件不会更新运行期搜索结果
 - [x] 1.2 增加失败性能测试，证明现有 `apply_update_batch` 会重建完整 compact candidate index
 - [x] 1.3 建立 `index_update_coordinator`、`targeted_index_scanner`、`layered_index` 和 `index_journal` 模块边界，保持 `lib.rs` 只负责 Tauri/runtime 接线
 
@@ -8,8 +8,8 @@
 
 - [x] 2.1 按 TDD 让 `RuntimeIndexWatcher` 返回可持续消费的 receiver，并支持 8192 容量的非阻塞事件通道
 - [x] 2.2 按 TDD 实现 5 秒静默窗口、10 秒硬上限和 create/write/remove/rename 的确定性批次折叠
-- [ ] 2.3 按 TDD 实现 channel overflow、平台 overflow 和 watcher failure 的 dirty-root 标记与结构化失败 code
-- [ ] 2.4 实现 coordinator 生命周期、取消和关闭，验证保存配置、刷新和应用退出不会泄漏 watcher 线程
+- [x] 2.3 按 TDD 实现 channel overflow、平台 overflow 和 watcher failure 的 dirty-root 标记与结构化失败 code
+- [x] 2.4 实现 coordinator 生命周期、取消和关闭，验证保存配置、刷新和应用退出不会泄漏 watcher 线程
 
 ## 3. Targeted scanner 与目录清单
 
@@ -32,12 +32,12 @@
 - [x] 5.1 为 SQLite 增加 delta batch/entry 和 runtime state schema，保持旧 `index_batches/index_entries` baseline 可读
 - [x] 5.2 按 TDD 实现 journal 事务提交、未提交批次忽略、generation 顺序和 path-key 幂等重放
 - [x] 5.3 按 TDD 实现启动加载 baseline 后重放 journal，并在 journal 损坏时保留 baseline、记录 fallback 原因
-- [ ] 5.4 实现“journal 先提交、内存 generation 后切换”的 runtime commit，并覆盖两个边界之间崩溃的恢复测试
-- [ ] 5.5 实现 overlay+tombstone 达到 50,000 条或 64 MiB 时安排现有后台全量刷新，成功后清理已合并增量状态
+- [x] 5.4 实现“journal 先提交、内存 generation 后切换”的 runtime commit，并覆盖两个边界之间崩溃的恢复测试
+- [x] 5.5 实现 overlay+tombstone 达到 50,000 条或 64 MiB 时安排现有后台全量刷新，成功后清理已合并增量状态
 
 ## 6. Runtime、配置与状态接线
 
-- [ ] 6.1 将 coordinator 接入 `QuickFoxRuntime`，在 baseline/manifest 准备完成后启动 watcher 并把批次提交到 layered view
+- [x] 6.1 将 coordinator 接入 `QuickFoxRuntime`，在 baseline/manifest 准备完成后启动 watcher 并把批次提交到 layered view
 - [ ] 6.2 让自动增量配置默认开启；关闭时停止 watcher 但保留搜索，重新开启时先执行 root 校准
 - [ ] 6.3 区分 watcher 开关变化与索引语义变化，后者触发带原因的后台全量重建
 - [ ] 6.4 扩展 `IndexStatus` 和 Tauri contract，暴露自动增量状态、pending/dirty 数、最近批次摘要和 degradation code，不暴露完整路径
