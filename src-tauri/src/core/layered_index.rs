@@ -319,6 +319,19 @@ impl LayeredSearchIndex {
             .collect()
     }
 
+    pub fn materialized_entries(&self) -> Vec<IndexedEntry> {
+        let mut entries: BTreeMap<String, IndexedEntry> = self
+            .baseline
+            .entries()
+            .iter()
+            .filter(|entry| self.baseline_entry_is_visible(entry))
+            .cloned()
+            .map(|entry| (normalize_path_text_key(&entry.path), entry))
+            .collect();
+        entries.extend(self.overlay_entries.clone());
+        entries.into_values().collect()
+    }
+
     #[cfg(test)]
     pub fn entries(&self) -> &[IndexedEntry] {
         self.baseline.entries()

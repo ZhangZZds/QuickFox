@@ -114,6 +114,13 @@ impl SqliteStorage {
         Self::open_with_comparison_mode(path, PathComparisonMode::native())
     }
 
+    pub fn reopen(&self) -> Result<Self, StorageError> {
+        let path = self.connection.path().ok_or_else(|| {
+            StorageError::InvalidJournal("SQLite storage has no reopenable path".to_owned())
+        })?;
+        Self::open_with_comparison_mode(PathBuf::from(path), self.comparison_mode)
+    }
+
     pub(crate) fn open_with_comparison_mode(
         path: PathBuf,
         comparison_mode: PathComparisonMode,
@@ -916,7 +923,13 @@ impl SqliteStorage {
             baseline_generation,
             self.comparison_mode,
         )?;
-        let manifest = merge_manifest_with_committed_deltas(manifest, &tail, self.comparison_mode);
+        let committed_manifest = load_persisted_manifest(&transaction)?;
+        let manifest = merge_manifest_with_committed_deltas(
+            manifest,
+            &tail,
+            &committed_manifest,
+            self.comparison_mode,
+        );
         transaction.execute("DELETE FROM index_directory_manifest", [])?;
         upsert_manifest_rows(&transaction, &manifest, self.comparison_mode)?;
         validate_persisted_manifest_tree(&transaction, self.comparison_mode)?;
@@ -1781,6 +1794,7 @@ fn load_committed_index_deltas_after(
 fn merge_manifest_with_committed_deltas(
     manifest: &[DirectoryFingerprint],
     deltas: &[CommittedIndexDelta],
+    committed_manifest: &[DirectoryFingerprint],
     comparison_mode: PathComparisonMode,
 ) -> Vec<DirectoryFingerprint> {
     let mut rows: BTreeMap<String, DirectoryFingerprint> = manifest
@@ -1793,26 +1807,56 @@ fn merge_manifest_with_committed_deltas(
             )
         })
         .collect();
+    let committed_rows: BTreeMap<String, DirectoryFingerprint> = committed_manifest
+        .iter()
+        .cloned()
+        .map(|row| {
+            (
+                normalize_path_text_key_for_mode(&row.path, comparison_mode),
+                row,
+            )
+        })
+        .collect();
+    let mut touched_paths = Vec::new();
     for delta in deltas {
         for removal in &delta.removals {
+            touched_paths.push(removal.clone());
             rows.retain(|_, row| {
                 !path_is_same_or_descendant_for_mode(removal, Path::new(&row.path), comparison_mode)
             });
         }
         for entry in &delta.upserts {
-            if entry.kind != IndexedEntryKind::Directory && !Path::new(&entry.path).is_dir() {
-                continue;
+            let path = PathBuf::from(&entry.path);
+            touched_paths.push(path);
+            let key = normalize_path_text_key_for_mode(&entry.path, comparison_mode);
+            if let Some(committed) = committed_rows.get(&key) {
+                rows.insert(key, committed.clone());
+            } else if entry.kind == IndexedEntryKind::Directory {
+                rows.insert(
+                    key,
+                    DirectoryFingerprint {
+                        path: entry.path.clone(),
+                        parent: (entry.path != entry.root)
+                            .then(|| entry.parent.clone())
+                            .filter(|parent| !parent.is_empty()),
+                        root: entry.root.clone(),
+                        modified_ms: entry.modified_ms,
+                    },
+                );
             }
+        }
+    }
+    for committed in committed_manifest {
+        if touched_paths.iter().any(|touched| {
+            path_is_same_or_descendant_for_mode(
+                Path::new(&committed.path),
+                touched,
+                comparison_mode,
+            )
+        }) {
             rows.insert(
-                normalize_path_text_key_for_mode(&entry.path, comparison_mode),
-                DirectoryFingerprint {
-                    path: entry.path.clone(),
-                    parent: (entry.path != entry.root)
-                        .then(|| entry.parent.clone())
-                        .filter(|parent| !parent.is_empty()),
-                    root: entry.root.clone(),
-                    modified_ms: entry.modified_ms,
-                },
+                normalize_path_text_key_for_mode(&committed.path, comparison_mode),
+                committed.clone(),
             );
         }
     }
@@ -2046,6 +2090,14 @@ fn validate_persisted_manifest_tree(
     connection: &Connection,
     mode: PathComparisonMode,
 ) -> Result<(), StorageError> {
+    let manifest = load_persisted_manifest(connection)?;
+    validate_manifest_rows(&manifest, mode)?;
+    validate_manifest_tree_rows(&manifest, mode)
+}
+
+fn load_persisted_manifest(
+    connection: &Connection,
+) -> Result<Vec<DirectoryFingerprint>, StorageError> {
     let mut statement = connection.prepare(
         r#"
         SELECT path, parent, root, modified_ms
@@ -2065,8 +2117,7 @@ fn validate_persisted_manifest_tree(
     for row in rows {
         manifest.push(row?);
     }
-    validate_manifest_rows(&manifest, mode)?;
-    validate_manifest_tree_rows(&manifest, mode)
+    Ok(manifest)
 }
 
 fn validate_manifest_removals(
@@ -3620,6 +3671,145 @@ mod tests {
             .iter()
             .any(|row| row.path == deleted.to_string_lossy()));
         assert_eq!(reopened.committed_index_deltas_after(0).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn activation_preserves_committed_parent_fingerprint_for_successor_file_change() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        let database_path = temp.path().join("activation-file-parent.sqlite");
+        let storage = SqliteStorage::open(database_path.clone()).unwrap();
+        let stale_manifest = vec![fingerprint(
+            &root.to_string_lossy(),
+            None,
+            &root.to_string_lossy(),
+            1,
+        )];
+        let initial_baseline_id = storage.save_completed_index_batch(1, &[]).unwrap();
+        storage
+            .activate_baseline_with_manifest_and_clear_incremental_state(
+                initial_baseline_id,
+                0,
+                &stale_manifest,
+            )
+            .unwrap();
+
+        let created = root.join("created.txt");
+        fs::write(&created, "created after snapshot").unwrap();
+        storage
+            .commit_incremental_batch(
+                &CommittedIndexDelta {
+                    generation: 1,
+                    upserts: vec![IndexedEntry::from_path_metadata(
+                        &created,
+                        &root,
+                        IndexedEntryKind::File,
+                    )],
+                    removals: Vec::new(),
+                },
+                &[fingerprint(
+                    &root.to_string_lossy(),
+                    None,
+                    &root.to_string_lossy(),
+                    99,
+                )],
+                &[],
+            )
+            .unwrap();
+        let baseline_id = storage.save_completed_index_batch(2, &[]).unwrap();
+
+        storage
+            .activate_baseline_with_manifest_and_clear_incremental_state(
+                baseline_id,
+                0,
+                &stale_manifest,
+            )
+            .unwrap();
+        drop(storage);
+
+        let reopened = SqliteStorage::open(database_path).unwrap();
+        let manifest = reopened.directory_manifest_for_root(&root).unwrap();
+        assert_eq!(manifest.len(), 1);
+        assert_eq!(manifest[0].modified_ms, Some(99));
+        assert_eq!(reopened.committed_index_deltas_after(0).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn activation_preserves_committed_parent_fingerprint_for_file_delete_and_rename() {
+        for (case, upsert_name, removals, expected_modified) in [
+            ("delete", None, vec!["old.txt"], 101),
+            ("rename", Some("new.txt"), vec!["old.txt"], 102),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("root");
+            fs::create_dir_all(&root).unwrap();
+            let old = root.join("old.txt");
+            fs::write(&old, "old").unwrap();
+            let database_path = temp.path().join(format!("activation-file-{case}.sqlite"));
+            let storage = SqliteStorage::open(database_path.clone()).unwrap();
+            let old_entry = IndexedEntry::from_path_metadata(&old, &root, IndexedEntryKind::File);
+            let stale_manifest = vec![fingerprint(
+                &root.to_string_lossy(),
+                None,
+                &root.to_string_lossy(),
+                1,
+            )];
+            let initial_baseline_id = storage
+                .save_completed_index_batch(1, std::slice::from_ref(&old_entry))
+                .unwrap();
+            storage
+                .activate_baseline_with_manifest_and_clear_incremental_state(
+                    initial_baseline_id,
+                    0,
+                    &stale_manifest,
+                )
+                .unwrap();
+            fs::remove_file(&old).unwrap();
+            let upserts = upsert_name
+                .map(|name| {
+                    let path = root.join(name);
+                    fs::write(&path, "new").unwrap();
+                    vec![IndexedEntry::from_path_metadata(
+                        &path,
+                        &root,
+                        IndexedEntryKind::File,
+                    )]
+                })
+                .unwrap_or_default();
+            storage
+                .commit_incremental_batch(
+                    &CommittedIndexDelta {
+                        generation: 1,
+                        upserts,
+                        removals: removals.iter().map(|name| root.join(name)).collect(),
+                    },
+                    &[fingerprint(
+                        &root.to_string_lossy(),
+                        None,
+                        &root.to_string_lossy(),
+                        expected_modified,
+                    )],
+                    &[],
+                )
+                .unwrap();
+            let baseline_id = storage
+                .save_completed_index_batch(2, std::slice::from_ref(&old_entry))
+                .unwrap();
+            storage
+                .activate_baseline_with_manifest_and_clear_incremental_state(
+                    baseline_id,
+                    0,
+                    &stale_manifest,
+                )
+                .unwrap();
+            drop(storage);
+
+            let reopened = SqliteStorage::open(database_path).unwrap();
+            let manifest = reopened.directory_manifest_for_root(&root).unwrap();
+            assert_eq!(manifest[0].modified_ms, Some(expected_modified));
+            assert_eq!(reopened.committed_index_deltas_after(0).unwrap().len(), 1);
+        }
     }
 
     #[test]

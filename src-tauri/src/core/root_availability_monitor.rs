@@ -113,34 +113,49 @@ pub fn spawn_root_availability_monitor(
 pub fn spawn_root_availability_monitor_with(
     spawner: &dyn RootMonitorSpawner,
     interval: Duration,
+    probe: impl FnMut() -> Result<bool, String> + Send + 'static,
+    on_ready: impl FnOnce() -> Result<(), String> + Send + 'static,
+) -> Result<RootAvailabilityMonitorHandle, String> {
+    spawn_root_availability_monitor_with_completion(spawner, interval, probe, on_ready, |_| {})
+}
+
+pub fn spawn_root_availability_monitor_with_completion(
+    spawner: &dyn RootMonitorSpawner,
+    interval: Duration,
     mut probe: impl FnMut() -> Result<bool, String> + Send + 'static,
     on_ready: impl FnOnce() -> Result<(), String> + Send + 'static,
+    on_exit: impl FnOnce(&MonitorExit) + Send + 'static,
 ) -> Result<RootAvailabilityMonitorHandle, String> {
     let cancellation = Arc::new(MonitorCancellation::default());
     let worker_cancellation = Arc::clone(&cancellation);
     let join = spawner.spawn(Box::new(move || {
-        let mut on_ready = Some(on_ready);
-        loop {
-            if worker_cancellation.is_cancelled() {
-                return MonitorExit::Cancelled;
-            }
-            match probe() {
-                Ok(true) => {
-                    return match on_ready
-                        .take()
-                        .expect("root monitor ready callback missing")(
-                    ) {
-                        Ok(()) => MonitorExit::Ready,
-                        Err(error) => MonitorExit::DispatchFailed(error),
-                    };
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut on_ready = Some(on_ready);
+            loop {
+                if worker_cancellation.is_cancelled() {
+                    return MonitorExit::Cancelled;
                 }
-                Ok(false) => {}
-                Err(error) => return MonitorExit::ProbeFailed(error),
+                match probe() {
+                    Ok(true) => {
+                        return match on_ready
+                            .take()
+                            .expect("root monitor ready callback missing")(
+                        ) {
+                            Ok(()) => MonitorExit::Ready,
+                            Err(error) => MonitorExit::DispatchFailed(error),
+                        };
+                    }
+                    Ok(false) => {}
+                    Err(error) => return MonitorExit::ProbeFailed(error),
+                }
+                if worker_cancellation.wait(interval) {
+                    return MonitorExit::Cancelled;
+                }
             }
-            if worker_cancellation.wait(interval) {
-                return MonitorExit::Cancelled;
-            }
-        }
+        }))
+        .unwrap_or(MonitorExit::ThreadPanicked);
+        on_exit(&outcome);
+        outcome
     }))?;
     Ok(RootAvailabilityMonitorHandle {
         cancellation,
@@ -207,6 +222,44 @@ mod tests {
         assert_eq!(
             dispatch_failure.join(),
             MonitorExit::DispatchFailed("dispatch failed".to_owned())
+        );
+    }
+
+    #[test]
+    fn completion_observer_receives_probe_failure_and_worker_panic() {
+        let probe_exit = Arc::new(Mutex::new(None));
+        let observed_probe_exit = Arc::clone(&probe_exit);
+        let mut probe_failure = spawn_root_availability_monitor_with_completion(
+            &SystemRootMonitorSpawner,
+            Duration::from_secs(60),
+            || Err("probe failed".to_owned()),
+            || Ok(()),
+            move |outcome| *observed_probe_exit.lock().unwrap() = Some(outcome.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            probe_failure.join(),
+            MonitorExit::ProbeFailed("probe failed".to_owned())
+        );
+        assert_eq!(
+            *probe_exit.lock().unwrap(),
+            Some(MonitorExit::ProbeFailed("probe failed".to_owned()))
+        );
+
+        let panic_exit = Arc::new(Mutex::new(None));
+        let observed_panic_exit = Arc::clone(&panic_exit);
+        let mut panicked = spawn_root_availability_monitor_with_completion(
+            &SystemRootMonitorSpawner,
+            Duration::from_secs(60),
+            || -> Result<bool, String> { panic!("injected probe panic") },
+            || Ok(()),
+            move |outcome| *observed_panic_exit.lock().unwrap() = Some(outcome.clone()),
+        )
+        .unwrap();
+        assert_eq!(panicked.join(), MonitorExit::ThreadPanicked);
+        assert_eq!(
+            *panic_exit.lock().unwrap(),
+            Some(MonitorExit::ThreadPanicked)
         );
     }
 

@@ -282,6 +282,7 @@ impl From<toml::ser::Error> for ConfigError {
     }
 }
 
+#[derive(Clone)]
 pub struct ConfigStore {
     path: PathBuf,
 }
