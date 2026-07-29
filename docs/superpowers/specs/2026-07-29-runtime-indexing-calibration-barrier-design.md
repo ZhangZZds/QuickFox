@@ -75,13 +75,24 @@ Windows ReadDirectoryChanges 都等待 backend command reply。macOS FSEvents �
 不足以保证紧随其后的 mutation 可见，因此在所有用户 roots 注册后，最后向同一个原生
 watcher 注册应用私有临时目录；只在该目录循环写 registration probe，直到同一 callback
 实际观察到 probe event 才返回。probe 不写入用户 root，并与 watcher 同生命周期回收。
+probe 目录必须由 `tempfile::Builder` 原子随机创建并持有 `TempDir` ownership，禁止使用可预测
+名称配合手工递归删除，避免预置 symlink 把清理重定向到非 QuickFox 目录。
 升级 notify 时必须重新审计三个平台的同 stream 契约。可观察 ack 后仍执行权威 calibration
 并 drain inbox；测试在 `watch_roots` 返回后的下一条语句制造 mutation，不使用固定 sleep。
 
 ContentIndex 不再复用并删除共享 `content-v1` 目录。每次 build 写入独立版本目录，
 SearchIndex 原子发布新版本；旧 ContentIndex 的最后一个 reader 释放后，由目录 lease 回收
 旧版本。启动恢复只安装 name/path view 并把 content 标记为未构建，setup-return gate 释放后
-由后台 worker 构建并原子安装正文索引。
+由后台 worker 构建并原子安装正文索引。版本目录同样由随机 `TempDir` 创建，带 QuickFox
+marker，并登记到进程内 active registry；lease 还必须持有 marker 的跨进程文件锁，GC 只有在
+非阻塞取得该锁后才可回收，避免第二个 QuickFox 进程删除仍在使用的版本。每次 build 和启动
+worker 只回收不在 registry 中、名称和真实普通 marker 文件都匹配的 crash orphan，不处理
+symlink、未标记目录或其他文件。正文索引成功安装后发布一次 `quickfox://index-status`，让当前
+查询自动重跑；superseded build 不发布。
+
+正文查询的语法错误与 reader/search I/O 错误使用结构化错误边界。前者返回可操作的非法查询
+feedback；后者返回内容索引不可用 feedback，同时把 runtime 标记为 degraded 并发布状态，
+不得把任何错误折叠成空结果。
 
 ## 被拒绝的方案
 

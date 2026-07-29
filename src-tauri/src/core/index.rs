@@ -3,7 +3,8 @@
 use crate::core::actions::Action;
 use crate::core::compact_index::CompactCandidateIndex;
 use crate::core::content_index::{
-    ContentIndex, ContentIndexOptions, ContentPathFilter, ContentSearchHit, PlainTextExtractor,
+    ContentIndex, ContentIndexOptions, ContentPathFilter, ContentSearchError, ContentSearchHit,
+    PlainTextExtractor,
 };
 use crate::core::file_matcher::FileMatcher;
 use crate::core::file_query::FileQuery;
@@ -505,7 +506,11 @@ impl SearchIndex {
         if is_cancelled() {
             return None;
         }
-        let content_hits = self.search_content_hits(&parsed_query, Some(candidate_paths), limit);
+        let content_hits =
+            match self.search_content_hits(&parsed_query, Some(candidate_paths), limit) {
+                Ok(hits) => hits,
+                Err(error) => return Some(vec![content_search_error_feedback(error)]),
+            };
         let hit_by_path: HashMap<_, _> = content_hits
             .into_iter()
             .map(|hit| (hit.path.clone(), hit))
@@ -563,7 +568,10 @@ impl SearchIndex {
                 }
             }
         };
-        let hits = self.search_content_hits_with_filter(query, path_filter, limit);
+        let hits = match self.search_content_hits_with_filter(query, path_filter, limit) {
+            Ok(hits) => hits,
+            Err(error) => return vec![content_search_error_feedback(error)],
+        };
         let mut results: Vec<_> = hits
             .into_iter()
             .filter_map(|hit| {
@@ -598,14 +606,12 @@ impl SearchIndex {
         query: &FileQuery,
         candidate_paths: Option<Arc<HashSet<String>>>,
         limit: usize,
-    ) -> Vec<ContentSearchHit> {
+    ) -> Result<Vec<ContentSearchHit>, ContentSearchError> {
         let Some(content_index) = &self.content_index else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let content_query = query.content_queries.join(" ");
-        content_index
-            .search_with_candidate_paths(&content_query, candidate_paths, limit)
-            .unwrap_or_default()
+        content_index.search_with_candidate_paths(&content_query, candidate_paths, limit)
     }
 
     fn search_content_hits_with_filter(
@@ -613,14 +619,12 @@ impl SearchIndex {
         query: &FileQuery,
         path_filter: Option<ContentPathFilter>,
         limit: usize,
-    ) -> Vec<ContentSearchHit> {
+    ) -> Result<Vec<ContentSearchHit>, ContentSearchError> {
         let Some(content_index) = &self.content_index else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let content_query = query.content_queries.join(" ");
-        content_index
-            .search_with_path_filter(&content_query, path_filter, limit)
-            .unwrap_or_default()
+        content_index.search_with_path_filter(&content_query, path_filter, limit)
     }
 
     fn search_regex(
@@ -675,6 +679,32 @@ impl FileSearchIndex for SearchIndex {
 
 fn content_score(hit: &ContentSearchHit) -> i64 {
     (hit.score * 1_000.0).round() as i64
+}
+
+fn content_search_error_feedback(error: ContentSearchError) -> SearchResult {
+    eprintln!("QuickFox content query failed: {}", error.log_category());
+    let (id, title, detail) = match error {
+        ContentSearchError::InvalidQuery(_) => (
+            "feedback:invalid-content-query",
+            "无效内容查询",
+            "请检查 content: 查询语法。",
+        ),
+        ContentSearchError::Unavailable(_) => (
+            "feedback:content-query-failed",
+            "内容索引查询失败",
+            "内容索引暂不可用；文件名和路径搜索仍可使用。",
+        ),
+    };
+    SearchResult::new(
+        id,
+        title,
+        SearchResultKind::Feedback,
+        Action::CopyText {
+            text: detail.to_owned(),
+        },
+    )
+    .with_detail(detail.to_owned())
+    .with_score(100)
 }
 
 fn searchable_text(entry: &IndexedEntry) -> String {
@@ -1417,6 +1447,57 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].kind, SearchResultKind::Feedback);
         assert!(results[0].title.contains("内容索引"));
+    }
+
+    #[test]
+    fn invalid_content_query_returns_feedback_instead_of_empty_results() {
+        let root = temp_dir("invalid-content-query");
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("notes.md");
+        fs::write(&file, "needle").unwrap();
+        let mut entries = vec![file_entry(&file.to_string_lossy())];
+        let content_index = ContentIndex::build(
+            &mut entries,
+            ContentIndexOptions {
+                index_dir: root.join("tantivy"),
+                max_file_bytes: DEFAULT_MAX_CONTENT_BYTES,
+            },
+        )
+        .unwrap();
+        let index = SearchIndex::from_entries_with_content_index(entries, content_index);
+        let parser = crate::core::search::QueryParser::new(Default::default());
+
+        let results = index.search(&parser.parse("content:("));
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "feedback:invalid-content-query");
+        assert_eq!(results[0].kind, SearchResultKind::Feedback);
+    }
+
+    #[test]
+    fn unavailable_content_reader_returns_feedback_instead_of_empty_results() {
+        let root = temp_dir("unavailable-content-reader");
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("notes.md");
+        fs::write(&file, "needle").unwrap();
+        let mut entries = vec![file_entry(&file.to_string_lossy())];
+        let content_index = ContentIndex::build(
+            &mut entries,
+            ContentIndexOptions {
+                index_dir: root.join("tantivy"),
+                max_file_bytes: DEFAULT_MAX_CONTENT_BYTES,
+            },
+        )
+        .unwrap();
+        content_index.remove_directory_for_test();
+        let index = SearchIndex::from_entries_with_content_index(entries, content_index);
+        let parser = crate::core::search::QueryParser::new(Default::default());
+
+        let results = index.search(&parser.parse("content:needle"));
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "feedback:content-query-failed");
+        assert_eq!(results[0].kind, SearchResultKind::Feedback);
     }
 
     #[test]

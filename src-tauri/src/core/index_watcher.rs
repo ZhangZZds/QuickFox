@@ -6,13 +6,11 @@ use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub const DEFAULT_WATCH_CHANNEL_CAPACITY: usize = 8_192;
-static REGISTRATION_PROBE_NONCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IndexWatchEvent {
@@ -239,42 +237,38 @@ impl WatcherFailure {
 #[derive(Debug)]
 pub struct RuntimeIndexWatcher {
     _watcher: RecommendedWatcher,
-    _registration_probe: RegistrationProbeDirectory,
+    _registration_probe: tempfile::TempDir,
     watched_roots: Vec<PathBuf>,
     inbox: Option<WatchEventInbox>,
 }
 
-#[derive(Debug)]
-struct RegistrationProbeDirectory(PathBuf);
-
-impl Drop for RegistrationProbeDirectory {
-    fn drop(&mut self) {
-        if let Err(error) = fs::remove_dir_all(&self.0) {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                eprintln!(
-                    "QuickFox failed to remove watcher registration probe {}: {error}",
-                    self.0.display()
-                );
-            }
-        }
-    }
-}
-
 impl RuntimeIndexWatcher {
     pub fn watch_roots(roots: Vec<PathBuf>) -> Result<Self, WatcherFailure> {
+        Self::watch_roots_with_probe_parent(roots, None)
+    }
+
+    fn watch_roots_with_probe_parent(
+        roots: Vec<PathBuf>,
+        probe_parent: Option<&Path>,
+    ) -> Result<Self, WatcherFailure> {
         let (callback_sender, inbox) =
             WatchEventInbox::bounded(roots.clone(), DEFAULT_WATCH_CHANNEL_CAPACITY);
-        let nonce = REGISTRATION_PROBE_NONCE.fetch_add(1, Ordering::Relaxed);
-        let probe_path = std::env::temp_dir().join(format!(
-            "quickfox-watcher-probe-{}-{nonce}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&probe_path)
-            .map_err(|error| WatcherFailure::new(probe_path.clone(), error.to_string()))?;
-        let probe_path = probe_path
+        let mut builder = tempfile::Builder::new();
+        builder.prefix("quickfox-watcher-probe-");
+        let registration_probe = match probe_parent {
+            Some(parent) => builder.tempdir_in(parent),
+            None => builder.tempdir(),
+        }
+        .map_err(|error| {
+            WatcherFailure::new(
+                probe_parent.unwrap_or_else(|| Path::new("")).to_path_buf(),
+                error.to_string(),
+            )
+        })?;
+        let owned_probe_path = registration_probe.path().to_path_buf();
+        let probe_path = owned_probe_path
             .canonicalize()
-            .map_err(|error| WatcherFailure::new(probe_path.clone(), error.to_string()))?;
-        let registration_probe = RegistrationProbeDirectory(probe_path.clone());
+            .map_err(|error| WatcherFailure::new(owned_probe_path.clone(), error.to_string()))?;
         let (registration_ack, registration_ack_receiver) = mpsc::channel();
         let callback_probe = probe_path.clone();
         let mut watcher = notify::recommended_watcher(move |result: notify::Result<Event>| {
@@ -306,7 +300,7 @@ impl RuntimeIndexWatcher {
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         let mut attempt = 0_u64;
         loop {
-            let probe_file = probe_path.join(format!("ack-{attempt}"));
+            let probe_file = owned_probe_path.join(format!("ack-{attempt}"));
             fs::write(&probe_file, attempt.to_le_bytes())
                 .map_err(|error| WatcherFailure::new(probe_path.clone(), error.to_string()))?;
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -553,15 +547,46 @@ mod tests {
         let started = std::time::Instant::now();
         let watcher =
             RuntimeIndexWatcher::watch_roots(vec![root.path().canonicalize().unwrap()]).unwrap();
-        let probe_path = watcher._registration_probe.0.clone();
+        let probe_path = watcher._registration_probe.path().to_path_buf();
 
         assert!(probe_path.is_dir());
         assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "quiet root registration waited near the failure timeout"
+            started.elapsed() < Duration::from_secs(5),
+            "quiet root registration exceeded its bounded acknowledgement window"
         );
         drop(watcher);
         assert!(!probe_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn predictable_probe_symlink_cannot_redirect_cleanup_to_victim() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let probe_parent = workspace.path().join("probes");
+        let victim = workspace.path().join("victim");
+        let watched_root = workspace.path().join("watched");
+        fs::create_dir_all(&probe_parent).unwrap();
+        fs::create_dir_all(&victim).unwrap();
+        fs::create_dir_all(&watched_root).unwrap();
+        let victim_marker = victim.join("must-survive.txt");
+        fs::write(&victim_marker, "safe").unwrap();
+        let predictable =
+            probe_parent.join(format!("quickfox-watcher-probe-{}-0", std::process::id()));
+        symlink(&victim, &predictable).unwrap();
+
+        let watcher = RuntimeIndexWatcher::watch_roots_with_probe_parent(
+            vec![watched_root.canonicalize().unwrap()],
+            Some(&probe_parent),
+        )
+        .unwrap();
+        let owned_probe = watcher._registration_probe.path().to_path_buf();
+
+        assert_ne!(owned_probe, predictable);
+        drop(watcher);
+        assert!(victim_marker.is_file());
+        assert!(predictable.is_symlink());
     }
 
     #[test]

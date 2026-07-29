@@ -292,17 +292,51 @@ struct GlobalHotkeyStatus {
 }
 
 #[tauri::command]
-fn search(state: tauri::State<QuickFoxAppState>, query: String) -> Vec<SearchResult> {
-    let runtime = state
-        .runtime
-        .lock()
-        .expect("quickfox runtime lock poisoned");
-    perform_search_with_index_status(
-        &runtime.config,
-        &runtime.index,
-        &runtime.index_status(),
-        &query,
-    )
+fn search(
+    app: tauri::AppHandle,
+    state: tauri::State<QuickFoxAppState>,
+    query: String,
+) -> Vec<SearchResult> {
+    let (results, failure_status) = {
+        let mut runtime = state
+            .runtime
+            .lock()
+            .expect("quickfox runtime lock poisoned");
+        let results = perform_search_with_index_status(
+            &runtime.config,
+            &runtime.index,
+            &runtime.index_status(),
+            &query,
+        );
+        let failure_status = apply_content_query_failure_status(&mut runtime, &results);
+        (results, failure_status)
+    };
+    if let Some(status) = failure_status {
+        let _ = app.emit("quickfox://index-status", status);
+    }
+    results
+}
+
+fn apply_content_query_failure_status(
+    runtime: &mut QuickFoxRuntime,
+    results: &[SearchResult],
+) -> Option<IndexStatus> {
+    if !results
+        .iter()
+        .any(|result| result.id == "feedback:content-query-failed")
+    {
+        return None;
+    }
+    if runtime.incremental_status.state == IncrementalState::Degraded
+        && runtime.incremental_status.degradation_code
+            == Some(IndexDegradationCode::FullRefreshFallback)
+    {
+        return None;
+    }
+    runtime.incremental_status.enabled = runtime.config.index.watcher_enabled;
+    runtime.incremental_status.state = IncrementalState::Degraded;
+    runtime.incremental_status.degradation_code = Some(IndexDegradationCode::FullRefreshFallback);
+    Some(runtime.index_status())
 }
 
 #[tauri::command]
@@ -1741,7 +1775,15 @@ fn schedule_startup_indexing_in_setup<R: tauri::Runtime>(
     let worker_app = app;
     schedule_startup_indexing_with(spawner, gate, move || {
         let state = worker_app.state::<QuickFoxAppState>();
-        if let Err(error) = rebuild_recovered_content_index(&state) {
+        let content_index_dir = {
+            let runtime = state
+                .runtime
+                .lock()
+                .expect("quickfox runtime lock poisoned");
+            content_index_options(&runtime.config).index_dir
+        };
+        ContentIndex::reclaim_orphaned_builds(&content_index_dir);
+        if let Err(error) = rebuild_recovered_content_index_and_publish(&worker_app, &state) {
             record_startup_content_rebuild_failure(&worker_app, &error);
         }
         let enabled = state
@@ -1778,9 +1820,9 @@ fn record_startup_scheduling_failure<R: tauri::Runtime>(app: &tauri::AppHandle<R
 
 fn record_startup_content_rebuild_failure<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
-    error: &str,
+    _error: &str,
 ) {
-    eprintln!("QuickFox startup content index rebuild failed: {error}");
+    eprintln!("QuickFox startup content index rebuild failed");
     let state = app.state::<QuickFoxAppState>();
     let status = {
         let mut runtime = state
@@ -4563,10 +4605,42 @@ fn build_runtime_from_recovery(
     }
 }
 
+#[cfg(test)]
 fn rebuild_recovered_content_index(state: &QuickFoxAppState) -> Result<bool, String> {
     rebuild_recovered_content_index_with(state, |config, entries| {
         build_search_index_with_content_for_config(config, entries)
     })
+}
+
+fn rebuild_recovered_content_index_and_publish<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    state: &QuickFoxAppState,
+) -> Result<bool, String> {
+    rebuild_recovered_content_index_with_publisher(
+        state,
+        build_search_index_with_content_for_config,
+        |status| {
+            app.emit("quickfox://index-status", status)
+                .map_err(|error| error.to_string())
+        },
+    )
+}
+
+fn rebuild_recovered_content_index_with_publisher(
+    state: &QuickFoxAppState,
+    builder: impl FnOnce(&QuickFoxConfig, Vec<IndexedEntry>) -> Result<SearchIndex, String>,
+    publisher: impl FnOnce(IndexStatus) -> Result<(), String>,
+) -> Result<bool, String> {
+    let installed = rebuild_recovered_content_index_with(state, builder)?;
+    if installed {
+        let status = state
+            .runtime
+            .lock()
+            .expect("quickfox runtime lock poisoned")
+            .index_status();
+        publisher(status)?;
+    }
+    Ok(installed)
 }
 
 fn rebuild_recovered_content_index_with(
@@ -6101,6 +6175,62 @@ mod tests {
         let entries = state.runtime.lock().unwrap().index.materialized_entries();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].path, refreshed_file.to_string_lossy());
+    }
+
+    #[test]
+    fn startup_content_publish_emits_once_only_for_installed_view() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("content.txt");
+        fs::write(&file, "content").unwrap();
+        let mut config =
+            QuickFoxConfig::default_with_index_dirs(vec![root.to_string_lossy().into_owned()]);
+        config.index.content_include_dirs = vec![root.to_string_lossy().into_owned()];
+        let app = tauri::test::mock_app();
+        app.manage(QuickFoxAppState {
+            runtime: Mutex::new(build_runtime_from_snapshot(
+                config,
+                Some(crate::core::storage::IndexSnapshot {
+                    completed_at_ms: 1,
+                    needs_full_refresh: false,
+                    entries: vec![IndexedEntry::from_path_metadata(
+                        &file,
+                        &root,
+                        IndexedEntryKind::File,
+                    )],
+                }),
+            )),
+            index_refresh_fence: Mutex::new(()),
+            window_state: Mutex::new(LauncherWindowState::default()),
+            global_hotkey_status: Mutex::new(pending_global_hotkey_status()),
+        });
+        let state = app.state::<QuickFoxAppState>();
+        let published = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let published_from_event = Arc::clone(&published);
+        tauri::Listener::listen(app.handle(), "quickfox://index-status", move |_| {
+            published_from_event.fetch_add(1, Ordering::Relaxed);
+        });
+
+        assert_eq!(
+            rebuild_recovered_content_index_and_publish(app.handle(), &state),
+            Ok(true)
+        );
+        assert_eq!(published.load(Ordering::Relaxed), 1);
+
+        {
+            let mut runtime = state.runtime.lock().unwrap();
+            runtime.index_refresh.active = Some(IndexRefreshIdentity {
+                lifecycle_generation: 1,
+                config_revision: runtime.index_refresh.config_revision,
+                config_fingerprint: runtime.index_refresh.config_fingerprint.clone(),
+            });
+        }
+        assert_eq!(
+            rebuild_recovered_content_index_and_publish(app.handle(), &state),
+            Ok(false)
+        );
+        assert_eq!(published.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -9486,6 +9616,65 @@ mod tests {
         let results = perform_search(&config, &index, "");
 
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn content_reader_failure_degrades_runtime_but_invalid_query_does_not() {
+        let config = QuickFoxConfig::default_with_index_dirs(vec!["/tmp".to_owned()]);
+        let mut runtime = build_runtime_from_snapshot(config, None);
+        let initial_pending = runtime.index_refresh.pending;
+        let initial_recovery_revision = runtime.index_refresh.restart_recovery_revision;
+        let app = tauri::test::mock_app();
+        let published = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let published_from_event = Arc::clone(&published);
+        tauri::Listener::listen(app.handle(), "quickfox://index-status", move |_| {
+            published_from_event.fetch_add(1, Ordering::Relaxed);
+        });
+        let invalid = SearchResult::new(
+            "feedback:invalid-content-query",
+            "无效内容查询",
+            crate::core::search::SearchResultKind::Feedback,
+            Action::CopyText {
+                text: "invalid".to_owned(),
+            },
+        );
+        assert!(apply_content_query_failure_status(&mut runtime, &[invalid]).is_none());
+        assert_ne!(runtime.incremental_status.state, IncrementalState::Degraded);
+
+        let unavailable = SearchResult::new(
+            "feedback:content-query-failed",
+            "内容索引查询失败",
+            crate::core::search::SearchResultKind::Feedback,
+            Action::CopyText {
+                text: "unavailable".to_owned(),
+            },
+        );
+        let status = apply_content_query_failure_status(&mut runtime, &[unavailable]).unwrap();
+        app.emit("quickfox://index-status", status.clone()).unwrap();
+        let repeated = SearchResult::new(
+            "feedback:content-query-failed",
+            "内容索引查询失败",
+            crate::core::search::SearchResultKind::Feedback,
+            Action::CopyText {
+                text: "unavailable".to_owned(),
+            },
+        );
+        if let Some(status) = apply_content_query_failure_status(&mut runtime, &[repeated]) {
+            app.emit("quickfox://index-status", status).unwrap();
+        }
+
+        assert_eq!(runtime.incremental_status.state, IncrementalState::Degraded);
+        assert_eq!(
+            runtime.incremental_status.degradation_code,
+            Some(IndexDegradationCode::FullRefreshFallback)
+        );
+        assert_eq!(status.incremental.state, IncrementalState::Degraded);
+        assert_eq!(published.load(Ordering::Relaxed), 1);
+        assert_eq!(runtime.index_refresh.pending, initial_pending);
+        assert_eq!(
+            runtime.index_refresh.restart_recovery_revision,
+            initial_recovery_revision
+        );
     }
 
     #[test]

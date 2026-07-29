@@ -5,12 +5,12 @@ use crate::core::search::SearchSnippet;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 #[cfg(test)]
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tantivy::collector::{BytesFilterCollector, TopDocs};
 use tantivy::query::QueryParser;
 use tantivy::schema::{Field, Schema, Value, FAST, STORED, STRING, TEXT};
@@ -18,12 +18,31 @@ use tantivy::{doc, Index, IndexWriter, TantivyDocument, Term};
 
 pub const DEFAULT_MAX_CONTENT_BYTES: u64 = 2 * 1024 * 1024;
 pub const CONTENT_INDEX_DIR_VERSION: &str = "content-v1";
-static CONTENT_BUILD_NONCE: AtomicU64 = AtomicU64::new(0);
+const CONTENT_BUILD_PREFIX: &str = "build-";
+const CONTENT_BUILD_MARKER: &str = ".quickfox-content-index-build";
+const CONTENT_BUILD_MARKER_CONTENT: &[u8] = b"quickfox-content-index-v1\n";
+static ACTIVE_CONTENT_BUILD_DIRS: OnceLock<std::sync::Mutex<HashSet<PathBuf>>> = OnceLock::new();
 
 type ContentResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+pub(crate) type ContentSearchResult<T> = Result<T, ContentSearchError>;
 pub(crate) type ContentPathFilter = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 const PATH_FILTER_FIELD_NAME: &str = "path_filter";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ContentSearchError {
+    InvalidQuery(String),
+    Unavailable(String),
+}
+
+impl ContentSearchError {
+    pub(crate) fn log_category(&self) -> &'static str {
+        match self {
+            Self::InvalidQuery(_) => "invalid query syntax",
+            Self::Unavailable(_) => "content index unavailable",
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContentIndexOptions {
@@ -57,16 +76,97 @@ pub struct ContentIndex {
 #[derive(Debug)]
 struct ContentIndexDirectoryLease {
     path: PathBuf,
+    marker_lock: Option<fs::File>,
+    directory: Option<tempfile::TempDir>,
 }
 
 impl Drop for ContentIndexDirectoryLease {
     fn drop(&mut self) {
-        if let Err(error) = fs::remove_dir_all(&self.path) {
-            if error.kind() != std::io::ErrorKind::NotFound {
+        let mut active = active_content_build_dirs()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        active.remove(&self.path);
+        if let Some(marker_lock) = self.marker_lock.take() {
+            let _ = marker_lock.unlock();
+            drop(marker_lock);
+        }
+        if let Some(directory) = self.directory.take() {
+            if let Err(error) = directory.close() {
                 eprintln!(
-                    "QuickFox failed to reclaim content index version {}: {error}",
-                    self.path.display()
+                    "QuickFox failed to reclaim a content index version: {:?}",
+                    error.kind()
                 );
+            }
+        }
+    }
+}
+
+fn active_content_build_dirs() -> &'static std::sync::Mutex<HashSet<PathBuf>> {
+    ACTIVE_CONTENT_BUILD_DIRS.get_or_init(|| std::sync::Mutex::new(HashSet::new()))
+}
+
+fn reclaim_inactive_content_build_dirs(version_root: &Path, active: &HashSet<PathBuf>) {
+    let entries = match fs::read_dir(version_root) {
+        Ok(entries) => entries,
+        Err(error) => {
+            eprintln!(
+                "QuickFox failed to inspect content index versions: {:?}",
+                error.kind()
+            );
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_managed_name = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(CONTENT_BUILD_PREFIX));
+        if !is_managed_name {
+            continue;
+        }
+        let is_real_directory = entry
+            .file_type()
+            .is_ok_and(|file_type| file_type.is_dir() && !file_type.is_symlink());
+        if !is_real_directory || active.contains(&path) {
+            continue;
+        }
+        let marker = path.join(CONTENT_BUILD_MARKER);
+        let is_real_marker = fs::symlink_metadata(&marker).is_ok_and(|metadata| {
+            metadata.file_type().is_file() && !metadata.file_type().is_symlink()
+        });
+        if !is_real_marker {
+            continue;
+        }
+        let mut marker = match fs::OpenOptions::new().read(true).write(true).open(&marker) {
+            Ok(marker) => marker,
+            Err(_) => continue,
+        };
+        match marker.try_lock() {
+            Ok(()) => {}
+            Err(fs::TryLockError::WouldBlock) => continue,
+            Err(fs::TryLockError::Error(error)) => {
+                eprintln!(
+                    "QuickFox failed to lock a content index build marker: {:?}",
+                    error.kind()
+                );
+                continue;
+            }
+        }
+        let mut marker_content = Vec::new();
+        let has_marker = marker
+            .read_to_end(&mut marker_content)
+            .is_ok_and(|_| marker_content == CONTENT_BUILD_MARKER_CONTENT);
+        let _ = marker.unlock();
+        drop(marker);
+        if has_marker {
+            if let Err(error) = fs::remove_dir_all(&path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!(
+                        "QuickFox failed to reclaim an orphaned content index: {:?}",
+                        error.kind()
+                    );
+                }
             }
         }
     }
@@ -139,6 +239,30 @@ impl TextExtractor for PlainTextExtractor {
 }
 
 impl ContentIndex {
+    pub(crate) fn reclaim_orphaned_builds(index_dir: &Path) {
+        let version_root = index_dir.join(CONTENT_INDEX_DIR_VERSION);
+        let is_real_directory = fs::symlink_metadata(&version_root).is_ok_and(|metadata| {
+            metadata.file_type().is_dir() && !metadata.file_type().is_symlink()
+        });
+        if !is_real_directory {
+            return;
+        }
+        let version_root = match version_root.canonicalize() {
+            Ok(path) => path,
+            Err(error) => {
+                eprintln!(
+                    "QuickFox failed to resolve content index versions: {:?}",
+                    error.kind()
+                );
+                return;
+            }
+        };
+        let active = active_content_build_dirs()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reclaim_inactive_content_build_dirs(&version_root, &active);
+    }
+
     pub fn build(
         entries: &mut [IndexedEntry],
         options: ContentIndexOptions,
@@ -153,12 +277,40 @@ impl ContentIndex {
     ) -> ContentResult<Self> {
         let version_root = options.index_dir.join(CONTENT_INDEX_DIR_VERSION);
         fs::create_dir_all(&version_root)?;
-        let nonce = CONTENT_BUILD_NONCE.fetch_add(1, Ordering::Relaxed);
-        let index_dir = version_root.join(format!("build-{}-{nonce}", std::process::id()));
-        fs::create_dir_all(&index_dir)?;
+        let version_root_metadata = fs::symlink_metadata(&version_root)?;
+        if !version_root_metadata.file_type().is_dir()
+            || version_root_metadata.file_type().is_symlink()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "content index version root is not a real directory",
+            )
+            .into());
+        }
+        let version_root = version_root.canonicalize()?;
+        let mut active = active_content_build_dirs()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reclaim_inactive_content_build_dirs(&version_root, &active);
+        let directory = tempfile::Builder::new()
+            .prefix(CONTENT_BUILD_PREFIX)
+            .tempdir_in(&version_root)?;
+        let mut marker_lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(directory.path().join(CONTENT_BUILD_MARKER))?;
+        marker_lock.lock()?;
+        marker_lock.write_all(CONTENT_BUILD_MARKER_CONTENT)?;
+        marker_lock.flush()?;
+        let index_dir = directory.path().to_path_buf();
+        active.insert(index_dir.clone());
         let directory_lease = Arc::new(ContentIndexDirectoryLease {
             path: index_dir.clone(),
+            marker_lock: Some(marker_lock),
+            directory: Some(directory),
         });
+        drop(active);
 
         let schema = content_schema();
         let path_field = schema.get_field("path")?;
@@ -206,12 +358,13 @@ impl ContentIndex {
         })
     }
 
-    pub fn search(
+    #[cfg(test)]
+    pub(crate) fn search(
         &self,
         content_query: &str,
         candidate_paths: Option<&HashSet<String>>,
         limit: usize,
-    ) -> ContentResult<Vec<ContentSearchHit>> {
+    ) -> ContentSearchResult<Vec<ContentSearchHit>> {
         self.search_with_candidate_paths(
             content_query,
             candidate_paths.map(|paths| Arc::new(paths.clone())),
@@ -224,7 +377,7 @@ impl ContentIndex {
         content_query: &str,
         candidate_paths: Option<Arc<HashSet<String>>>,
         limit: usize,
-    ) -> ContentResult<Vec<ContentSearchHit>> {
+    ) -> ContentSearchResult<Vec<ContentSearchHit>> {
         let path_filter = candidate_paths
             .map(|paths| Arc::new(move |path: &str| paths.contains(path)) as ContentPathFilter);
         self.search_with_path_filter(content_query, path_filter, limit)
@@ -235,15 +388,20 @@ impl ContentIndex {
         content_query: &str,
         path_filter: Option<ContentPathFilter>,
         limit: usize,
-    ) -> ContentResult<Vec<ContentSearchHit>> {
+    ) -> ContentSearchResult<Vec<ContentSearchHit>> {
         if limit == 0 || content_query.trim().is_empty() {
             return Ok(Vec::new());
         }
 
-        let reader = self.index.reader()?;
+        let reader = self
+            .index
+            .reader()
+            .map_err(|error| ContentSearchError::Unavailable(error.to_string()))?;
         let searcher = reader.searcher();
         let parser = QueryParser::for_index(&self.index, vec![self.content_field]);
-        let query = parser.parse_query(content_query)?;
+        let query = parser
+            .parse_query(content_query)
+            .map_err(|error| ContentSearchError::InvalidQuery(error.to_string()))?;
         let tantivy_limit = limit.saturating_mul(4).clamp(10, 10_000);
         #[cfg(test)]
         self.last_collector_limit
@@ -256,14 +414,20 @@ impl ContentIndex {
                 },
                 TopDocs::with_limit(tantivy_limit).order_by_score(),
             );
-            searcher.search(&query, &collector)?
+            searcher
+                .search(&query, &collector)
+                .map_err(|error| ContentSearchError::Unavailable(error.to_string()))?
         } else {
-            searcher.search(&query, &TopDocs::with_limit(tantivy_limit).order_by_score())?
+            searcher
+                .search(&query, &TopDocs::with_limit(tantivy_limit).order_by_score())
+                .map_err(|error| ContentSearchError::Unavailable(error.to_string()))?
         };
         let mut hits = Vec::new();
 
         for (score, address) in top_docs {
-            let doc = searcher.doc::<TantivyDocument>(address)?;
+            let doc = searcher
+                .doc::<TantivyDocument>(address)
+                .map_err(|error| ContentSearchError::Unavailable(error.to_string()))?;
             let Some(path) = doc
                 .get_first(self.path_field)
                 .and_then(|value| value.as_str())
@@ -295,6 +459,11 @@ impl ContentIndex {
         }
 
         Ok(hits)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remove_directory_for_test(&self) {
+        let _ = fs::remove_dir_all(&self._directory_lease.path);
     }
 
     pub fn remove_path(&mut self, path: impl AsRef<Path>) -> ContentResult<()> {
@@ -528,6 +697,52 @@ mod tests {
     }
 
     #[test]
+    fn external_process_gc_cannot_remove_a_locked_live_build() {
+        const CHILD_VERSION_ROOT: &str = "QUICKFOX_TEST_EXTERNAL_GC_VERSION_ROOT";
+        if let Some(version_root) = std::env::var_os(CHILD_VERSION_ROOT) {
+            let version_root = PathBuf::from(version_root);
+            reclaim_inactive_content_build_dirs(&version_root, &HashSet::new());
+            assert_eq!(fs::read_dir(version_root).unwrap().count(), 1);
+            return;
+        }
+
+        let workspace = tempfile::tempdir().unwrap();
+        let base = workspace.path().join("content-base");
+        let file = workspace.path().join("live.txt");
+        fs::write(&file, "live content").unwrap();
+        let mut entries = vec![entry(&file)];
+        let index = ContentIndex::build(
+            &mut entries,
+            ContentIndexOptions {
+                index_dir: base.clone(),
+                max_file_bytes: DEFAULT_MAX_CONTENT_BYTES,
+            },
+        )
+        .unwrap();
+        let version_root = base.join(CONTENT_INDEX_DIR_VERSION).canonicalize().unwrap();
+        let live_path = index._directory_lease.path.clone();
+
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "core::content_index::tests::external_process_gc_cannot_remove_a_locked_live_build",
+                "--exact",
+                "--nocapture",
+            ])
+            .env(CHILD_VERSION_ROOT, &version_root)
+            .output()
+            .unwrap();
+
+        assert!(
+            child.status.success(),
+            "external GC process failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
+        );
+        assert!(live_path.is_dir());
+        assert_eq!(index.search("content", None, 10).unwrap().len(), 1);
+    }
+
+    #[test]
     fn cloned_reader_keeps_version_directory_leased_until_last_drop() {
         let workspace = tempfile::tempdir().unwrap();
         let base = workspace.path().join("shared-content-base");
@@ -556,6 +771,121 @@ mod tests {
 
         drop(reader);
         assert!(!version.exists());
+    }
+
+    #[test]
+    fn next_build_reclaims_marked_crash_orphan_without_touching_unrelated_entries() {
+        let workspace = tempfile::tempdir().unwrap();
+        let base = workspace.path().join("content-base");
+        let version_root = base.join(CONTENT_INDEX_DIR_VERSION);
+        let orphan = version_root.join(format!("build-{}-0", std::process::id()));
+        let unrelated = version_root.join("user-owned-cache");
+        let unmarked_build = version_root.join("build-not-quickfox");
+        fs::create_dir_all(&orphan).unwrap();
+        fs::write(
+            orphan.join(CONTENT_BUILD_MARKER),
+            CONTENT_BUILD_MARKER_CONTENT,
+        )
+        .unwrap();
+        fs::write(orphan.join("partial-segment"), "crash").unwrap();
+        fs::create_dir_all(&unrelated).unwrap();
+        fs::create_dir_all(&unmarked_build).unwrap();
+        let file = workspace.path().join("live.txt");
+        fs::write(&file, "live content").unwrap();
+        let mut entries = vec![entry(&file)];
+
+        let index = ContentIndex::build(
+            &mut entries,
+            ContentIndexOptions {
+                index_dir: base,
+                max_file_bytes: DEFAULT_MAX_CONTENT_BYTES,
+            },
+        )
+        .unwrap();
+        let live_path = index._directory_lease.path.clone();
+
+        assert!(!orphan.exists());
+        assert!(unrelated.is_dir());
+        assert!(unmarked_build.is_dir());
+        assert!(live_path.is_dir());
+        assert_ne!(live_path, orphan);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn orphan_gc_never_follows_managed_name_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let base = workspace.path().join("content-base");
+        let version_root = base.join(CONTENT_INDEX_DIR_VERSION);
+        let victim = workspace.path().join("victim");
+        fs::create_dir_all(&version_root).unwrap();
+        fs::create_dir_all(&victim).unwrap();
+        let victim_marker = victim.join(CONTENT_BUILD_MARKER);
+        fs::write(&victim_marker, CONTENT_BUILD_MARKER_CONTENT).unwrap();
+        fs::write(victim.join("must-survive"), "safe").unwrap();
+        let malicious = version_root.join("build-malicious-link");
+        symlink(&victim, &malicious).unwrap();
+        let forged = version_root.join("build-forged-marker-link");
+        fs::create_dir_all(&forged).unwrap();
+        fs::write(forged.join("must-survive"), "safe").unwrap();
+        symlink(&victim_marker, forged.join(CONTENT_BUILD_MARKER)).unwrap();
+        let file = workspace.path().join("live.txt");
+        fs::write(&file, "live content").unwrap();
+        let mut entries = vec![entry(&file)];
+
+        let index = ContentIndex::build(
+            &mut entries,
+            ContentIndexOptions {
+                index_dir: base,
+                max_file_bytes: DEFAULT_MAX_CONTENT_BYTES,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(index.search("content", None, 10).unwrap().len(), 1);
+        assert!(victim.join("must-survive").is_file());
+        assert!(malicious.is_symlink());
+        assert!(forged.join("must-survive").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn version_root_symlink_cannot_redirect_orphan_gc() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let base = workspace.path().join("content-base");
+        let victim = workspace.path().join("victim");
+        let victim_build = victim.join("build-forged");
+        fs::create_dir_all(&base).unwrap();
+        fs::create_dir_all(&victim_build).unwrap();
+        fs::write(
+            victim_build.join(CONTENT_BUILD_MARKER),
+            CONTENT_BUILD_MARKER_CONTENT,
+        )
+        .unwrap();
+        let victim_file = victim_build.join("must-survive");
+        fs::write(&victim_file, "safe").unwrap();
+        symlink(&victim, base.join(CONTENT_INDEX_DIR_VERSION)).unwrap();
+
+        ContentIndex::reclaim_orphaned_builds(&base);
+
+        assert!(victim_file.is_file());
+
+        let file = workspace.path().join("live.txt");
+        fs::write(&file, "live content").unwrap();
+        let mut entries = vec![entry(&file)];
+        assert!(ContentIndex::build(
+            &mut entries,
+            ContentIndexOptions {
+                index_dir: base,
+                max_file_bytes: DEFAULT_MAX_CONTENT_BYTES,
+            },
+        )
+        .is_err());
+        assert!(victim_file.is_file());
     }
 
     #[test]
