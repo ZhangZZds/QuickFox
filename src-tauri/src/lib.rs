@@ -446,6 +446,7 @@ fn save_config(
         .clone();
     let config_to_persist = candidate.config.clone();
     let publish_app = app.clone();
+    let recovery_app = app.clone();
     let next_shortcut = transition_runtime_config_revision_with_persist(
         &state,
         candidate,
@@ -471,6 +472,10 @@ fn save_config(
                 .unwrap_or(Ok(()))
         },
         move |service, event| publish_runtime_indexing_event(publish_app.clone(), service, event),
+        move || {
+            let state = recovery_app.state::<QuickFoxAppState>();
+            start_background_index_refresh(recovery_app.clone(), &state).map(|_| ())
+        },
     )?;
     refresh_enabled_global_hotkey_status(&app, &next_shortcut);
 
@@ -494,6 +499,8 @@ struct ConfigRevisionTransitionHooks<'a> {
     before_successor_start: &'a dyn Fn() -> Result<(), String>,
     before_successor_fence: &'a dyn Fn() -> Result<(), String>,
     after_successor_fence: &'a dyn Fn() -> Result<(), String>,
+    before_storage_rollback: &'a dyn Fn() -> Result<(), String>,
+    schedule_recovery: &'a dyn Fn() -> Result<(), String>,
 }
 
 #[derive(Clone, Copy)]
@@ -502,16 +509,22 @@ struct ActivatedConfigRollback<'a> {
     baseline_id: i64,
     generation: u64,
     manifest: &'a [DirectoryFingerprint],
+    before_restore: &'a dyn Fn() -> Result<(), String>,
+    candidate_config: &'a QuickFoxConfig,
+    candidate_revision: u64,
+    schedule_recovery: &'a dyn Fn() -> Result<(), String>,
 }
 
-impl ConfigRevisionTransitionHooks<'static> {
-    fn production() -> Self {
+impl<'a> ConfigRevisionTransitionHooks<'a> {
+    fn production(schedule_recovery: &'a dyn Fn() -> Result<(), String>) -> Self {
         Self {
             before_old_fence: &|| Ok(()),
             before_activation: &|| Ok(()),
             before_successor_start: &|| Ok(()),
             before_successor_fence: &|| Ok(()),
             after_successor_fence: &|| Ok(()),
+            before_storage_rollback: &|| Ok(()),
+            schedule_recovery,
         }
     }
 }
@@ -605,6 +618,7 @@ fn transition_runtime_config_revision(
         || Ok(()),
         || Ok(()),
         |_, _| {},
+        || Ok(()),
     )
 }
 
@@ -615,6 +629,7 @@ fn transition_runtime_config_revision_with_persist(
     persist: impl FnOnce() -> Result<(), String>,
     restore_config: impl FnOnce() -> Result<(), String>,
     publish: impl Fn(RuntimeServiceIdentity, RuntimeIndexingEvent) + Send + 'static,
+    schedule_recovery: impl Fn() -> Result<(), String>,
 ) -> Result<WakeShortcut, String> {
     transition_runtime_config_revision_with_hooks(
         state,
@@ -623,7 +638,7 @@ fn transition_runtime_config_revision_with_persist(
         persist,
         restore_config,
         publish,
-        ConfigRevisionTransitionHooks::production(),
+        ConfigRevisionTransitionHooks::production(&schedule_recovery),
     )
 }
 
@@ -887,6 +902,10 @@ fn transition_runtime_config_revision_with_hooks(
         baseline_id: rollback_baseline_id,
         generation: fence_generation,
         manifest: &rollback_manifest,
+        before_restore: hooks.before_storage_rollback,
+        candidate_config: &candidate.config,
+        candidate_revision: candidate.session.revision(),
+        schedule_recovery: hooks.schedule_recovery,
     };
     let future_service = RuntimeServiceIdentity {
         epoch: next_service_epoch,
@@ -1174,13 +1193,17 @@ fn rollback_activated_config_revision(
     restore_config: impl FnOnce() -> Result<(), String>,
     original_error: String,
 ) -> String {
-    let storage_error = rollback
-        .storage
-        .restore_baseline_after_failed_revision(
-            rollback.baseline_id,
-            rollback.generation,
-            rollback.manifest,
-        )
+    let storage_error = (rollback.before_restore)()
+        .and_then(|_| {
+            rollback
+                .storage
+                .restore_baseline_after_failed_revision(
+                    rollback.baseline_id,
+                    rollback.generation,
+                    rollback.manifest,
+                )
+                .map_err(|error| error.to_string())
+        })
         .err()
         .map(|error| format!("storage rollback failed: {error}"));
     let config_error = restore_config()
@@ -1189,19 +1212,102 @@ fn rollback_activated_config_revision(
     if storage_error.is_none() && config_error.is_none() {
         return restore_fenced_config_service(state, previous, previous_service, original_error);
     }
+    let adopt_candidate_config = config_error.is_some();
     let combined = [Some(original_error), storage_error, config_error]
         .into_iter()
         .flatten()
         .collect::<Vec<_>>()
         .join("; ");
-    let error = restore_fenced_config_service(state, previous, previous_service, combined);
-    state
+    if let Some(previous) = previous {
+        previous.stop();
+    }
+    {
+        let mut runtime = state
+            .runtime
+            .lock()
+            .expect("quickfox runtime lock poisoned");
+        if adopt_candidate_config {
+            runtime.config = rollback.candidate_config.clone();
+            runtime.index_refresh.config_revision = rollback.candidate_revision;
+            runtime.index_refresh.config_fingerprint =
+                index_semantic_config_fingerprint(&runtime.config);
+        }
+        runtime.runtime_indexing = None;
+        runtime.index_refresh.active_service = None;
+        runtime.index_refresh.restart_recovery_revision = None;
+        runtime.index_refresh.pending = true;
+        runtime.incremental_status.state = IncrementalState::Degraded;
+        runtime.incremental_status.degradation_code =
+            Some(IndexDegradationCode::FullRefreshFallback);
+    }
+    match (rollback.schedule_recovery)() {
+        Ok(()) => combined,
+        Err(recovery_error) => {
+            match recover_config_revision_baseline_inline(state, rollback.storage) {
+                Ok(()) => format!(
+                    "{combined}; recovery worker unavailable, completed inline recovery: {recovery_error}"
+                ),
+                Err(inline_error) => format!(
+                    "{combined}; failed to schedule recovery: {recovery_error}; inline recovery failed: {inline_error}"
+                ),
+            }
+        }
+    }
+}
+
+fn recover_config_revision_baseline_inline(
+    state: &QuickFoxAppState,
+    storage: &SqliteStorage,
+) -> Result<(), String> {
+    let config = state
         .runtime
         .lock()
         .expect("quickfox runtime lock poisoned")
-        .index_refresh
-        .pending = true;
-    error
+        .config
+        .clone();
+    let roots = refresh_capture_roots(&config, Vec::new())?;
+    let options = build_scan_options(&config);
+    let payload = IndexScanner
+        .scan_plan(IndexScanPlan {
+            include_roots: roots.clone(),
+            exclude_dirs: options.exclude_dirs,
+            exclude_patterns: options.exclude_patterns,
+            respect_project_ignores: options.respect_project_ignores,
+            stage: None,
+        })
+        .map_err(|error| error.to_string())?;
+    if !payload.failures.is_empty() {
+        return Err("inline config recovery scan reported filesystem failures".to_owned());
+    }
+    let generation = storage
+        .highest_committed_generation()
+        .map_err(|error| error.to_string())?;
+    let search_index = build_search_index_with_content_for_config(&config, payload.entries);
+    let manifest = baseline_manifest_from_entries(search_index.entries(), &roots);
+    let baseline_id = storage
+        .save_completed_index_batch(current_time_ms(), search_index.entries())
+        .map_err(|error| error.to_string())?;
+    storage
+        .activate_baseline_with_manifest_and_clear_incremental_state(
+            baseline_id,
+            generation,
+            &manifest,
+        )
+        .map_err(|error| error.to_string())?;
+    let mut runtime = state
+        .runtime
+        .lock()
+        .expect("quickfox runtime lock poisoned");
+    runtime
+        .index
+        .replace_baseline_search_index(search_index, generation);
+    runtime.index_lifecycle =
+        IndexLifecycle::from_ready(runtime.index.entry_count(), current_time_ms());
+    runtime.manifest_ready = true;
+    runtime.incremental_status.state = IncrementalState::Degraded;
+    runtime.incremental_status.degradation_code = Some(IndexDegradationCode::FullRefreshFallback);
+    runtime.index_refresh.pending = true;
+    Ok(())
 }
 
 fn record_config_transition_failure(state: &QuickFoxAppState) {
@@ -3966,8 +4072,62 @@ fn publish_runtime_indexing_event<R: tauri::Runtime>(
         )
         .is_err()
     {
-        mark_runtime_dispatch_recovery_spawn_failure(&failure_app, service);
+        let state = failure_app.state::<QuickFoxAppState>();
+        if storage_store()
+            .as_ref()
+            .and_then(|storage| replay_runtime_dispatch_tail(&state, service, storage).ok())
+            .is_none()
+        {
+            mark_runtime_dispatch_recovery_spawn_failure(&failure_app, service);
+        }
     }
+}
+
+fn replay_runtime_dispatch_tail(
+    state: &QuickFoxAppState,
+    service: RuntimeServiceIdentity,
+    storage: &SqliteStorage,
+) -> Result<(), String> {
+    let start_generation = {
+        let runtime = state
+            .runtime
+            .lock()
+            .expect("quickfox runtime lock poisoned");
+        if runtime.index_refresh.active_service != Some(service) {
+            return Err("runtime service was superseded before dispatch replay".to_owned());
+        }
+        runtime.index.generation()
+    };
+    let deltas = storage
+        .committed_index_deltas_after(start_generation)
+        .map_err(|error| error.to_string())?;
+    let mut expected = start_generation.saturating_add(1);
+    for delta in &deltas {
+        if delta.generation != expected {
+            return Err(format!(
+                "runtime dispatch replay generation gap: expected {expected}, got {}",
+                delta.generation
+            ));
+        }
+        expected = expected.saturating_add(1);
+    }
+    let mut runtime = state
+        .runtime
+        .lock()
+        .expect("quickfox runtime lock poisoned");
+    if runtime.index_refresh.active_service != Some(service)
+        || runtime.index.generation() != start_generation
+    {
+        return Err("runtime service advanced before dispatch replay".to_owned());
+    }
+    for delta in deltas {
+        runtime.index.apply_delta(delta);
+    }
+    runtime.index_refresh.restart_recovery_revision = None;
+    runtime.index_refresh.pending = false;
+    runtime.incremental_status.state = IncrementalState::Watching;
+    runtime.incremental_status.degradation_code = None;
+    Ok(())
 }
 
 fn schedule_runtime_dispatch_recovery<R: tauri::Runtime>(
@@ -4033,6 +4193,16 @@ fn apply_runtime_indexing_event(
                 || delta.generation <= runtime.index.generation()
             {
                 return None;
+            }
+            if delta.generation != runtime.index.generation().saturating_add(1) {
+                runtime.index_refresh.pending = true;
+                runtime.incremental_status.state = IncrementalState::Degraded;
+                runtime.incremental_status.degradation_code =
+                    Some(IndexDegradationCode::JournalReplayFailed);
+                return Some(RuntimeIndexingEventApplication {
+                    status: runtime.index_status(),
+                    request_refresh: true,
+                });
             }
             runtime.index.apply_delta(delta);
             let delta_safety_reached = baseline_refresh_event_for_delta_state(
@@ -6948,6 +7118,7 @@ mod tests {
             || Err("injected config persistence failure".to_owned()),
             || Ok(()),
             |_, _| {},
+            || Ok(()),
         );
 
         assert_eq!(
@@ -6962,7 +7133,13 @@ mod tests {
 
     #[test]
     fn revision_post_persist_failures_roll_back_storage_config_and_old_service() {
-        for failure_point in ["activation", "start", "fence", "config-restore"] {
+        for failure_point in [
+            "activation",
+            "start",
+            "fence",
+            "config-restore",
+            "storage-rollback",
+        ] {
             let temp = tempfile::Builder::new()
                 .prefix("quickfox-revision-rollback-")
                 .tempdir_in(std::env::temp_dir())
@@ -7026,10 +7203,11 @@ mod tests {
                 window_state: Mutex::new(LauncherWindowState::default()),
                 global_hotkey_status: Mutex::new(pending_global_hotkey_status()),
             };
+            let new_config = QuickFoxConfig::default_with_index_dirs(vec![new_root
+                .to_string_lossy()
+                .into_owned()]);
             let candidate = prepare_config_revision_candidate_for_roots(
-                QuickFoxConfig::default_with_index_dirs(vec![new_root
-                    .to_string_lossy()
-                    .into_owned()]),
+                new_config.clone(),
                 &storage,
                 1,
                 vec![new_root],
@@ -7041,7 +7219,9 @@ mod tests {
                     .ok_or_else(|| "injected activation failure".to_owned())
             };
             let fail_start = || {
-                (failure_point != "start" && failure_point != "config-restore")
+                (failure_point != "start"
+                    && failure_point != "config-restore"
+                    && failure_point != "storage-rollback")
                     .then_some(())
                     .ok_or_else(|| "injected successor start failure".to_owned())
             };
@@ -7083,6 +7263,16 @@ mod tests {
                     )
                     .map_err(|error| error.to_string())
             };
+            let fail_storage_rollback = || {
+                (failure_point != "storage-rollback")
+                    .then_some(())
+                    .ok_or_else(|| "injected storage rollback failure".to_owned())
+            };
+            let recovery_scheduled = Arc::new(AtomicBool::new(false));
+            let schedule_recovery = || {
+                recovery_scheduled.store(true, Ordering::Release);
+                recover_config_revision_baseline_inline(&state, &storage)
+            };
 
             let result = transition_runtime_config_revision_with_hooks(
                 &state,
@@ -7101,35 +7291,72 @@ mod tests {
                     before_successor_start: &fail_start,
                     before_successor_fence: &fail_fence,
                     after_successor_fence: &|| Ok(()),
+                    before_storage_rollback: &fail_storage_rollback,
+                    schedule_recovery: &schedule_recovery,
                 },
             );
 
             assert!(result.is_err(), "failure point {failure_point} succeeded");
             {
                 let runtime = state.runtime.lock().unwrap();
-                assert_eq!(runtime.config, old_config);
-                assert!(runtime.runtime_indexing.is_some());
                 assert_eq!(
-                    runtime
-                        .index_refresh
-                        .active_service
-                        .unwrap()
-                        .config_revision,
-                    0
+                    runtime.config,
+                    if failure_point == "config-restore" {
+                        new_config.clone()
+                    } else {
+                        old_config.clone()
+                    }
+                );
+                let rollback_failed =
+                    matches!(failure_point, "config-restore" | "storage-rollback");
+                assert_eq!(runtime.runtime_indexing.is_none(), rollback_failed);
+                assert_eq!(
+                    runtime.index_refresh.active_service.is_none(),
+                    rollback_failed
                 );
                 assert_eq!(runtime.index_refresh.restart_recovery_revision, None);
+                let expected_file = if failure_point == "config-restore" {
+                    &new_file
+                } else {
+                    &old_file
+                };
                 assert!(runtime
                     .index
                     .materialized_entries()
                     .iter()
-                    .any(|entry| entry.path == old_file.to_string_lossy()));
+                    .any(|entry| { entry.path == expected_file.to_string_lossy() }));
+                if rollback_failed {
+                    assert!(runtime
+                        .index
+                        .search(
+                            &crate::core::search::QueryRequest::new(
+                                expected_file.file_name().unwrap().to_string_lossy(),
+                                crate::core::search::SearchMode::Normal,
+                            ),
+                            20,
+                        )
+                        .iter()
+                        .any(|result| {
+                            result.detail.as_deref()
+                                == Some(expected_file.to_string_lossy().as_ref())
+                        }));
+                }
             }
+            assert_eq!(
+                recovery_scheduled.load(Ordering::Acquire),
+                matches!(failure_point, "config-restore" | "storage-rollback")
+            );
             let recovery = recover_layered_index(&storage);
+            let expected_recovered_file = if failure_point == "config-restore" {
+                &new_file
+            } else {
+                &old_file
+            };
             assert!(recovery
                 .index
                 .materialized_entries()
                 .iter()
-                .any(|entry| entry.path == old_file.to_string_lossy()));
+                .any(|entry| entry.path == expected_recovered_file.to_string_lossy()));
             if failure_point == "start" {
                 assert!(recovery
                     .index
@@ -7400,6 +7627,8 @@ mod tests {
                 before_successor_start: &|| Ok(()),
                 before_successor_fence: &|| Ok(()),
                 after_successor_fence: &after_successor_fence,
+                before_storage_rollback: &|| Ok(()),
+                schedule_recovery: &|| Ok(()),
             },
         )
         .unwrap();
@@ -7909,7 +8138,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_dispatch_recovery_spawn_failure_preserves_service_and_releases_retry_claim() {
+    fn runtime_dispatch_recovery_spawn_failure_replays_g1_before_successful_g2() {
         struct FailingSpawner;
         impl RefreshWorkerSpawner for FailingSpawner {
             fn spawn(&self, _task: Box<dyn FnOnce() + Send>) -> Result<(), String> {
@@ -7917,9 +8146,23 @@ mod tests {
             }
         }
 
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        let storage = SqliteStorage::open(temp.path().join("dispatch-replay.sqlite")).unwrap();
+        let baseline_id = storage.save_completed_index_batch(1, &[]).unwrap();
+        storage
+            .activate_baseline_with_manifest_and_clear_incremental_state(
+                baseline_id,
+                0,
+                &baseline_manifest_from_entries(&[], std::slice::from_ref(&root)),
+            )
+            .unwrap();
         let app = tauri::test::mock_app();
-        let mut runtime =
-            build_runtime_from_snapshot(QuickFoxConfig::default_with_index_dirs(Vec::new()), None);
+        let mut runtime = build_runtime_from_recovery(
+            QuickFoxConfig::default_with_index_dirs(vec![root.to_string_lossy().into_owned()]),
+            recover_layered_index(&storage),
+        );
         let service = RuntimeServiceIdentity {
             epoch: 3,
             config_revision: 0,
@@ -7932,18 +8175,83 @@ mod tests {
             window_state: Mutex::new(LauncherWindowState::default()),
             global_hotkey_status: Mutex::new(pending_global_hotkey_status()),
         });
+        let g1_file = root.join("g1.txt");
+        let g2_file = root.join("g2.txt");
+        let g1 = CommittedIndexDelta {
+            generation: 1,
+            upserts: vec![IndexedEntry::legacy(
+                g1_file.to_string_lossy(),
+                "g1.txt",
+                IndexedEntryKind::File,
+            )],
+            removals: Vec::new(),
+        };
+        storage.commit_incremental_batch(&g1, &[], &[]).unwrap();
 
         assert_eq!(
             schedule_runtime_dispatch_recovery(app.handle().clone(), service, &FailingSpawner),
             Err("injected dispatch recovery spawn failure".to_owned())
         );
-        mark_runtime_dispatch_recovery_spawn_failure(app.handle(), service);
-
         let state = app.state::<QuickFoxAppState>();
+        replay_runtime_dispatch_tail(&state, service, &storage).unwrap();
+        let g2 = CommittedIndexDelta {
+            generation: 2,
+            upserts: vec![IndexedEntry::legacy(
+                g2_file.to_string_lossy(),
+                "g2.txt",
+                IndexedEntryKind::File,
+            )],
+            removals: Vec::new(),
+        };
+        storage.commit_incremental_batch(&g2, &[], &[]).unwrap();
+        apply_runtime_indexing_event(
+            &mut state.runtime.lock().unwrap(),
+            &service,
+            RuntimeIndexingEvent::DeltaCommitted(g2),
+        )
+        .unwrap();
+
         let runtime = state.runtime.lock().unwrap();
+        let entries = runtime.index.materialized_entries();
+        assert!(entries
+            .iter()
+            .any(|entry| entry.path == g1_file.to_string_lossy()));
+        assert!(entries
+            .iter()
+            .any(|entry| entry.path == g2_file.to_string_lossy()));
+        assert_eq!(runtime.index.generation(), 2);
         assert_eq!(runtime.index_refresh.active_service, Some(service));
         assert_eq!(runtime.index_refresh.restart_recovery_revision, None);
-        assert!(runtime.index_refresh.pending);
+    }
+
+    #[test]
+    fn runtime_delta_generation_gap_requests_refresh_without_advancing_view() {
+        let mut runtime =
+            build_runtime_from_snapshot(QuickFoxConfig::default_with_index_dirs(Vec::new()), None);
+        let service = RuntimeServiceIdentity {
+            epoch: 1,
+            config_revision: 0,
+        };
+        runtime.index_refresh.active_service = Some(service);
+
+        let application = apply_runtime_indexing_event(
+            &mut runtime,
+            &service,
+            RuntimeIndexingEvent::DeltaCommitted(CommittedIndexDelta {
+                generation: 2,
+                upserts: vec![IndexedEntry::legacy(
+                    "/tmp/g2.txt",
+                    "g2.txt",
+                    IndexedEntryKind::File,
+                )],
+                removals: Vec::new(),
+            }),
+        )
+        .unwrap();
+
+        assert!(application.request_refresh);
+        assert_eq!(runtime.index.generation(), 0);
+        assert!(runtime.index.materialized_entries().is_empty());
         assert_eq!(runtime.incremental_status.state, IncrementalState::Degraded);
     }
 
