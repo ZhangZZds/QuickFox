@@ -6,10 +6,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 #[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 use tantivy::collector::{BytesFilterCollector, TopDocs};
 use tantivy::query::QueryParser;
 use tantivy::schema::{Field, Schema, Value, FAST, STORED, STRING, TEXT};
@@ -17,6 +18,7 @@ use tantivy::{doc, Index, IndexWriter, TantivyDocument, Term};
 
 pub const DEFAULT_MAX_CONTENT_BYTES: u64 = 2 * 1024 * 1024;
 pub const CONTENT_INDEX_DIR_VERSION: &str = "content-v1";
+static CONTENT_BUILD_NONCE: AtomicU64 = AtomicU64::new(0);
 
 type ContentResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 pub(crate) type ContentPathFilter = Arc<dyn Fn(&str) -> bool + Send + Sync>;
@@ -46,8 +48,28 @@ pub struct ContentIndex {
     path_field: Field,
     path_filter_field: Field,
     content_field: Field,
+    // Field order keeps the directory alive until every Tantivy handle above has dropped.
+    _directory_lease: Arc<ContentIndexDirectoryLease>,
     #[cfg(test)]
     last_collector_limit: Arc<AtomicUsize>,
+}
+
+#[derive(Debug)]
+struct ContentIndexDirectoryLease {
+    path: PathBuf,
+}
+
+impl Drop for ContentIndexDirectoryLease {
+    fn drop(&mut self) {
+        if let Err(error) = fs::remove_dir_all(&self.path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                eprintln!(
+                    "QuickFox failed to reclaim content index version {}: {error}",
+                    self.path.display()
+                );
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -129,11 +151,14 @@ impl ContentIndex {
         options: ContentIndexOptions,
         extractor: &dyn TextExtractor,
     ) -> ContentResult<Self> {
-        let index_dir = options.index_dir.join(CONTENT_INDEX_DIR_VERSION);
-        if index_dir.exists() {
-            fs::remove_dir_all(&index_dir)?;
-        }
+        let version_root = options.index_dir.join(CONTENT_INDEX_DIR_VERSION);
+        fs::create_dir_all(&version_root)?;
+        let nonce = CONTENT_BUILD_NONCE.fetch_add(1, Ordering::Relaxed);
+        let index_dir = version_root.join(format!("build-{}-{nonce}", std::process::id()));
         fs::create_dir_all(&index_dir)?;
+        let directory_lease = Arc::new(ContentIndexDirectoryLease {
+            path: index_dir.clone(),
+        });
 
         let schema = content_schema();
         let path_field = schema.get_field("path")?;
@@ -175,6 +200,7 @@ impl ContentIndex {
             path_field,
             path_filter_field,
             content_field,
+            _directory_lease: directory_lease,
             #[cfg(test)]
             last_collector_limit: Arc::new(AtomicUsize::new(0)),
         })
@@ -417,6 +443,120 @@ mod tests {
     use crate::core::index_entry::ContentIndexState;
     use crate::core::search::QueryParser;
     use std::fs;
+    use std::sync::{mpsc, Mutex};
+
+    #[test]
+    fn concurrent_build_in_same_base_keeps_live_reader_until_atomic_publish() {
+        struct BlockingExtractor {
+            started: mpsc::SyncSender<()>,
+            release: Mutex<mpsc::Receiver<()>>,
+        }
+
+        impl TextExtractor for BlockingExtractor {
+            fn extract(&self, path: &Path, _max_bytes: u64) -> ContentExtractionResult {
+                self.started.send(()).unwrap();
+                self.release.lock().unwrap().recv().unwrap();
+                ContentExtractionResult::Text(fs::read_to_string(path).unwrap())
+            }
+        }
+
+        let workspace = tempfile::tempdir().unwrap();
+        let base = workspace.path().join("production-content-base");
+        let old_file = workspace.path().join("old.txt");
+        let new_file = workspace.path().join("new.txt");
+        fs::write(&old_file, "old durable needle").unwrap();
+        fs::write(&new_file, "new replacement haystack").unwrap();
+        let options = ContentIndexOptions {
+            index_dir: base.clone(),
+            max_file_bytes: DEFAULT_MAX_CONTENT_BYTES,
+        };
+        let mut old_entries = vec![entry(&old_file)];
+        let old = ContentIndex::build(&mut old_entries, options.clone()).unwrap();
+        let old_version = fs::read_dir(base.join(CONTENT_INDEX_DIR_VERSION))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let extractor = BlockingExtractor {
+            started: started_tx,
+            release: Mutex::new(release_rx),
+        };
+
+        let new = std::thread::scope(|scope| {
+            let options = options.clone();
+            let builder = scope.spawn(|| {
+                let mut entries = vec![entry(&new_file)];
+                let index =
+                    ContentIndex::build_with_extractor(&mut entries, options, &extractor).unwrap();
+                (index, entries)
+            });
+            started_rx.recv().unwrap();
+            assert!(old_version.is_dir());
+            assert_eq!(
+                fs::read_dir(base.join(CONTENT_INDEX_DIR_VERSION))
+                    .unwrap()
+                    .count(),
+                2
+            );
+            for _ in 0..100 {
+                assert_eq!(old.search("needle", None, 10).unwrap().len(), 1);
+            }
+            release_tx.send(()).unwrap();
+            builder.join().unwrap()
+        });
+
+        assert_eq!(old.search("needle", None, 10).unwrap().len(), 1);
+        assert_eq!(new.0.search("haystack", None, 10).unwrap().len(), 1);
+        drop(old);
+        assert!(!old_version.exists());
+        assert_eq!(
+            fs::read_dir(base.join(CONTENT_INDEX_DIR_VERSION))
+                .unwrap()
+                .count(),
+            1
+        );
+        drop(new);
+        assert_eq!(
+            fs::read_dir(base.join(CONTENT_INDEX_DIR_VERSION))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn cloned_reader_keeps_version_directory_leased_until_last_drop() {
+        let workspace = tempfile::tempdir().unwrap();
+        let base = workspace.path().join("shared-content-base");
+        let file = workspace.path().join("leased.txt");
+        fs::write(&file, "leased reader needle").unwrap();
+        let mut entries = vec![entry(&file)];
+        let index = ContentIndex::build(
+            &mut entries,
+            ContentIndexOptions {
+                index_dir: base.clone(),
+                max_file_bytes: DEFAULT_MAX_CONTENT_BYTES,
+            },
+        )
+        .unwrap();
+        let version = fs::read_dir(base.join(CONTENT_INDEX_DIR_VERSION))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let reader = index.clone();
+
+        drop(index);
+        assert!(version.is_dir());
+        assert_eq!(reader.search("needle", None, 10).unwrap().len(), 1);
+
+        drop(reader);
+        assert!(!version.exists());
+    }
 
     #[test]
     fn indexes_text_files_and_searches_content_with_snippets() {

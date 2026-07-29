@@ -1,28 +1,5 @@
 use std::thread;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RevisionCaptureFence {
-    old_service_join_generation: u64,
-}
-
-impl RevisionCaptureFence {
-    pub fn after_old_service_join(generation: u64) -> Self {
-        Self {
-            old_service_join_generation: generation,
-        }
-    }
-}
-
-pub fn compatible_tail_start_generation(
-    scan_start_generation: u64,
-    fence: Option<RevisionCaptureFence>,
-) -> u64 {
-    fence
-        .map(|fence| fence.old_service_join_generation)
-        .unwrap_or(scan_start_generation)
-        .max(scan_start_generation)
-}
-
 pub trait RefreshWorkerSpawner: Send + Sync {
     fn spawn(&self, task: Box<dyn FnOnce() + Send>) -> Result<(), String>;
 }
@@ -267,13 +244,6 @@ impl RevisionRecoveryLatch {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn revision_fence_selects_tail_after_old_service_join() {
-        let fence = RevisionCaptureFence::after_old_service_join(7);
-        assert_eq!(compatible_tail_start_generation(3, Some(fence)), 7);
-        assert_eq!(compatible_tail_start_generation(9, Some(fence)), 9);
-    }
 
     #[test]
     fn delta_safety_during_refresh_is_absorbed_without_pending_rerun() {

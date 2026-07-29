@@ -4,12 +4,15 @@ use crate::core::index_entry::IndexDegradationCode;
 use notify::event::{ModifyKind, RenameMode};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::BTreeSet;
+use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub const DEFAULT_WATCH_CHANNEL_CAPACITY: usize = 8_192;
+static REGISTRATION_PROBE_NONCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IndexWatchEvent {
@@ -236,27 +239,98 @@ impl WatcherFailure {
 #[derive(Debug)]
 pub struct RuntimeIndexWatcher {
     _watcher: RecommendedWatcher,
+    _registration_probe: RegistrationProbeDirectory,
     watched_roots: Vec<PathBuf>,
     inbox: Option<WatchEventInbox>,
+}
+
+#[derive(Debug)]
+struct RegistrationProbeDirectory(PathBuf);
+
+impl Drop for RegistrationProbeDirectory {
+    fn drop(&mut self) {
+        if let Err(error) = fs::remove_dir_all(&self.0) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                eprintln!(
+                    "QuickFox failed to remove watcher registration probe {}: {error}",
+                    self.0.display()
+                );
+            }
+        }
+    }
 }
 
 impl RuntimeIndexWatcher {
     pub fn watch_roots(roots: Vec<PathBuf>) -> Result<Self, WatcherFailure> {
         let (callback_sender, inbox) =
             WatchEventInbox::bounded(roots.clone(), DEFAULT_WATCH_CHANNEL_CAPACITY);
+        let nonce = REGISTRATION_PROBE_NONCE.fetch_add(1, Ordering::Relaxed);
+        let probe_path = std::env::temp_dir().join(format!(
+            "quickfox-watcher-probe-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&probe_path)
+            .map_err(|error| WatcherFailure::new(probe_path.clone(), error.to_string()))?;
+        let probe_path = probe_path
+            .canonicalize()
+            .map_err(|error| WatcherFailure::new(probe_path.clone(), error.to_string()))?;
+        let registration_probe = RegistrationProbeDirectory(probe_path.clone());
+        let (registration_ack, registration_ack_receiver) = mpsc::channel();
+        let callback_probe = probe_path.clone();
         let mut watcher = notify::recommended_watcher(move |result: notify::Result<Event>| {
+            if result.as_ref().is_ok_and(|event| {
+                event
+                    .paths
+                    .iter()
+                    .any(|path| path.starts_with(&callback_probe))
+            }) {
+                let _ = registration_ack.send(());
+                return;
+            }
             dispatch_notify_result(result, &callback_sender);
         })
         .map_err(|error| WatcherFailure::new(PathBuf::new(), error.to_string()))?;
 
+        // notify 8.2.0 acknowledges inotify/ReadDirectoryChanges commands, while FSEvents can still
+        // miss a mutation immediately after stream startup. The final watched path is therefore an
+        // app-owned probe on the same native backend stream; returning requires observing its event.
+        // Re-audit this same-stream registration contract on notify upgrades.
         for root in &roots {
             watcher
                 .watch(root, RecursiveMode::Recursive)
                 .map_err(|error| WatcherFailure::new(root.clone(), error.to_string()))?;
         }
+        watcher
+            .watch(&probe_path, RecursiveMode::Recursive)
+            .map_err(|error| WatcherFailure::new(probe_path.clone(), error.to_string()))?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let mut attempt = 0_u64;
+        loop {
+            let probe_file = probe_path.join(format!("ack-{attempt}"));
+            fs::write(&probe_file, attempt.to_le_bytes())
+                .map_err(|error| WatcherFailure::new(probe_path.clone(), error.to_string()))?;
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(WatcherFailure::new(
+                    probe_path,
+                    "native watcher registration acknowledgement timed out",
+                ));
+            }
+            match registration_ack_receiver.recv_timeout(remaining.min(Duration::from_millis(50))) {
+                Ok(()) => break,
+                Err(RecvTimeoutError::Timeout) => attempt = attempt.saturating_add(1),
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(WatcherFailure::new(
+                        probe_path,
+                        "native watcher registration acknowledgement disconnected",
+                    ));
+                }
+            }
+        }
 
         Ok(Self {
             _watcher: watcher,
+            _registration_probe: registration_probe,
             watched_roots: roots,
             inbox: Some(inbox),
         })
@@ -363,6 +437,7 @@ pub fn roots_from_entries(entries: &[crate::core::index_entry::IndexedEntry]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::path::PathBuf;
 
     #[test]
@@ -470,6 +545,52 @@ mod tests {
 
         assert!(watcher.take_inbox().is_some());
         assert!(watcher.take_inbox().is_none());
+    }
+
+    #[test]
+    fn registration_probe_lifetime_matches_native_watcher() {
+        let root = tempfile::tempdir().unwrap();
+        let started = std::time::Instant::now();
+        let watcher =
+            RuntimeIndexWatcher::watch_roots(vec![root.path().canonicalize().unwrap()]).unwrap();
+        let probe_path = watcher._registration_probe.0.clone();
+
+        assert!(probe_path.is_dir());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "quiet root registration waited near the failure timeout"
+        );
+        drop(watcher);
+        assert!(!probe_path.exists());
+    }
+
+    #[test]
+    fn watch_roots_returns_only_after_immediate_mutation_is_observable() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let created = root.join("immediate.txt");
+        let mut watcher = RuntimeIndexWatcher::watch_roots(vec![root]).unwrap();
+        fs::write(&created, "registered").unwrap();
+        let inbox = watcher.take_inbox().unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let observed = loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break false;
+            }
+            match inbox.recv_timeout(remaining) {
+                Ok(IndexWatchEvent::Create(path) | IndexWatchEvent::Write(path))
+                    if path == created || created.starts_with(&path) =>
+                {
+                    break true;
+                }
+                Ok(_) => {}
+                Err(_) => break false,
+            }
+        };
+
+        assert!(observed, "immediate post-registration mutation was missed");
     }
 
     #[test]

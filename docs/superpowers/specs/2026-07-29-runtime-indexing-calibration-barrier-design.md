@@ -68,12 +68,27 @@ view、状态置 `Degraded`、同 revision 最多安排一次恢复。
 baseline persistence `Failed` 也使用同一漏斗，即使已经存在 no-op successor，也必须
 停止该 successor、恢复 live service 或安排一次校准 session，不能永久停在无服务状态。
 
+### 5. Watcher registration 与 ContentIndex 生命周期
+
+QuickFox 先利用 notify 8.2.0 原生 backend 的同步 `watch()` 边界：Linux inotify 与
+Windows ReadDirectoryChanges 都等待 backend command reply。macOS FSEvents 的 command ack
+不足以保证紧随其后的 mutation 可见，因此在所有用户 roots 注册后，最后向同一个原生
+watcher 注册应用私有临时目录；只在该目录循环写 registration probe，直到同一 callback
+实际观察到 probe event 才返回。probe 不写入用户 root，并与 watcher 同生命周期回收。
+升级 notify 时必须重新审计三个平台的同 stream 契约。可观察 ack 后仍执行权威 calibration
+并 drain inbox；测试在 `watch_roots` 返回后的下一条语句制造 mutation，不使用固定 sleep。
+
+ContentIndex 不再复用并删除共享 `content-v1` 目录。每次 build 写入独立版本目录，
+SearchIndex 原子发布新版本；旧 ContentIndex 的最后一个 reader 释放后，由目录 lease 回收
+旧版本。启动恢复只安装 name/path view 并把 content 标记为未构建，setup-return gate 释放后
+由后台 worker 构建并原子安装正文索引。
+
 ## 被拒绝的方案
 
 - 为 manifest 新增 generation/tombstone journal：允许 activation 与 durable writer 并行，
   但本轮需要额外 migration 和恢复协议；静止切换能以更小范围满足一致性要求。
-- 依赖平台 watcher registration acknowledgement：当前跨平台 watcher abstraction 没有
-  可靠统一 ack，而且不能解决 persistence、dispatch 和 monitor lifecycle 失败。
+- 在用户索引 root 写隐藏 probe：会引入权限、同步软件和用户可见副作用；registration probe
+  只允许写入应用私有临时目录，并复用同一个原生 watcher stream。
 
 ## 验证
 

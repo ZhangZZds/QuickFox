@@ -14,9 +14,8 @@ use crate::core::index_entry::{
 };
 use crate::core::index_journal::recover_layered_index;
 use crate::core::index_refresh_orchestrator::{
-    authoritative_install_generation, compatible_tail_start_generation, refresh_request_decision,
-    RefreshRequestDecision, RefreshRequestReason, RefreshWorkerSpawner, RevisionCaptureFence,
-    RevisionRecoveryLatch, RuntimeCalibrationSession,
+    authoritative_install_generation, refresh_request_decision, RefreshRequestDecision,
+    RefreshRequestReason, RefreshWorkerSpawner, RevisionRecoveryLatch, RuntimeCalibrationSession,
     RuntimeFailureApplication as CoreRuntimeFailureApplication, RuntimeFailureKind,
     SystemRefreshWorkerSpawner,
 };
@@ -151,12 +150,12 @@ struct RuntimeRestartFailureApplication {
 struct IndexRefreshControl {
     config_revision: u64,
     config_fingerprint: String,
+    search_view_epoch: u64,
     active: Option<IndexRefreshIdentity>,
     pending: bool,
     next_service_epoch: u64,
     active_service: Option<RuntimeServiceIdentity>,
     standby_watcher: Option<RuntimeIndexWatcher>,
-    revision_capture_fence: Option<RevisionCaptureFence>,
     restart_recovery_revision: Option<u64>,
     root_recovery_latch: RevisionRecoveryLatch,
     root_monitor_failure_revision: Option<u64>,
@@ -168,12 +167,12 @@ impl IndexRefreshControl {
         Self {
             config_revision: 0,
             config_fingerprint: index_semantic_config_fingerprint(config),
+            search_view_epoch: 0,
             active: None,
             pending: false,
             next_service_epoch: 0,
             active_service: None,
             standby_watcher: None,
-            revision_capture_fence: None,
             restart_recovery_revision: None,
             root_recovery_latch: RevisionRecoveryLatch::default(),
             root_monitor_failure_revision: None,
@@ -554,6 +553,24 @@ fn prepare_config_revision_candidate_with_capture_tail(
     roots: Vec<PathBuf>,
     capture_tail: impl FnOnce() -> Vec<crate::core::index_watcher::IndexWatchEvent>,
 ) -> Result<ConfigRevisionCandidate, String> {
+    prepare_config_revision_candidate_with_registration_boundary(
+        config,
+        storage,
+        revision,
+        roots,
+        || {},
+        capture_tail,
+    )
+}
+
+fn prepare_config_revision_candidate_with_registration_boundary(
+    config: QuickFoxConfig,
+    storage: &SqliteStorage,
+    revision: u64,
+    roots: Vec<PathBuf>,
+    after_registration: impl FnOnce(),
+    capture_tail: impl FnOnce() -> Vec<crate::core::index_watcher::IndexWatchEvent>,
+) -> Result<ConfigRevisionCandidate, String> {
     let starting_generation = storage
         .highest_committed_generation()
         .map_err(|error| error.to_string())?;
@@ -563,6 +580,7 @@ fn prepare_config_revision_candidate_with_capture_tail(
     session
         .mark_capture_registered()
         .map_err(|error| format!("config capture transition failed: {error:?}"))?;
+    after_registration();
     let mut accumulator = IndexRefreshAccumulator::default();
     let scan_options = build_scan_options(&config);
     accumulator.merge(
@@ -1049,8 +1067,25 @@ fn transition_runtime_config_revision_with_hooks(
         }
         let final_candidate_entries =
             entries_after_committed_deltas(candidate.entries, &successor_tail);
-        let candidate_search_index =
-            build_search_index_with_content_for_config(&candidate.config, final_candidate_entries);
+        let candidate_search_index = match build_search_index_with_content_for_config(
+            &candidate.config,
+            final_candidate_entries,
+        ) {
+            Ok(index) => index,
+            Err(error) => {
+                if let Some(successor) = successor {
+                    successor.stop();
+                }
+                return Err(rollback_activated_config_revision(
+                    state,
+                    previous,
+                    previous_service,
+                    rollback_target,
+                    restore_config,
+                    format!("content index build failed: {error}"),
+                ));
+            }
+        };
         let final_manifest = baseline_manifest_after_committed_deltas(
             candidate_search_index.entries(),
             &successor_tail,
@@ -1104,13 +1139,14 @@ fn transition_runtime_config_revision_with_hooks(
             runtime.index_refresh.pending = false;
             runtime.index_refresh.active_service = watcher_enabled.then_some(future_service);
             runtime.index_refresh.standby_watcher = None;
-            runtime.index_refresh.revision_capture_fence = None;
             runtime.index_refresh.restart_recovery_revision = None;
             runtime.index_refresh.root_recovery_latch = RevisionRecoveryLatch::default();
             runtime.index_refresh.root_monitor_failure_revision = None;
             runtime
                 .index
                 .replace_baseline_search_index(candidate_search_index, successor_generation);
+            runtime.index_refresh.search_view_epoch =
+                runtime.index_refresh.search_view_epoch.saturating_add(1);
             runtime.index_lifecycle =
                 IndexLifecycle::from_ready(runtime.index.entry_count(), current_time_ms());
             runtime.last_report = candidate.report;
@@ -1288,7 +1324,7 @@ fn recover_config_revision_baseline_inline(
     let generation = storage
         .highest_committed_generation()
         .map_err(|error| error.to_string())?;
-    let search_index = build_search_index_with_content_for_config(&config, payload.entries);
+    let search_index = build_search_index_with_content_for_config(&config, payload.entries)?;
     let manifest = baseline_manifest_from_entries(search_index.entries(), &roots);
     let baseline_id = storage
         .save_completed_index_batch(current_time_ms(), search_index.entries())
@@ -1307,6 +1343,8 @@ fn recover_config_revision_baseline_inline(
     runtime
         .index
         .replace_baseline_search_index(search_index, generation);
+    runtime.index_refresh.search_view_epoch =
+        runtime.index_refresh.search_view_epoch.saturating_add(1);
     runtime.index_lifecycle =
         IndexLifecycle::from_ready(runtime.index.entry_count(), current_time_ms());
     runtime.manifest_ready = true;
@@ -1360,7 +1398,6 @@ fn index_semantic_config_fingerprint(config: &QuickFoxConfig) -> String {
 #[cfg(test)]
 fn replace_runtime_config_for_full_refresh(runtime: &mut QuickFoxRuntime, config: QuickFoxConfig) {
     runtime.index_refresh.standby_watcher.take();
-    runtime.index_refresh.revision_capture_fence = None;
     runtime.index_refresh.restart_recovery_revision = None;
     runtime.index_refresh.root_recovery_latch = RevisionRecoveryLatch::default();
     runtime.index_refresh.root_monitor_failure_revision = None;
@@ -1704,6 +1741,9 @@ fn schedule_startup_indexing_in_setup<R: tauri::Runtime>(
     let worker_app = app;
     schedule_startup_indexing_with(spawner, gate, move || {
         let state = worker_app.state::<QuickFoxAppState>();
+        if let Err(error) = rebuild_recovered_content_index(&state) {
+            record_startup_content_rebuild_failure(&worker_app, &error);
+        }
         let enabled = state
             .runtime
             .lock()
@@ -1728,6 +1768,28 @@ fn record_startup_scheduling_failure<R: tauri::Runtime>(app: &tauri::AppHandle<R
         apply_runtime_failure_state(
             &mut runtime,
             RuntimeFailureKind::WorkerSpawn,
+            IndexDegradationCode::FullRefreshFallback,
+            false,
+        );
+        runtime.index_status()
+    };
+    let _ = app.emit("quickfox://index-status", status);
+}
+
+fn record_startup_content_rebuild_failure<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    error: &str,
+) {
+    eprintln!("QuickFox startup content index rebuild failed: {error}");
+    let state = app.state::<QuickFoxAppState>();
+    let status = {
+        let mut runtime = state
+            .runtime
+            .lock()
+            .expect("quickfox runtime lock poisoned");
+        apply_runtime_failure_state(
+            &mut runtime,
+            RuntimeFailureKind::Calibration,
             IndexDegradationCode::FullRefreshFallback,
             false,
         );
@@ -2327,37 +2389,48 @@ fn start_background_index_refresh_with_spawner<R: tauri::Runtime>(
 
                     if update_result.is_ok() {
                         let content_completed_at_ms = current_time_ms();
-                        let content_index =
-                            build_search_index_with_content_for_config(&config, content_entries);
-                        let content_entries = content_index.entries().to_vec();
-                        let content_report = IndexReport {
-                            failures: Vec::new(),
-                            ..Default::default()
-                        };
-                        let content_payload = IndexRefreshPayload {
-                            entries: content_entries,
-                            summary: content_report,
-                        };
                         let persistence_state = app.state::<QuickFoxAppState>();
-                        let manifest = handoff
-                            .as_ref()
-                            .map(|handoff| handoff.manifest.clone())
-                            .unwrap_or_default();
-                        let mut persistence = persist_index_refresh_for_identity(
-                            &persistence_state,
-                            &identity,
-                            content_completed_at_ms,
-                            content_payload,
-                            authoritative_generation,
-                            move |completed_at_ms, entries, baseline_generation, _| {
-                                persist_and_activate_baseline_with_manifest(
-                                    completed_at_ms,
-                                    entries,
-                                    baseline_generation,
-                                    &manifest,
-                                )
-                            },
-                        );
+                        let (content_index, mut persistence) =
+                            match build_search_index_with_content_for_config(
+                                &config,
+                                content_entries,
+                            ) {
+                                Ok(content_index) => {
+                                    let content_payload = IndexRefreshPayload {
+                                        entries: content_index.entries().to_vec(),
+                                        summary: IndexReport {
+                                            failures: Vec::new(),
+                                            ..Default::default()
+                                        },
+                                    };
+                                    let manifest = handoff
+                                        .as_ref()
+                                        .map(|handoff| handoff.manifest.clone())
+                                        .unwrap_or_default();
+                                    let persistence = persist_index_refresh_for_identity(
+                                        &persistence_state,
+                                        &identity,
+                                        content_completed_at_ms,
+                                        content_payload,
+                                        authoritative_generation,
+                                        move |completed_at_ms, entries, baseline_generation, _| {
+                                            persist_and_activate_baseline_with_manifest(
+                                                completed_at_ms,
+                                                entries,
+                                                baseline_generation,
+                                                &manifest,
+                                            )
+                                        },
+                                    );
+                                    (Some(content_index), persistence)
+                                }
+                                Err(error) => (
+                                    None,
+                                    BaselinePersistenceOutcome::Failed(format!(
+                                        "content index build failed: {error}"
+                                    )),
+                                ),
+                            };
                         let app_for_update = app.clone();
                         let app_for_state = app_for_update.clone();
                         let content_identity = identity.clone();
@@ -2381,6 +2454,20 @@ fn start_background_index_refresh_with_spawner<R: tauri::Runtime>(
                             let state = app_for_state.state::<QuickFoxAppState>();
                             match persistence {
                                 BaselinePersistenceOutcome::Completed(payload) => {
+                                    let Some(content_index) = content_index else {
+                                        if let Some(status) =
+                                            apply_failed_index_refresh_for_identity(
+                                                &state,
+                                                &content_identity,
+                                                "content index build completed without an index"
+                                                    .to_owned(),
+                                            )
+                                        {
+                                            let _ = app_for_state
+                                                .emit("quickfox://index-status", status);
+                                        }
+                                        return;
+                                    };
                                     if let Some(status) =
                                         apply_completed_content_index_refresh_for_identity(
                                             &state,
@@ -2810,14 +2897,13 @@ fn prepare_index_refresh_handoff(
                     runtime.runtime_indexing.take(),
                     capture_watcher,
                     roots,
-                    runtime.index_refresh.revision_capture_fence.take(),
                 )))
             }
         } else {
             Err("index refresh standby watcher is unavailable".to_owned())
         }
     };
-    let (previous, capture_watcher, roots, revision_capture_fence) = match handoff_parts {
+    let (previous, capture_watcher, roots) = match handoff_parts {
         Ok(Some(parts)) => parts,
         Ok(None) => return Ok(None),
         Err(error) => {
@@ -2915,16 +3001,15 @@ fn prepare_index_refresh_handoff(
         record_index_refresh_runtime_failure(state, identity, RuntimeRestartFailureKind::Storage);
         "index journal storage is unavailable".to_owned()
     })?;
-    let (tail_deltas, manifest) = load_revision_compatible_handoff_snapshot(
-        &storage,
-        scan_start_generation,
-        revision_capture_fence,
-        &roots,
-        entries,
-    )
-    .inspect_err(|_| {
-        record_index_refresh_runtime_failure(state, identity, RuntimeRestartFailureKind::Storage);
-    })?;
+    let (tail_deltas, manifest) =
+        load_full_refresh_handoff_snapshot(&storage, scan_start_generation, &roots, entries)
+            .inspect_err(|_| {
+                record_index_refresh_runtime_failure(
+                    state,
+                    identity,
+                    RuntimeRestartFailureKind::Storage,
+                );
+            })?;
 
     Ok(Some(IndexRefreshHandoff {
         authoritative_generation: authoritative_install_generation(
@@ -3108,18 +3193,6 @@ fn load_full_refresh_handoff_snapshot(
         .collect();
     refresh_tail_touched_manifest_fingerprints(&mut manifest_by_path, &touched_paths, roots);
     Ok((tail_deltas, manifest_by_path.into_values().collect()))
-}
-
-fn load_revision_compatible_handoff_snapshot(
-    storage: &SqliteStorage,
-    scan_start_generation: u64,
-    revision_capture_fence: Option<RevisionCaptureFence>,
-    roots: &[PathBuf],
-    scanned_entries: &[IndexedEntry],
-) -> Result<(Vec<CommittedIndexDelta>, Vec<DirectoryFingerprint>), String> {
-    let compatible_tail_start =
-        compatible_tail_start_generation(scan_start_generation, revision_capture_fence);
-    load_full_refresh_handoff_snapshot(storage, compatible_tail_start, roots, scanned_entries)
 }
 
 fn refresh_tail_touched_manifest_fingerprints(
@@ -3480,6 +3553,10 @@ fn apply_baseline_persistence_outcome_for_identity(
                 baseline_generation,
                 tail_deltas,
             );
+            if installed {
+                runtime.index_refresh.search_view_epoch =
+                    runtime.index_refresh.search_view_epoch.saturating_add(1);
+            }
             let lifecycle_completed = !complete_lifecycle
                 || runtime.index_lifecycle.complete_refresh(
                     identity.lifecycle_generation,
@@ -3564,15 +3641,22 @@ fn apply_completed_content_index_refresh_for_identity(
         .lock()
         .expect("quickfox runtime lock poisoned");
     let entry_count = payload.entries.len();
-    if !runtime.index.replace_baseline_with_authoritative_tail(
+    let installed = runtime.index.replace_baseline_with_authoritative_tail(
         content_index,
         baseline_generation,
         tail_deltas,
-    ) || !runtime.index_lifecycle.complete_refresh(
-        identity.lifecycle_generation,
-        entry_count,
-        completed_at_ms,
-    ) {
+    );
+    if installed {
+        runtime.index_refresh.search_view_epoch =
+            runtime.index_refresh.search_view_epoch.saturating_add(1);
+    }
+    if !installed
+        || !runtime.index_lifecycle.complete_refresh(
+            identity.lifecycle_generation,
+            entry_count,
+            completed_at_ms,
+        )
+    {
         return None;
     }
     runtime.manifest_ready = true;
@@ -3696,9 +3780,15 @@ fn apply_completed_index_refresh(
         .expect("quickfox runtime lock poisoned");
     let entry_count = payload.entries.len();
     let baseline = build_search_index_for_config(&runtime.config, payload.entries);
-    if !runtime
-        .index
-        .replace_baseline_with_authoritative_tail(baseline, baseline_generation, &[])
+    let installed =
+        runtime
+            .index
+            .replace_baseline_with_authoritative_tail(baseline, baseline_generation, &[]);
+    if installed {
+        runtime.index_refresh.search_view_epoch =
+            runtime.index_refresh.search_view_epoch.saturating_add(1);
+    }
+    if !installed
         || !runtime
             .index_lifecycle
             .complete_refresh(generation, entry_count, completed_at_ms)
@@ -3724,13 +3814,19 @@ fn apply_completed_content_index_refresh(
         .lock()
         .expect("quickfox runtime lock poisoned");
     let entry_count = payload.entries.len();
-    if !runtime.index.replace_baseline_with_authoritative_tail(
+    let installed = runtime.index.replace_baseline_with_authoritative_tail(
         content_index,
         baseline_generation,
         &[],
-    ) || !runtime
-        .index_lifecycle
-        .complete_refresh(generation, entry_count, completed_at_ms)
+    );
+    if installed {
+        runtime.index_refresh.search_view_epoch =
+            runtime.index_refresh.search_view_epoch.saturating_add(1);
+    }
+    if !installed
+        || !runtime
+            .index_lifecycle
+            .complete_refresh(generation, entry_count, completed_at_ms)
     {
         return None;
     }
@@ -4355,6 +4451,8 @@ fn apply_index_refresh_progress(
         runtime
             .index
             .replace_baseline(payload.entries, index_generation);
+        runtime.index_refresh.search_view_epoch =
+            runtime.index_refresh.search_view_epoch.saturating_add(1);
     }
     runtime.last_report = payload.summary;
     Some(runtime.index_status())
@@ -4444,9 +4542,12 @@ fn build_runtime_from_recovery(
     let index_refresh = IndexRefreshControl::for_config(&config);
     if should_build_content_index_for_config(&config, &recovery.index.materialized_entries()) {
         let generation = recovery.index.generation();
-        let entries = recovery.index.materialized_entries();
+        let mut entries = recovery.index.materialized_entries();
+        for entry in &mut entries {
+            entry.content_index_state = ContentIndexState::NotIndexed;
+        }
         recovery.index.replace_baseline_search_index(
-            build_search_index_with_content_for_config(&config, entries),
+            build_search_index_for_config(&config, entries),
             generation,
         );
     }
@@ -4460,6 +4561,57 @@ fn build_runtime_from_recovery(
         manifest_ready,
         index_refresh,
     }
+}
+
+fn rebuild_recovered_content_index(state: &QuickFoxAppState) -> Result<bool, String> {
+    rebuild_recovered_content_index_with(state, |config, entries| {
+        build_search_index_with_content_for_config(config, entries)
+    })
+}
+
+fn rebuild_recovered_content_index_with(
+    state: &QuickFoxAppState,
+    builder: impl FnOnce(&QuickFoxConfig, Vec<IndexedEntry>) -> Result<SearchIndex, String>,
+) -> Result<bool, String> {
+    let (config, revision, fingerprint, view_epoch, generation, entries) = {
+        let runtime = state
+            .runtime
+            .lock()
+            .expect("quickfox runtime lock poisoned");
+        let entries = runtime.index.materialized_entries();
+        if runtime.index_refresh.active.is_some()
+            || !should_build_content_index_for_config(&runtime.config, &entries)
+        {
+            return Ok(false);
+        }
+        (
+            runtime.config.clone(),
+            runtime.index_refresh.config_revision,
+            runtime.index_refresh.config_fingerprint.clone(),
+            runtime.index_refresh.search_view_epoch,
+            runtime.index.generation(),
+            entries,
+        )
+    };
+    let content_index = builder(&config, entries)?;
+    let mut runtime = state
+        .runtime
+        .lock()
+        .expect("quickfox runtime lock poisoned");
+    if runtime.index_refresh.config_revision != revision
+        || runtime.index_refresh.config_fingerprint != fingerprint
+        || runtime.index_refresh.search_view_epoch != view_epoch
+        || runtime.index.generation() != generation
+        || runtime.index_refresh.active.is_some()
+    {
+        return Ok(false);
+    }
+    runtime
+        .index
+        .replace_baseline_search_index(content_index, generation);
+    runtime.index_refresh.search_view_epoch =
+        runtime.index_refresh.search_view_epoch.saturating_add(1);
+    Ok(true)
 }
 
 fn load_latest_index_snapshot() -> Option<crate::core::storage::IndexSnapshot> {
@@ -4515,10 +4667,10 @@ fn build_search_index_for_config(
 fn build_search_index_with_content_for_config(
     config: &QuickFoxConfig,
     mut entries: Vec<IndexedEntry>,
-) -> SearchIndex {
+) -> Result<SearchIndex, String> {
     let content_roots = content_index_roots(config);
     if content_roots.is_empty() || entries.is_empty() {
-        return SearchIndex::from_entries(entries);
+        return Ok(SearchIndex::from_entries(entries));
     }
 
     let mut content_entries: Vec<_> = entries
@@ -4527,11 +4679,12 @@ fn build_search_index_with_content_for_config(
         .cloned()
         .collect();
     if content_entries.is_empty() {
-        return SearchIndex::from_entries(entries);
+        return Ok(SearchIndex::from_entries(entries));
     }
 
-    match ContentIndex::build(&mut content_entries, content_index_options(config)) {
-        Ok(content_index) => {
+    ContentIndex::build(&mut content_entries, content_index_options(config))
+        .map_err(|error| error.to_string())
+        .map(|content_index| {
             let states_by_path: std::collections::HashMap<_, _> = content_entries
                 .into_iter()
                 .map(|entry| (entry.path, entry.content_index_state))
@@ -4543,12 +4696,7 @@ fn build_search_index_with_content_for_config(
                     .unwrap_or(ContentIndexState::NotIndexed);
             }
             SearchIndex::from_entries_with_content_index(entries, content_index)
-        }
-        Err(error) => {
-            eprintln!("QuickFox content index build failed: {error}");
-            SearchIndex::from_entries(entries)
-        }
-    }
+        })
 }
 
 fn should_build_content_index_for_config(
@@ -5691,6 +5839,268 @@ mod tests {
         gate.release_after_setup();
         join.join().unwrap();
         assert!(ran.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[test]
+    fn startup_content_rebuild_waits_for_setup_gate_and_installs_atomically() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("startup-content.txt");
+        fs::write(&file, "startup asynchronous needle").unwrap();
+        let storage = SqliteStorage::open(temp.path().join("startup-content.sqlite")).unwrap();
+        let entry = IndexedEntry::from_path_metadata(&file, &root, IndexedEntryKind::File);
+        let baseline_id = storage
+            .save_completed_index_batch(1, std::slice::from_ref(&entry))
+            .unwrap();
+        storage
+            .activate_baseline_with_manifest_and_clear_incremental_state(
+                baseline_id,
+                0,
+                &baseline_manifest_from_entries(
+                    std::slice::from_ref(&entry),
+                    std::slice::from_ref(&root),
+                ),
+            )
+            .unwrap();
+        let mut config =
+            QuickFoxConfig::default_with_index_dirs(vec![root.to_string_lossy().into_owned()]);
+        config.index.content_include_dirs = vec![root.to_string_lossy().into_owned()];
+        let runtime = build_runtime_from_recovery(config, recover_layered_index(&storage));
+        assert!(runtime.index.materialized_entries().iter().any(|entry| {
+            entry.path == file.to_string_lossy()
+                && entry.content_index_state == ContentIndexState::NotIndexed
+        }));
+        assert!(runtime
+            .index
+            .search(
+                &crate::core::search::QueryRequest::new(
+                    "startup-content",
+                    crate::core::search::SearchMode::Normal,
+                ),
+                20,
+            )
+            .iter()
+            .any(|result| result.detail.as_deref() == Some(file.to_string_lossy().as_ref())));
+        let state = Arc::new(QuickFoxAppState {
+            runtime: Mutex::new(runtime),
+            index_refresh_fence: Mutex::new(()),
+            window_state: Mutex::new(LauncherWindowState::default()),
+            global_hotkey_status: Mutex::new(pending_global_hotkey_status()),
+        });
+        assert_eq!(
+            rebuild_recovered_content_index_with(&state, |_, _| {
+                Err("injected content build failure".to_owned())
+            }),
+            Err("injected content build failure".to_owned())
+        );
+        assert!(state
+            .runtime
+            .lock()
+            .unwrap()
+            .index
+            .search(
+                &crate::core::search::QueryRequest::new(
+                    "startup-content",
+                    crate::core::search::SearchMode::Normal,
+                ),
+                20,
+            )
+            .iter()
+            .any(|result| result.detail.as_deref() == Some(file.to_string_lossy().as_ref())));
+        let gate = Arc::new(StartupIndexingGate::default());
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        let worker_state = Arc::clone(&state);
+        schedule_startup_indexing_with(&SystemRefreshWorkerSpawner, Arc::clone(&gate), move || {
+            let result = rebuild_recovered_content_index_with(&worker_state, |config, entries| {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                build_search_index_with_content_for_config(config, entries)
+            });
+            done_tx.send(result).unwrap();
+        })
+        .unwrap();
+
+        assert!(started_rx.recv_timeout(Duration::from_millis(100)).is_err());
+        gate.release_after_setup();
+        started_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(*gate.setup_returned.lock().unwrap());
+        assert!(state
+            .runtime
+            .lock()
+            .unwrap()
+            .index
+            .search(
+                &crate::core::search::QueryRequest::new(
+                    "startup-content",
+                    crate::core::search::SearchMode::Normal,
+                ),
+                20,
+            )
+            .iter()
+            .any(|result| result.detail.as_deref() == Some(file.to_string_lossy().as_ref())));
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_secs(3)).unwrap(),
+            Ok(true)
+        );
+        let runtime = state.runtime.lock().unwrap();
+        assert!(runtime
+            .index
+            .search(
+                &crate::core::search::QueryRequest::new(
+                    "content:needle",
+                    crate::core::search::SearchMode::Normal,
+                ),
+                20,
+            )
+            .iter()
+            .any(|result| result.detail.as_deref() == Some(file.to_string_lossy().as_ref())));
+    }
+
+    #[test]
+    fn startup_content_rebuild_cannot_overwrite_same_fingerprint_config_transition() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        let recovered_file = root.join("recovered.txt");
+        let replacement_file = root.join("config-transition.txt");
+        fs::write(&recovered_file, "recovered").unwrap();
+        fs::write(&replacement_file, "replacement").unwrap();
+        let mut config =
+            QuickFoxConfig::default_with_index_dirs(vec![root.to_string_lossy().into_owned()]);
+        config.index.content_include_dirs = vec![root.to_string_lossy().into_owned()];
+        let runtime = build_runtime_from_snapshot(
+            config,
+            Some(crate::core::storage::IndexSnapshot {
+                completed_at_ms: 1,
+                needs_full_refresh: false,
+                entries: vec![IndexedEntry::from_path_metadata(
+                    &recovered_file,
+                    &root,
+                    IndexedEntryKind::File,
+                )],
+            }),
+        );
+        let state = Arc::new(QuickFoxAppState {
+            runtime: Mutex::new(runtime),
+            index_refresh_fence: Mutex::new(()),
+            window_state: Mutex::new(LauncherWindowState::default()),
+            global_hotkey_status: Mutex::new(pending_global_hotkey_status()),
+        });
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+
+        let result = std::thread::scope(|scope| {
+            let worker_state = Arc::clone(&state);
+            let worker = scope.spawn(move || {
+                rebuild_recovered_content_index_with(&worker_state, |_, entries| {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(SearchIndex::from_entries(entries))
+                })
+            });
+            started_rx.recv().unwrap();
+            {
+                let mut runtime = state.runtime.lock().unwrap();
+                let generation = runtime.index.generation();
+                runtime.index_refresh.config_revision =
+                    runtime.index_refresh.config_revision.saturating_add(1);
+                runtime.index.replace_baseline(
+                    vec![IndexedEntry::from_path_metadata(
+                        &replacement_file,
+                        &root,
+                        IndexedEntryKind::File,
+                    )],
+                    generation,
+                );
+                runtime.index_refresh.search_view_epoch =
+                    runtime.index_refresh.search_view_epoch.saturating_add(1);
+            }
+            release_tx.send(()).unwrap();
+            worker.join().unwrap()
+        });
+
+        assert_eq!(result, Ok(false));
+        let entries = state.runtime.lock().unwrap().index.materialized_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, replacement_file.to_string_lossy());
+    }
+
+    #[test]
+    fn startup_content_rebuild_cannot_overwrite_completed_same_generation_refresh() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        let recovered_file = root.join("recovered.txt");
+        let refreshed_file = root.join("manual-refresh.txt");
+        fs::write(&recovered_file, "recovered").unwrap();
+        fs::write(&refreshed_file, "refreshed").unwrap();
+        let mut config =
+            QuickFoxConfig::default_with_index_dirs(vec![root.to_string_lossy().into_owned()]);
+        config.index.content_include_dirs = vec![root.to_string_lossy().into_owned()];
+        let runtime = build_runtime_from_snapshot(
+            config,
+            Some(crate::core::storage::IndexSnapshot {
+                completed_at_ms: 1,
+                needs_full_refresh: false,
+                entries: vec![IndexedEntry::from_path_metadata(
+                    &recovered_file,
+                    &root,
+                    IndexedEntryKind::File,
+                )],
+            }),
+        );
+        let state = Arc::new(QuickFoxAppState {
+            runtime: Mutex::new(runtime),
+            index_refresh_fence: Mutex::new(()),
+            window_state: Mutex::new(LauncherWindowState::default()),
+            global_hotkey_status: Mutex::new(pending_global_hotkey_status()),
+        });
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+
+        let result = std::thread::scope(|scope| {
+            let worker_state = Arc::clone(&state);
+            let worker = scope.spawn(move || {
+                rebuild_recovered_content_index_with(&worker_state, |_, entries| {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(SearchIndex::from_entries(entries))
+                })
+            });
+            started_rx.recv().unwrap();
+            let (refresh_generation, baseline_generation) = {
+                let mut runtime = state.runtime.lock().unwrap();
+                let baseline_generation = runtime.index.generation();
+                let refresh_generation = runtime.index_lifecycle.start_refresh(true);
+                (refresh_generation, baseline_generation)
+            };
+            apply_completed_index_refresh(
+                &state,
+                refresh_generation,
+                baseline_generation,
+                IndexReport {
+                    entries: vec![IndexedEntry::from_path_metadata(
+                        &refreshed_file,
+                        &root,
+                        IndexedEntryKind::File,
+                    )],
+                    ..IndexReport::default()
+                },
+                2,
+            )
+            .unwrap();
+            release_tx.send(()).unwrap();
+            worker.join().unwrap()
+        });
+
+        assert_eq!(result, Ok(false));
+        let entries = state.runtime.lock().unwrap().index.materialized_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, refreshed_file.to_string_lossy());
     }
 
     #[test]
@@ -6869,66 +7279,6 @@ mod tests {
     }
 
     #[test]
-    fn revision_handoff_fence_excludes_old_service_journal_tail() {
-        let temp = tempfile::tempdir().unwrap();
-        let new_root = temp.path().join("new-root");
-        fs::create_dir_all(&new_root).unwrap();
-        let storage = SqliteStorage::open(temp.path().join("revision-fence.sqlite")).unwrap();
-        let baseline_id = storage.save_completed_index_batch(1, &[]).unwrap();
-        storage
-            .activate_baseline_with_manifest_and_clear_incremental_state(
-                baseline_id,
-                0,
-                &baseline_manifest_from_entries(&[], std::slice::from_ref(&new_root)),
-            )
-            .unwrap();
-        storage
-            .commit_incremental_batch(
-                &CommittedIndexDelta {
-                    generation: 1,
-                    upserts: vec![IndexedEntry::from_path_metadata(
-                        "/old-root/contamination.md",
-                        "/old-root",
-                        IndexedEntryKind::File,
-                    )],
-                    removals: vec![],
-                },
-                &[],
-                &[],
-            )
-            .unwrap();
-        let new_entry = IndexedEntry::from_path_metadata(
-            new_root.join("captured.md"),
-            &new_root,
-            IndexedEntryKind::File,
-        );
-        storage
-            .commit_incremental_batch(
-                &CommittedIndexDelta {
-                    generation: 2,
-                    upserts: vec![new_entry.clone()],
-                    removals: vec![],
-                },
-                &[],
-                &[],
-            )
-            .unwrap();
-
-        let (tail, _) = load_revision_compatible_handoff_snapshot(
-            &storage,
-            0,
-            Some(RevisionCaptureFence::after_old_service_join(1)),
-            std::slice::from_ref(&new_root),
-            &[],
-        )
-        .unwrap();
-
-        assert_eq!(tail.len(), 1);
-        assert_eq!(tail[0].generation, 2);
-        assert_eq!(tail[0].upserts, vec![new_entry]);
-    }
-
-    #[test]
     fn production_config_transition_joins_old_service_before_generation_fence() {
         let temp = tempfile::Builder::new()
             .prefix("quickfox-revision-transition-")
@@ -7502,6 +7852,22 @@ mod tests {
             .iter()
             .any(|entry| {
                 entry.path == file.to_string_lossy()
+                    && entry.content_index_state == ContentIndexState::NotIndexed
+            }));
+        let recovered_state = QuickFoxAppState {
+            runtime: Mutex::new(recovered_runtime),
+            index_refresh_fence: Mutex::new(()),
+            window_state: Mutex::new(LauncherWindowState::default()),
+            global_hotkey_status: Mutex::new(pending_global_hotkey_status()),
+        };
+        assert!(rebuild_recovered_content_index(&recovered_state).unwrap());
+        let recovered_runtime = recovered_state.runtime.lock().unwrap();
+        assert!(recovered_runtime
+            .index
+            .materialized_entries()
+            .iter()
+            .any(|entry| {
+                entry.path == file.to_string_lossy()
                     && entry.content_index_state == ContentIndexState::Indexed
             }));
         let content_results = recovered_runtime.index.search(
@@ -7584,6 +7950,55 @@ mod tests {
             .iter()
             .any(|entry| entry.path == captured.to_string_lossy()));
         stop_runtime_incremental_indexing(&state);
+    }
+
+    #[test]
+    fn revision_candidate_registration_ack_precedes_immediate_calibration_mutation() {
+        let temp = tempfile::Builder::new()
+            .prefix("quickfox-registration-ack-")
+            .tempdir_in(std::env::temp_dir())
+            .unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        let storage = SqliteStorage::open(temp.path().join("registration-ack.sqlite")).unwrap();
+        let baseline_id = storage.save_completed_index_batch(1, &[]).unwrap();
+        storage
+            .activate_baseline_with_manifest_and_clear_incremental_state(
+                baseline_id,
+                0,
+                &baseline_manifest_from_entries(&[], std::slice::from_ref(&root)),
+            )
+            .unwrap();
+        let config =
+            QuickFoxConfig::default_with_index_dirs(vec![root.to_string_lossy().into_owned()]);
+        let immediate = root.join("immediate-after-ack.txt");
+
+        let candidate = prepare_config_revision_candidate_with_registration_boundary(
+            config,
+            &storage,
+            1,
+            vec![root],
+            || fs::write(&immediate, "registration boundary").unwrap(),
+            Vec::new,
+        )
+        .unwrap();
+
+        assert!(
+            candidate
+                .entries
+                .iter()
+                .any(|entry| entry.path == immediate.to_string_lossy()),
+            "candidate entries: {:?}",
+            candidate
+                .entries
+                .iter()
+                .map(|entry| &entry.path)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            candidate.session.phase(),
+            crate::core::index_refresh_orchestrator::CalibrationPhase::Calibrated
+        );
     }
 
     #[test]
