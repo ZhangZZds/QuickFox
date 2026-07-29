@@ -512,7 +512,7 @@ struct ActivatedConfigRollback<'a> {
     before_restore: &'a dyn Fn() -> Result<(), String>,
     candidate_config: &'a QuickFoxConfig,
     candidate_revision: u64,
-    schedule_recovery: &'a dyn Fn() -> Result<(), String>,
+    recovery_requested: &'a AtomicBool,
 }
 
 impl<'a> ConfigRevisionTransitionHooks<'a> {
@@ -651,157 +651,67 @@ fn transition_runtime_config_revision_with_hooks(
     publish: impl Fn(RuntimeServiceIdentity, RuntimeIndexingEvent) + Send + 'static,
     hooks: ConfigRevisionTransitionHooks<'_>,
 ) -> Result<WakeShortcut, String> {
+    let recovery_requested = AtomicBool::new(false);
     let _refresh_fence = state
         .index_refresh_fence
         .lock()
         .expect("index refresh fence poisoned");
-    let preflight_generation = match storage.highest_committed_generation() {
-        Ok(generation) => generation,
-        Err(error) => {
-            record_config_transition_failure(state);
-            return Err(error.to_string());
-        }
-    };
-    let (
-        mut previous,
-        previous_service,
-        mut rollback_entries,
-        rollback_view_generation,
-        next_service_epoch,
-    ) = {
-        let mut runtime = state
-            .runtime
-            .lock()
-            .expect("quickfox runtime lock poisoned");
-        let previous_service = runtime.index_refresh.active_service.take();
-        let rollback_entries = runtime.index.materialized_entries();
-        let rollback_view_generation = runtime.index.generation();
-        runtime.index_refresh.next_service_epoch =
-            runtime.index_refresh.next_service_epoch.saturating_add(1);
-        (
-            runtime.runtime_indexing.take(),
-            previous_service,
-            rollback_entries,
-            rollback_view_generation,
-            runtime.index_refresh.next_service_epoch,
-        )
-    };
-    if let Err(error) = (hooks.before_old_fence)() {
-        return Err(restore_fenced_config_service(
-            state,
-            previous,
-            previous_service,
-            error,
-        ));
-    }
-    let mut fence_generation = match previous.as_mut() {
-        Some(handle) => match handle.fence() {
-            Ok(generation) => generation.max(preflight_generation),
+    let transition_result = (|| -> Result<WakeShortcut, String> {
+        let preflight_generation = match storage.highest_committed_generation() {
+            Ok(generation) => generation,
             Err(error) => {
-                return Err(restore_fenced_config_service(
-                    state,
-                    previous,
-                    previous_service,
-                    error,
-                ));
+                record_config_transition_failure(state);
+                return Err(error.to_string());
             }
-        },
-        None => preflight_generation,
-    };
-    fence_generation = match storage.highest_committed_generation() {
-        Ok(generation) => fence_generation.max(generation),
-        Err(error) => {
-            return Err(restore_fenced_config_service(
-                state,
-                previous,
-                previous_service,
-                error.to_string(),
-            ));
-        }
-    };
-    let rollback_tail = match storage.committed_index_deltas_after(rollback_view_generation) {
-        Ok(tail) => tail,
-        Err(error) => {
-            return Err(restore_fenced_config_service(
-                state,
-                previous,
-                previous_service,
-                error.to_string(),
-            ));
-        }
-    };
-    rollback_entries = entries_after_committed_deltas(rollback_entries, &rollback_tail);
-    let successor_watcher = match RuntimeIndexWatcher::watch_roots(candidate.roots.clone()) {
-        Ok(watcher) => watcher,
-        Err(failure) => {
-            return Err(restore_fenced_config_service(
-                state,
-                previous,
-                previous_service,
-                failure.message,
-            ));
-        }
-    };
-    let inbox = match candidate.capture_watcher.take_inbox() {
-        Some(inbox) => inbox,
-        None => {
-            return Err(restore_fenced_config_service(
-                state,
-                previous,
-                previous_service,
-                "config candidate watcher inbox is unavailable".to_owned(),
-            ));
-        }
-    };
-    drop(candidate.capture_watcher);
-    if let Some(failure) = inbox.take_failure() {
-        return Err(restore_fenced_config_service(
-            state,
-            previous,
+        };
+        let (
+            mut previous,
             previous_service,
-            failure.message,
-        ));
-    }
-    if inbox.take_degradation_code().is_some() || !inbox.take_dirty_roots().is_empty() {
-        return Err(restore_fenced_config_service(
-            state,
-            previous,
-            previous_service,
-            "config candidate capture requires a fresh calibration".to_owned(),
-        ));
-    }
-    let mut coordinator = crate::core::index_update_coordinator::CoordinatorState::new(
-        crate::core::index_update_coordinator::CoordinatorPolicy::production(),
-    );
-    for event in candidate.buffered_capture_events {
-        if coordinator.push_event(event, Instant::now())
-            == crate::core::index_update_coordinator::CoordinatorPushOutcome::CapacityReached
-        {
+            mut rollback_entries,
+            rollback_view_generation,
+            next_service_epoch,
+        ) = {
+            let mut runtime = state
+                .runtime
+                .lock()
+                .expect("quickfox runtime lock poisoned");
+            let previous_service = runtime.index_refresh.active_service.take();
+            let rollback_entries = runtime.index.materialized_entries();
+            let rollback_view_generation = runtime.index.generation();
+            runtime.index_refresh.next_service_epoch =
+                runtime.index_refresh.next_service_epoch.saturating_add(1);
+            (
+                runtime.runtime_indexing.take(),
+                previous_service,
+                rollback_entries,
+                rollback_view_generation,
+                runtime.index_refresh.next_service_epoch,
+            )
+        };
+        if let Err(error) = (hooks.before_old_fence)() {
             return Err(restore_fenced_config_service(
                 state,
                 previous,
                 previous_service,
-                "config candidate buffered capture overflowed".to_owned(),
+                error,
             ));
         }
-    }
-    while let Ok(event) = inbox.try_recv() {
-        if coordinator.push_event(event, Instant::now())
-            == crate::core::index_update_coordinator::CoordinatorPushOutcome::CapacityReached
-        {
-            return Err(restore_fenced_config_service(
-                state,
-                previous,
-                previous_service,
-                "config candidate capture overflowed".to_owned(),
-            ));
-        }
-    }
-    if !coordinator.is_empty() {
-        let calibration = match TargetedIndexScanner::new(candidate.rules.clone())
-            .scan_batch(coordinator.drain())
-        {
-            Ok(calibration) => calibration,
+        let mut fence_generation = match previous.as_mut() {
+            Some(handle) => match handle.fence() {
+                Ok(generation) => generation.max(preflight_generation),
+                Err(error) => {
+                    return Err(restore_fenced_config_service(
+                        state,
+                        previous,
+                        previous_service,
+                        error,
+                    ));
+                }
+            },
+            None => preflight_generation,
+        };
+        fence_generation = match storage.highest_committed_generation() {
+            Ok(generation) => fence_generation.max(generation),
             Err(error) => {
                 return Err(restore_fenced_config_service(
                     state,
@@ -811,340 +721,447 @@ fn transition_runtime_config_revision_with_hooks(
                 ));
             }
         };
-        if !calibration.failures.is_empty() {
+        let rollback_tail = match storage.committed_index_deltas_after(rollback_view_generation) {
+            Ok(tail) => tail,
+            Err(error) => {
+                return Err(restore_fenced_config_service(
+                    state,
+                    previous,
+                    previous_service,
+                    error.to_string(),
+                ));
+            }
+        };
+        rollback_entries = entries_after_committed_deltas(rollback_entries, &rollback_tail);
+        let successor_watcher = match RuntimeIndexWatcher::watch_roots(candidate.roots.clone()) {
+            Ok(watcher) => watcher,
+            Err(failure) => {
+                return Err(restore_fenced_config_service(
+                    state,
+                    previous,
+                    previous_service,
+                    failure.message,
+                ));
+            }
+        };
+        let inbox = match candidate.capture_watcher.take_inbox() {
+            Some(inbox) => inbox,
+            None => {
+                return Err(restore_fenced_config_service(
+                    state,
+                    previous,
+                    previous_service,
+                    "config candidate watcher inbox is unavailable".to_owned(),
+                ));
+            }
+        };
+        drop(candidate.capture_watcher);
+        if let Some(failure) = inbox.take_failure() {
             return Err(restore_fenced_config_service(
                 state,
                 previous,
                 previous_service,
-                "config candidate targeted calibration failed".to_owned(),
-            ));
-        }
-        candidate.entries = entries_after_committed_deltas(
-            candidate.entries,
-            &[CommittedIndexDelta {
-                generation: fence_generation,
-                upserts: calibration.upserts,
-                removals: calibration.removals,
-            }],
-        );
-    }
-    if let Err(error) = candidate.session.mark_fenced(fence_generation) {
-        return Err(restore_fenced_config_service(
-            state,
-            previous,
-            previous_service,
-            format!("config candidate fence transition failed: {error:?}"),
-        ));
-    }
-    let manifest = baseline_manifest_from_entries(&candidate.entries, &candidate.roots);
-    let rollback_manifest = load_complete_directory_manifest(storage).map_err(|error| {
-        restore_fenced_config_service(state, previous.take(), previous_service, error)
-    })?;
-    let rollback_baseline_id = storage
-        .save_completed_index_batch(current_time_ms(), &rollback_entries)
-        .map_err(|error| {
-            restore_fenced_config_service(
-                state,
-                previous.take(),
-                previous_service,
-                error.to_string(),
-            )
-        })?;
-    let candidate_baseline_id = storage
-        .save_completed_index_batch(current_time_ms(), &candidate.entries)
-        .map_err(|error| {
-            restore_fenced_config_service(
-                state,
-                previous.take(),
-                previous_service,
-                error.to_string(),
-            )
-        })?;
-    if let Err(error) = persist() {
-        let restore_error = restore_config().err();
-        return Err(restore_fenced_config_service(
-            state,
-            previous,
-            previous_service,
-            restore_error
-                .map(|restore| format!("{error}; failed to restore config: {restore}"))
-                .unwrap_or(error),
-        ));
-    }
-    if let Err(error) = (hooks.before_activation)() {
-        let restore_error = restore_config().err();
-        return Err(restore_fenced_config_service(
-            state,
-            previous,
-            previous_service,
-            restore_error
-                .map(|restore| format!("{error}; failed to restore config: {restore}"))
-                .unwrap_or(error),
-        ));
-    }
-    if let Err(error) = storage.activate_baseline_with_manifest_and_clear_incremental_state(
-        candidate_baseline_id,
-        fence_generation,
-        &manifest,
-    ) {
-        let restore_error = restore_config().err();
-        return Err(restore_fenced_config_service(
-            state,
-            previous,
-            previous_service,
-            restore_error
-                .map(|restore| format!("{error}; failed to restore config: {restore}"))
-                .unwrap_or_else(|| error.to_string()),
-        ));
-    }
-    let rollback_target = ActivatedConfigRollback {
-        storage,
-        baseline_id: rollback_baseline_id,
-        generation: fence_generation,
-        manifest: &rollback_manifest,
-        before_restore: hooks.before_storage_rollback,
-        candidate_config: &candidate.config,
-        candidate_revision: candidate.session.revision(),
-        schedule_recovery: hooks.schedule_recovery,
-    };
-    let future_service = RuntimeServiceIdentity {
-        epoch: next_service_epoch,
-        config_revision: candidate.session.revision(),
-    };
-    let publish_service = future_service;
-    if let Err(error) = (hooks.before_successor_start)() {
-        return Err(rollback_activated_config_revision(
-            state,
-            previous,
-            previous_service,
-            rollback_target,
-            restore_config,
-            error,
-        ));
-    }
-    let successor_storage = match storage.reopen() {
-        Ok(storage) => storage,
-        Err(error) => {
-            return Err(rollback_activated_config_revision(
-                state,
-                previous,
-                previous_service,
-                rollback_target,
-                restore_config,
-                error.to_string(),
-            ));
-        }
-    };
-    let mut successor = match start_runtime_indexing(
-        successor_watcher,
-        TargetedIndexScanner::new(candidate.rules.clone()),
-        Box::new(successor_storage),
-        RuntimeIndexingOptions {
-            roots: candidate.roots.clone(),
-            policy: crate::core::index_update_coordinator::CoordinatorPolicy::production(),
-            initial_generation: fence_generation,
-        },
-        move |event| publish(publish_service, event),
-    ) {
-        Ok(handle) => handle,
-        Err(failure) => {
-            return Err(rollback_activated_config_revision(
-                state,
-                previous,
-                previous_service,
-                rollback_target,
-                restore_config,
                 failure.message,
             ));
         }
-    };
-    if let Err(error) = (hooks.before_successor_fence)() {
-        successor.stop();
-        return Err(rollback_activated_config_revision(
-            state,
-            previous,
-            previous_service,
-            rollback_target,
-            restore_config,
-            error,
-        ));
-    }
-    let watcher_enabled = candidate.config.index.watcher_enabled;
-    let (mut successor_generation, mut successor) = if watcher_enabled {
-        let generation = match successor.fence() {
-            Ok(generation) => generation,
+        if inbox.take_degradation_code().is_some() || !inbox.take_dirty_roots().is_empty() {
+            return Err(restore_fenced_config_service(
+                state,
+                previous,
+                previous_service,
+                "config candidate capture requires a fresh calibration".to_owned(),
+            ));
+        }
+        let mut coordinator = crate::core::index_update_coordinator::CoordinatorState::new(
+            crate::core::index_update_coordinator::CoordinatorPolicy::production(),
+        );
+        for event in candidate.buffered_capture_events {
+            if coordinator.push_event(event, Instant::now())
+                == crate::core::index_update_coordinator::CoordinatorPushOutcome::CapacityReached
+            {
+                return Err(restore_fenced_config_service(
+                    state,
+                    previous,
+                    previous_service,
+                    "config candidate buffered capture overflowed".to_owned(),
+                ));
+            }
+        }
+        while let Ok(event) = inbox.try_recv() {
+            if coordinator.push_event(event, Instant::now())
+                == crate::core::index_update_coordinator::CoordinatorPushOutcome::CapacityReached
+            {
+                return Err(restore_fenced_config_service(
+                    state,
+                    previous,
+                    previous_service,
+                    "config candidate capture overflowed".to_owned(),
+                ));
+            }
+        }
+        if !coordinator.is_empty() {
+            let calibration = match TargetedIndexScanner::new(candidate.rules.clone())
+                .scan_batch(coordinator.drain())
+            {
+                Ok(calibration) => calibration,
+                Err(error) => {
+                    return Err(restore_fenced_config_service(
+                        state,
+                        previous,
+                        previous_service,
+                        error.to_string(),
+                    ));
+                }
+            };
+            if !calibration.failures.is_empty() {
+                return Err(restore_fenced_config_service(
+                    state,
+                    previous,
+                    previous_service,
+                    "config candidate targeted calibration failed".to_owned(),
+                ));
+            }
+            candidate.entries = entries_after_committed_deltas(
+                candidate.entries,
+                &[CommittedIndexDelta {
+                    generation: fence_generation,
+                    upserts: calibration.upserts,
+                    removals: calibration.removals,
+                }],
+            );
+        }
+        if let Err(error) = candidate.session.mark_fenced(fence_generation) {
+            return Err(restore_fenced_config_service(
+                state,
+                previous,
+                previous_service,
+                format!("config candidate fence transition failed: {error:?}"),
+            ));
+        }
+        let manifest = baseline_manifest_from_entries(&candidate.entries, &candidate.roots);
+        let rollback_manifest = load_complete_directory_manifest(storage).map_err(|error| {
+            restore_fenced_config_service(state, previous.take(), previous_service, error)
+        })?;
+        let rollback_baseline_id = storage
+            .save_completed_index_batch(current_time_ms(), &rollback_entries)
+            .map_err(|error| {
+                restore_fenced_config_service(
+                    state,
+                    previous.take(),
+                    previous_service,
+                    error.to_string(),
+                )
+            })?;
+        let candidate_baseline_id = storage
+            .save_completed_index_batch(current_time_ms(), &candidate.entries)
+            .map_err(|error| {
+                restore_fenced_config_service(
+                    state,
+                    previous.take(),
+                    previous_service,
+                    error.to_string(),
+                )
+            })?;
+        if let Err(error) = persist() {
+            let restore_error = restore_config().err();
+            return Err(restore_fenced_config_service(
+                state,
+                previous,
+                previous_service,
+                restore_error
+                    .map(|restore| format!("{error}; failed to restore config: {restore}"))
+                    .unwrap_or(error),
+            ));
+        }
+        if let Err(error) = (hooks.before_activation)() {
+            let restore_error = restore_config().err();
+            return Err(restore_fenced_config_service(
+                state,
+                previous,
+                previous_service,
+                restore_error
+                    .map(|restore| format!("{error}; failed to restore config: {restore}"))
+                    .unwrap_or(error),
+            ));
+        }
+        if let Err(error) = storage.activate_baseline_with_manifest_and_clear_incremental_state(
+            candidate_baseline_id,
+            fence_generation,
+            &manifest,
+        ) {
+            let restore_error = restore_config().err();
+            return Err(restore_fenced_config_service(
+                state,
+                previous,
+                previous_service,
+                restore_error
+                    .map(|restore| format!("{error}; failed to restore config: {restore}"))
+                    .unwrap_or_else(|| error.to_string()),
+            ));
+        }
+        let rollback_target = ActivatedConfigRollback {
+            storage,
+            baseline_id: rollback_baseline_id,
+            generation: fence_generation,
+            manifest: &rollback_manifest,
+            before_restore: hooks.before_storage_rollback,
+            candidate_config: &candidate.config,
+            candidate_revision: candidate.session.revision(),
+            recovery_requested: &recovery_requested,
+        };
+        let future_service = RuntimeServiceIdentity {
+            epoch: next_service_epoch,
+            config_revision: candidate.session.revision(),
+        };
+        let publish_service = future_service;
+        if let Err(error) = (hooks.before_successor_start)() {
+            return Err(rollback_activated_config_revision(
+                state,
+                previous,
+                previous_service,
+                rollback_target,
+                restore_config,
+                error,
+            ));
+        }
+        let successor_storage = match storage.reopen() {
+            Ok(storage) => storage,
             Err(error) => {
-                successor.stop();
                 return Err(rollback_activated_config_revision(
                     state,
                     previous,
                     previous_service,
                     rollback_target,
                     restore_config,
-                    error,
+                    error.to_string(),
                 ));
             }
         };
-        (generation, Some(successor))
-    } else {
-        let handoff = successor.handoff_with_generation();
-        if handoff.outcome == RuntimeIndexingHandoffOutcome::RecoveryRequired {
-            return Err(rollback_activated_config_revision(
-                state,
-                previous,
-                previous_service,
-                rollback_target,
-                restore_config,
-                "disabled config successor handoff requires recovery".to_owned(),
-            ));
-        }
-        (handoff.last_committed_generation, None)
-    };
-    if let Err(error) = (hooks.after_successor_fence)() {
-        if let Some(successor) = successor {
-            successor.stop();
-        }
-        return Err(rollback_activated_config_revision(
-            state,
-            previous,
-            previous_service,
-            rollback_target,
-            restore_config,
-            error,
-        ));
-    }
-    let successor_tail = match storage.committed_index_deltas_after(fence_generation) {
-        Ok(tail) => tail,
-        Err(error) => {
-            if let Some(successor) = successor {
-                successor.stop();
+        let mut successor = match start_runtime_indexing(
+            successor_watcher,
+            TargetedIndexScanner::new(candidate.rules.clone()),
+            Box::new(successor_storage),
+            RuntimeIndexingOptions {
+                roots: candidate.roots.clone(),
+                policy: crate::core::index_update_coordinator::CoordinatorPolicy::production(),
+                initial_generation: fence_generation,
+            },
+            move |event| publish(publish_service, event),
+        ) {
+            Ok(handle) => handle,
+            Err(failure) => {
+                return Err(rollback_activated_config_revision(
+                    state,
+                    previous,
+                    previous_service,
+                    rollback_target,
+                    restore_config,
+                    failure.message,
+                ));
             }
-            return Err(rollback_activated_config_revision(
-                state,
-                previous,
-                previous_service,
-                rollback_target,
-                restore_config,
-                error.to_string(),
-            ));
-        }
-    };
-    if let Some(last) = successor_tail.last() {
-        successor_generation = successor_generation.max(last.generation);
-    }
-    if let Err(error) = candidate.session.mark_watching() {
-        if let Some(successor) = successor {
-            successor.stop();
-        }
-        return Err(rollback_activated_config_revision(
-            state,
-            previous,
-            previous_service,
-            rollback_target,
-            restore_config,
-            format!("config candidate watching transition failed: {error:?}"),
-        ));
-    }
-    let final_candidate_entries =
-        entries_after_committed_deltas(candidate.entries, &successor_tail);
-    let candidate_search_index =
-        build_search_index_with_content_for_config(&candidate.config, final_candidate_entries);
-    let final_manifest = baseline_manifest_after_committed_deltas(
-        candidate_search_index.entries(),
-        &successor_tail,
-        &candidate.roots,
-    );
-    let final_baseline_id = match storage
-        .save_completed_index_batch(current_time_ms(), candidate_search_index.entries())
-    {
-        Ok(baseline_id) => baseline_id,
-        Err(error) => {
-            if let Some(successor) = successor {
-                successor.stop();
-            }
-            return Err(rollback_activated_config_revision(
-                state,
-                previous,
-                previous_service,
-                rollback_target,
-                restore_config,
-                error.to_string(),
-            ));
-        }
-    };
-    if let Err(error) = storage.activate_baseline_with_manifest_and_clear_incremental_state(
-        final_baseline_id,
-        successor_generation,
-        &final_manifest,
-    ) {
-        if let Some(successor) = successor {
-            successor.stop();
-        }
-        return Err(rollback_activated_config_revision(
-            state,
-            previous,
-            previous_service,
-            rollback_target,
-            restore_config,
-            error.to_string(),
-        ));
-    }
-    let monitor = {
-        let mut runtime = state
-            .runtime
-            .lock()
-            .expect("quickfox runtime lock poisoned");
-        runtime.config = candidate.config;
-        runtime.index_refresh.config_revision = candidate.session.revision();
-        runtime.index_refresh.config_fingerprint =
-            index_semantic_config_fingerprint(&runtime.config);
-        runtime.index_refresh.active = None;
-        runtime.index_refresh.pending = false;
-        runtime.index_refresh.active_service = watcher_enabled.then_some(future_service);
-        runtime.index_refresh.standby_watcher = None;
-        runtime.index_refresh.revision_capture_fence = None;
-        runtime.index_refresh.restart_recovery_revision = None;
-        runtime.index_refresh.root_recovery_latch = RevisionRecoveryLatch::default();
-        runtime.index_refresh.root_monitor_failure_revision = None;
-        runtime
-            .index
-            .replace_baseline_search_index(candidate_search_index, successor_generation);
-        runtime.index_lifecycle =
-            IndexLifecycle::from_ready(runtime.index.entry_count(), current_time_ms());
-        runtime.last_report = candidate.report;
-        runtime.manifest_ready = true;
-        runtime.incremental_status.enabled = runtime.config.index.watcher_enabled;
-        runtime.incremental_status.state = if watcher_enabled {
-            IncrementalState::Watching
-        } else {
-            IncrementalState::Disabled
         };
-        runtime.incremental_status.degradation_code = None;
-        runtime.runtime_indexing = successor.take();
-        runtime.index_refresh.root_monitor.take()
-    };
-    if let Some(handle) = previous {
-        handle.stop();
+        if let Err(error) = (hooks.before_successor_fence)() {
+            successor.stop();
+            return Err(rollback_activated_config_revision(
+                state,
+                previous,
+                previous_service,
+                rollback_target,
+                restore_config,
+                error,
+            ));
+        }
+        let watcher_enabled = candidate.config.index.watcher_enabled;
+        let (mut successor_generation, mut successor) = if watcher_enabled {
+            let generation = match successor.fence() {
+                Ok(generation) => generation,
+                Err(error) => {
+                    successor.stop();
+                    return Err(rollback_activated_config_revision(
+                        state,
+                        previous,
+                        previous_service,
+                        rollback_target,
+                        restore_config,
+                        error,
+                    ));
+                }
+            };
+            (generation, Some(successor))
+        } else {
+            let handoff = successor.handoff_with_generation();
+            if handoff.outcome == RuntimeIndexingHandoffOutcome::RecoveryRequired {
+                return Err(rollback_activated_config_revision(
+                    state,
+                    previous,
+                    previous_service,
+                    rollback_target,
+                    restore_config,
+                    "disabled config successor handoff requires recovery".to_owned(),
+                ));
+            }
+            (handoff.last_committed_generation, None)
+        };
+        if let Err(error) = (hooks.after_successor_fence)() {
+            if let Some(successor) = successor {
+                successor.stop();
+            }
+            return Err(rollback_activated_config_revision(
+                state,
+                previous,
+                previous_service,
+                rollback_target,
+                restore_config,
+                error,
+            ));
+        }
+        let successor_tail = match storage.committed_index_deltas_after(fence_generation) {
+            Ok(tail) => tail,
+            Err(error) => {
+                if let Some(successor) = successor {
+                    successor.stop();
+                }
+                return Err(rollback_activated_config_revision(
+                    state,
+                    previous,
+                    previous_service,
+                    rollback_target,
+                    restore_config,
+                    error.to_string(),
+                ));
+            }
+        };
+        if let Some(last) = successor_tail.last() {
+            successor_generation = successor_generation.max(last.generation);
+        }
+        if let Err(error) = candidate.session.mark_watching() {
+            if let Some(successor) = successor {
+                successor.stop();
+            }
+            return Err(rollback_activated_config_revision(
+                state,
+                previous,
+                previous_service,
+                rollback_target,
+                restore_config,
+                format!("config candidate watching transition failed: {error:?}"),
+            ));
+        }
+        let final_candidate_entries =
+            entries_after_committed_deltas(candidate.entries, &successor_tail);
+        let candidate_search_index =
+            build_search_index_with_content_for_config(&candidate.config, final_candidate_entries);
+        let final_manifest = baseline_manifest_after_committed_deltas(
+            candidate_search_index.entries(),
+            &successor_tail,
+            &candidate.roots,
+        );
+        let final_baseline_id = match storage
+            .save_completed_index_batch(current_time_ms(), candidate_search_index.entries())
+        {
+            Ok(baseline_id) => baseline_id,
+            Err(error) => {
+                if let Some(successor) = successor {
+                    successor.stop();
+                }
+                return Err(rollback_activated_config_revision(
+                    state,
+                    previous,
+                    previous_service,
+                    rollback_target,
+                    restore_config,
+                    error.to_string(),
+                ));
+            }
+        };
+        if let Err(error) = storage.activate_baseline_with_manifest_and_clear_incremental_state(
+            final_baseline_id,
+            successor_generation,
+            &final_manifest,
+        ) {
+            if let Some(successor) = successor {
+                successor.stop();
+            }
+            return Err(rollback_activated_config_revision(
+                state,
+                previous,
+                previous_service,
+                rollback_target,
+                restore_config,
+                error.to_string(),
+            ));
+        }
+        let monitor = {
+            let mut runtime = state
+                .runtime
+                .lock()
+                .expect("quickfox runtime lock poisoned");
+            runtime.config = candidate.config;
+            runtime.index_refresh.config_revision = candidate.session.revision();
+            runtime.index_refresh.config_fingerprint =
+                index_semantic_config_fingerprint(&runtime.config);
+            runtime.index_refresh.active = None;
+            runtime.index_refresh.pending = false;
+            runtime.index_refresh.active_service = watcher_enabled.then_some(future_service);
+            runtime.index_refresh.standby_watcher = None;
+            runtime.index_refresh.revision_capture_fence = None;
+            runtime.index_refresh.restart_recovery_revision = None;
+            runtime.index_refresh.root_recovery_latch = RevisionRecoveryLatch::default();
+            runtime.index_refresh.root_monitor_failure_revision = None;
+            runtime
+                .index
+                .replace_baseline_search_index(candidate_search_index, successor_generation);
+            runtime.index_lifecycle =
+                IndexLifecycle::from_ready(runtime.index.entry_count(), current_time_ms());
+            runtime.last_report = candidate.report;
+            runtime.manifest_ready = true;
+            runtime.incremental_status.enabled = runtime.config.index.watcher_enabled;
+            runtime.incremental_status.state = if watcher_enabled {
+                IncrementalState::Watching
+            } else {
+                IncrementalState::Disabled
+            };
+            runtime.incremental_status.degradation_code = None;
+            runtime.runtime_indexing = successor.take();
+            runtime.index_refresh.root_monitor.take()
+        };
+        if let Some(handle) = previous {
+            handle.stop();
+        }
+        if let Some(mut monitor) = monitor {
+            monitor.cancel_and_join();
+        }
+        if watcher_enabled {
+            state
+                .runtime
+                .lock()
+                .expect("quickfox runtime lock poisoned")
+                .runtime_indexing
+                .as_mut()
+                .ok_or_else(|| "config successor service disappeared".to_owned())?
+                .resume()?;
+        }
+        let next_shortcut = current_wake_shortcut(&state.runtime.lock().unwrap().config);
+        debug_assert_eq!(
+            successor_generation,
+            storage.highest_committed_generation().unwrap_or(0)
+        );
+        Ok(next_shortcut)
+    })();
+    drop(_refresh_fence);
+    if recovery_requested.load(Ordering::Acquire) {
+        if let Err(recovery_error) = (hooks.schedule_recovery)() {
+            if let Err(inline_error) = recover_config_revision_baseline_inline(state, storage) {
+                return Err(format!(
+                    "{}; failed to schedule recovery: {recovery_error}; inline recovery failed: {inline_error}",
+                    transition_result
+                        .err()
+                        .unwrap_or_else(|| "config transition recovery required".to_owned())
+                ));
+            }
+        }
     }
-    if let Some(mut monitor) = monitor {
-        monitor.cancel_and_join();
-    }
-    if watcher_enabled {
-        state
-            .runtime
-            .lock()
-            .expect("quickfox runtime lock poisoned")
-            .runtime_indexing
-            .as_mut()
-            .ok_or_else(|| "config successor service disappeared".to_owned())?
-            .resume()?;
-    }
-    let next_shortcut = current_wake_shortcut(&state.runtime.lock().unwrap().config);
-    debug_assert_eq!(
-        successor_generation,
-        storage.highest_committed_generation().unwrap_or(0)
-    );
-    Ok(next_shortcut)
+    transition_result
 }
 
 fn load_complete_directory_manifest(
@@ -1240,19 +1257,8 @@ fn rollback_activated_config_revision(
         runtime.incremental_status.degradation_code =
             Some(IndexDegradationCode::FullRefreshFallback);
     }
-    match (rollback.schedule_recovery)() {
-        Ok(()) => combined,
-        Err(recovery_error) => {
-            match recover_config_revision_baseline_inline(state, rollback.storage) {
-                Ok(()) => format!(
-                    "{combined}; recovery worker unavailable, completed inline recovery: {recovery_error}"
-                ),
-                Err(inline_error) => format!(
-                    "{combined}; failed to schedule recovery: {recovery_error}; inline recovery failed: {inline_error}"
-                ),
-            }
-        }
-    }
+    rollback.recovery_requested.store(true, Ordering::Release);
+    combined
 }
 
 fn recover_config_revision_baseline_inline(
@@ -4045,6 +4051,7 @@ fn publish_runtime_indexing_event<R: tauri::Runtime>(
 ) {
     let dispatch = app.clone();
     let failure_app = app.clone();
+    let fallback_event = event.clone();
     let dispatch_failed = app
         .run_on_main_thread(move || {
             let state = dispatch.state::<QuickFoxAppState>();
@@ -4073,14 +4080,47 @@ fn publish_runtime_indexing_event<R: tauri::Runtime>(
         .is_err()
     {
         let state = failure_app.state::<QuickFoxAppState>();
-        if storage_store()
-            .as_ref()
-            .and_then(|storage| replay_runtime_dispatch_tail(&state, service, storage).ok())
-            .is_none()
-        {
-            mark_runtime_dispatch_recovery_spawn_failure(&failure_app, service);
+        match fallback_event {
+            RuntimeIndexingEvent::DeltaCommitted(_) => {
+                if storage_store()
+                    .as_ref()
+                    .and_then(|storage| replay_runtime_dispatch_tail(&state, service, storage).ok())
+                    .is_none()
+                {
+                    mark_runtime_dispatch_recovery_spawn_failure(&failure_app, service);
+                }
+            }
+            event => {
+                if mark_runtime_non_delta_dispatch_failure(&state, service, event) {
+                    let _ = start_background_index_refresh(failure_app.clone(), &state);
+                }
+            }
         }
     }
+}
+
+fn mark_runtime_non_delta_dispatch_failure(
+    state: &QuickFoxAppState,
+    service: RuntimeServiceIdentity,
+    event: RuntimeIndexingEvent,
+) -> bool {
+    let mut runtime = state
+        .runtime
+        .lock()
+        .expect("quickfox runtime lock poisoned");
+    if runtime.index_refresh.active_service != Some(service) {
+        return false;
+    }
+    if let RuntimeIndexingEvent::BaselineRefreshRequired { reason } = event {
+        if baseline_refresh_requires_manifest_rebuild(reason) {
+            runtime.manifest_ready = false;
+        }
+    }
+    runtime.index_refresh.restart_recovery_revision = None;
+    runtime.index_refresh.pending = true;
+    runtime.incremental_status.state = IncrementalState::Degraded;
+    runtime.incremental_status.degradation_code = Some(IndexDegradationCode::FullRefreshFallback);
+    true
 }
 
 fn replay_runtime_dispatch_tail(
@@ -7270,6 +7310,10 @@ mod tests {
             };
             let recovery_scheduled = Arc::new(AtomicBool::new(false));
             let schedule_recovery = || {
+                assert!(
+                    state.index_refresh_fence.try_lock().is_ok(),
+                    "recovery callback must run after releasing the config transition fence"
+                );
                 recovery_scheduled.store(true, Ordering::Release);
                 recover_config_revision_baseline_inline(&state, &storage)
             };
@@ -8253,6 +8297,48 @@ mod tests {
         assert_eq!(runtime.index.generation(), 0);
         assert!(runtime.index.materialized_entries().is_empty());
         assert_eq!(runtime.incremental_status.state, IncrementalState::Degraded);
+    }
+
+    #[test]
+    fn non_delta_dispatch_failure_stays_degraded_and_pending_for_full_refresh() {
+        for event in [
+            RuntimeIndexingEvent::Status(RuntimeIncrementalStatus {
+                enabled: true,
+                state: IncrementalState::Degraded,
+                degradation_code: Some(IndexDegradationCode::WatcherRuntimeFailed),
+                ..RuntimeIncrementalStatus::default()
+            }),
+            RuntimeIndexingEvent::BaselineRefreshRequired {
+                reason: BaselineRefreshReason::WatcherFailure,
+            },
+        ] {
+            let mut runtime = build_runtime_from_snapshot(
+                QuickFoxConfig::default_with_index_dirs(Vec::new()),
+                None,
+            );
+            let service = RuntimeServiceIdentity {
+                epoch: 2,
+                config_revision: 0,
+            };
+            runtime.index_refresh.active_service = Some(service);
+            runtime.manifest_ready = true;
+            let state = QuickFoxAppState {
+                runtime: Mutex::new(runtime),
+                index_refresh_fence: Mutex::new(()),
+                window_state: Mutex::new(LauncherWindowState::default()),
+                global_hotkey_status: Mutex::new(pending_global_hotkey_status()),
+            };
+
+            assert!(mark_runtime_non_delta_dispatch_failure(
+                &state, service, event
+            ));
+
+            let runtime = state.runtime.lock().unwrap();
+            assert!(runtime.index_refresh.pending);
+            assert_eq!(runtime.incremental_status.state, IncrementalState::Degraded);
+            assert_eq!(runtime.index.generation(), 0);
+            assert_ne!(runtime.incremental_status.state, IncrementalState::Watching);
+        }
     }
 
     #[test]
