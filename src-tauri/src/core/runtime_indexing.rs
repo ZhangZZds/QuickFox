@@ -4,7 +4,7 @@ use crate::core::index_entry::{path_is_same_or_descendant_for_mode, PathComparis
 use crate::core::index_entry::{IncrementalState, IndexDegradationCode, RuntimeIncrementalStatus};
 use crate::core::index_journal::IndexJournalRepository;
 use crate::core::index_update_coordinator::{
-    CoordinatorPolicy, CoordinatorShutdown, CoordinatorState,
+    CoordinatorPolicy, CoordinatorPushOutcome, CoordinatorShutdown, CoordinatorState,
 };
 use crate::core::index_watcher::{RuntimeIndexWatcher, WatchEventInbox, WatcherFailure};
 use crate::core::layered_index::CommittedIndexDelta;
@@ -13,12 +13,15 @@ use crate::core::targeted_index_scanner::{
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, SyncSender, TryRecvError};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
 pub const MAX_DELTA_ENTRIES: usize = 50_000;
 pub const MAX_DELTA_BYTES: usize = 64 * 1024 * 1024;
+const MAX_INBOX_DRAIN_PER_TICK: usize = 256;
 
 #[derive(Debug, Clone)]
 pub struct RuntimeIndexingOptions {
@@ -44,9 +47,22 @@ pub enum RuntimeIndexingEvent {
 }
 
 pub struct RuntimeIndexingHandle {
-    stop: SyncSender<()>,
+    command: SyncSender<RuntimeIndexingCommand>,
     shutdown: CoordinatorShutdown,
     join: Option<JoinHandle<()>>,
+    recovery_required: Arc<AtomicBool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeIndexingHandoffOutcome {
+    Clean,
+    RecoveryRequired,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RuntimeIndexingCommand {
+    StopNow,
+    Handoff,
 }
 
 impl RuntimeIndexingHandle {
@@ -54,12 +70,35 @@ impl RuntimeIndexingHandle {
         self.stop_and_join();
     }
 
+    pub fn handoff(mut self) -> RuntimeIndexingHandoffOutcome {
+        if self
+            .command
+            .try_send(RuntimeIndexingCommand::Handoff)
+            .is_err()
+        {
+            self.recovery_required.store(true, Ordering::Release);
+        }
+        if !self.join_worker() {
+            self.recovery_required.store(true, Ordering::Release);
+        }
+        if self.recovery_required.load(Ordering::Acquire) {
+            RuntimeIndexingHandoffOutcome::RecoveryRequired
+        } else {
+            RuntimeIndexingHandoffOutcome::Clean
+        }
+    }
+
     fn stop_and_join(&mut self) {
         self.shutdown.request();
-        let _ = self.stop.try_send(());
+        let _ = self.command.try_send(RuntimeIndexingCommand::StopNow);
+        self.join_worker();
+    }
+
+    fn join_worker(&mut self) -> bool {
         if let Some(join) = self.join.take() {
-            let _ = join.join();
+            return join.join().is_ok();
         }
+        true
     }
 }
 
@@ -129,12 +168,14 @@ fn start_runtime_indexing_with_scanner(
 ) -> Result<RuntimeIndexingHandle, String> {
     let shutdown = CoordinatorShutdown::default();
     let worker_shutdown = shutdown.clone();
-    let (stop, stop_receiver) = mpsc::sync_channel(1);
+    let recovery_required = Arc::new(AtomicBool::new(false));
+    let worker_recovery_required = Arc::clone(&recovery_required);
+    let (command, command_receiver) = mpsc::sync_channel(1);
     let join = thread::Builder::new()
         .name("quickfox-runtime-indexing".to_owned())
         .spawn(move || {
             RuntimeIndexingService {
-                _watcher: watcher,
+                watcher,
                 inbox,
                 scanner,
                 journal,
@@ -147,24 +188,26 @@ fn start_runtime_indexing_with_scanner(
                 },
                 publish: Box::new(publish),
                 shutdown: worker_shutdown,
-                stop_receiver,
+                command_receiver,
                 roots: options.roots,
                 degraded_roots: std::collections::BTreeSet::new(),
                 baseline_refresh_requested: false,
+                recovery_required: worker_recovery_required,
             }
             .run();
         })
         .map_err(|error| error.to_string())?;
 
     Ok(RuntimeIndexingHandle {
-        stop,
+        command,
         shutdown,
         join: Some(join),
+        recovery_required,
     })
 }
 
 struct RuntimeIndexingService {
-    _watcher: Option<RuntimeIndexWatcher>,
+    watcher: Option<RuntimeIndexWatcher>,
     inbox: WatchEventInbox,
     scanner: Box<dyn RuntimeBatchScanner>,
     journal: Box<dyn IndexJournalRepository + Send>,
@@ -173,20 +216,32 @@ struct RuntimeIndexingService {
     status: RuntimeIncrementalStatus,
     publish: Box<dyn Fn(RuntimeIndexingEvent) + Send>,
     shutdown: CoordinatorShutdown,
-    stop_receiver: mpsc::Receiver<()>,
+    command_receiver: mpsc::Receiver<RuntimeIndexingCommand>,
     roots: Vec<PathBuf>,
     degraded_roots: std::collections::BTreeSet<PathBuf>,
     baseline_refresh_requested: bool,
+    recovery_required: Arc<AtomicBool>,
 }
 
 impl RuntimeIndexingService {
     fn run(&mut self) {
         self.publish_status();
-        while !self.should_stop() {
+        loop {
+            match self.command_receiver.try_recv() {
+                Ok(RuntimeIndexingCommand::Handoff) => {
+                    self.finish_handoff();
+                    return;
+                }
+                Ok(RuntimeIndexingCommand::StopNow) | Err(TryRecvError::Disconnected) => return,
+                Err(TryRecvError::Empty) => {}
+            }
+            if self.should_stop() {
+                return;
+            }
             let now = Instant::now();
             let wait = self.coordinator.next_wait(now);
             if let Ok(event) = self.inbox.recv_timeout(wait) {
-                self.coordinator.push_event(event, Instant::now());
+                self.accept_event(event, Instant::now());
             }
             self.drain_inbox();
             self.consume_watcher_degradation();
@@ -200,15 +255,43 @@ impl RuntimeIndexingService {
 
     fn should_stop(&self) -> bool {
         self.shutdown.is_requested()
-            || matches!(
-                self.stop_receiver.try_recv(),
-                Ok(()) | Err(TryRecvError::Disconnected)
-            )
+    }
+
+    fn finish_handoff(&mut self) {
+        self.watcher.take();
+        while !self.shutdown.is_requested() {
+            let Ok(event) = self.inbox.try_recv() else {
+                break;
+            };
+            self.accept_event(event, Instant::now());
+        }
+        self.consume_watcher_degradation();
+        if !self.coordinator.is_empty() {
+            self.commit_ready_batch();
+        }
     }
 
     fn drain_inbox(&mut self) {
-        while let Ok(event) = self.inbox.try_recv() {
-            self.coordinator.push_event(event, Instant::now());
+        for _ in 0..MAX_INBOX_DRAIN_PER_TICK {
+            if self.should_stop() {
+                return;
+            }
+            let Ok(event) = self.inbox.try_recv() else {
+                return;
+            };
+            self.accept_event(event, Instant::now());
+        }
+    }
+
+    fn accept_event(&mut self, event: crate::core::index_watcher::IndexWatchEvent, now: Instant) {
+        if self.coordinator.push_event(event, now) == CoordinatorPushOutcome::CapacityReached {
+            self.coordinator.discard_individual_events();
+            self.degraded_roots.extend(self.roots.iter().cloned());
+            for root in &self.roots {
+                self.coordinator.mark_dirty_root(root.clone(), now);
+            }
+            self.publish_degraded(IndexDegradationCode::ChannelOverflow);
+            self.request_baseline_refresh(BaselineRefreshReason::DirtyRoots);
         }
     }
 
@@ -297,7 +380,9 @@ impl RuntimeIndexingService {
             )
             .is_err()
         {
+            self.degraded_roots.extend(self.roots.iter().cloned());
             self.publish_degraded(IndexDegradationCode::JournalWriteFailed);
+            self.request_baseline_refresh(BaselineRefreshReason::DirtyRoots);
             if failed_root_count > 0 {
                 self.publish_calibration_failure(dirty_roots.len());
             }
@@ -376,6 +461,7 @@ impl RuntimeIndexingService {
     }
 
     fn request_baseline_refresh(&mut self, reason: BaselineRefreshReason) {
+        self.recovery_required.store(true, Ordering::Release);
         if self.baseline_refresh_requested {
             return;
         }
@@ -406,7 +492,7 @@ pub fn baseline_refresh_event_for_delta_state(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::index::FileSearchIndex;
+    use crate::core::index::{FileSearchIndex, IndexScanOptions, IndexScanner};
     use crate::core::index_entry::{IndexFailure, IndexedEntry, IndexedEntryKind};
     use crate::core::index_journal::recover_layered_index;
     use crate::core::index_scanner::{IndexPathRules, IndexScanPlan};
@@ -614,6 +700,15 @@ mod tests {
             }
         }
 
+        fn handoff(&self) -> RuntimeIndexingHandoffOutcome {
+            self.handle
+                .lock()
+                .unwrap()
+                .take()
+                .expect("runtime indexing handle")
+                .handoff()
+        }
+
         fn journal_generations(&self) -> Vec<u64> {
             SqliteStorage::open(self.database_path.clone())
                 .unwrap()
@@ -690,22 +785,63 @@ mod tests {
         assert!(harness.statuses().iter().any(|status| {
             status.degradation_code == Some(IndexDegradationCode::JournalWriteFailed)
         }));
+        assert_eq!(
+            harness
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    RuntimeIndexingEvent::BaselineRefreshRequired {
+                        reason: BaselineRefreshReason::DirtyRoots
+                    }
+                ))
+                .count(),
+            1,
+            "a drained batch must latch one recoverable fallback when its journal commit fails"
+        );
+        assert_eq!(harness.journal_generations(), Vec::<u64>::new());
+        assert_eq!(
+            harness.handoff(),
+            RuntimeIndexingHandoffOutcome::RecoveryRequired,
+            "a failed journal commit must make baseline handoff untrusted"
+        );
 
         connection
             .execute_batch("DROP TRIGGER fail_runtime_commit;")
             .unwrap();
-        let recovered_path = harness.create_file("recovered.md");
-        harness.push(IndexWatchEvent::Create(recovered_path));
-        harness.advance(Duration::from_millis(100));
 
-        assert_eq!(
-            harness
-                .committed_deltas()
-                .into_iter()
-                .map(|delta| delta.generation)
-                .collect::<Vec<_>>(),
-            vec![1]
+        harness.stop();
+        let fallback_report = IndexScanner
+            .scan(IndexScanOptions {
+                include_dirs: vec![harness.root.path().to_path_buf()],
+                ..IndexScanOptions::default()
+            })
+            .unwrap();
+        let storage = SqliteStorage::open(harness.database_path.clone()).unwrap();
+        let generation = storage.highest_committed_generation().unwrap();
+        let baseline_id = storage
+            .save_completed_index_batch(2, &fallback_report.entries)
+            .unwrap();
+        let manifest = baseline_manifest_from_entries(
+            &fallback_report.entries,
+            &[harness.root.path().to_path_buf()],
         );
+        storage
+            .activate_baseline_with_manifest_and_clear_incremental_state(
+                baseline_id,
+                generation,
+                &manifest,
+            )
+            .unwrap();
+        let recovered = recover_layered_index(&storage);
+        assert!(recovered
+            .index
+            .search_files(&QueryRequest::new("failed", SearchMode::Normal), 20)
+            .iter()
+            .any(|result| result.title == "failed.md"));
+        assert_eq!(recovered.index.generation(), generation);
     }
 
     #[test]
@@ -1164,6 +1300,209 @@ mod tests {
                 reason: BaselineRefreshReason::DirtyRoots
             }
         )));
+    }
+
+    #[test]
+    fn coordinator_capacity_overflow_clears_individual_events_and_latches_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = SqliteStorage::open(root.path().join("coordinator-capacity.sqlite")).unwrap();
+        let baseline_id = storage.save_completed_index_batch(1, &[]).unwrap();
+        storage
+            .activate_baseline_and_clear_incremental_state(baseline_id, 0)
+            .unwrap();
+        let roots = vec![root.path().to_path_buf()];
+        let (sender, inbox) = WatchEventInbox::bounded(roots.clone(), 9_000);
+        for index in 0..8_193 {
+            assert_eq!(
+                sender.try_send(IndexWatchEvent::Write(
+                    root.path().join(format!("event-{index}.md")),
+                )),
+                crate::core::index_watcher::WatchSendOutcome::Queued
+            );
+        }
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let published = Arc::clone(&events);
+        let handle = start_runtime_indexing_with_scanner(
+            None,
+            inbox,
+            Box::new(FixedScanner::returning(TargetedScanResult::default())),
+            Box::new(storage),
+            RuntimeIndexingOptions {
+                roots,
+                policy: CoordinatorPolicy::new(Duration::from_secs(60), Duration::from_secs(60)),
+                initial_generation: 0,
+            },
+            move |event| published.lock().unwrap().push(event),
+        )
+        .unwrap();
+
+        thread::sleep(Duration::from_millis(250));
+        handle.stop();
+        let events = events.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    RuntimeIndexingEvent::BaselineRefreshRequired {
+                        reason: BaselineRefreshReason::DirtyRoots
+                    }
+                ))
+                .count(),
+            1
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeIndexingEvent::Status(RuntimeIncrementalStatus {
+                pending_events: 0,
+                degradation_code: Some(IndexDegradationCode::ChannelOverflow),
+                ..
+            })
+        )));
+    }
+
+    #[test]
+    fn continuous_producer_cannot_starve_runtime_service_stop() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = SqliteStorage::open(root.path().join("bounded-stop.sqlite")).unwrap();
+        let baseline_id = storage.save_completed_index_batch(1, &[]).unwrap();
+        storage
+            .activate_baseline_and_clear_incremental_state(baseline_id, 0)
+            .unwrap();
+        let roots = vec![root.path().to_path_buf()];
+        let (sender, inbox) = WatchEventInbox::bounded(roots.clone(), 8_192);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let published = Arc::clone(&events);
+        let handle = start_runtime_indexing_with_scanner(
+            None,
+            inbox,
+            Box::new(FixedScanner::returning(TargetedScanResult::default())),
+            Box::new(storage),
+            RuntimeIndexingOptions {
+                roots,
+                policy: CoordinatorPolicy::new(Duration::from_secs(60), Duration::from_secs(60)),
+                initial_generation: 0,
+            },
+            move |event| published.lock().unwrap().push(event),
+        )
+        .unwrap();
+        let producing = Arc::new(AtomicBool::new(true));
+        let producer_running = Arc::clone(&producing);
+        let producer_root = root.path().to_path_buf();
+        let producer = thread::spawn(move || {
+            let mut index = 0_u64;
+            while producer_running.load(Ordering::Acquire) {
+                let _ = sender.try_send(IndexWatchEvent::Write(
+                    producer_root.join(format!("event-{}.md", index % 16_384)),
+                ));
+                index = index.wrapping_add(1);
+            }
+        });
+        thread::sleep(Duration::from_millis(75));
+
+        let started = Instant::now();
+        handle.stop();
+        let elapsed = started.elapsed();
+        producing.store(false, Ordering::Release);
+        producer.join().unwrap();
+
+        assert!(
+            elapsed <= Duration::from_millis(250),
+            "stop took {elapsed:?}"
+        );
+        assert!(events.lock().unwrap().iter().all(|event| match event {
+            RuntimeIndexingEvent::Status(status) => status.pending_events <= 8_192,
+            _ => true,
+        }));
+    }
+
+    #[test]
+    fn handoff_drains_received_events_before_old_watcher_service_joins() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("before-standby.md");
+        fs::write(&path, "handoff").unwrap();
+        let storage = SqliteStorage::open(root.path().join("handoff-drain.sqlite")).unwrap();
+        let baseline_id = storage.save_completed_index_batch(1, &[]).unwrap();
+        storage
+            .activate_baseline_and_clear_incremental_state(baseline_id, 0)
+            .unwrap();
+        let roots = vec![root.path().to_path_buf()];
+        let rules = IndexPathRules::from_plan(&IndexScanPlan {
+            include_roots: roots.clone(),
+            ..IndexScanPlan::default()
+        })
+        .unwrap();
+        let (sender, inbox) = WatchEventInbox::bounded(roots.clone(), 16);
+        assert_eq!(
+            sender.try_send(IndexWatchEvent::Create(path)),
+            crate::core::index_watcher::WatchSendOutcome::Queued
+        );
+        let handle = start_runtime_indexing_from_parts(
+            None,
+            inbox,
+            TargetedIndexScanner::new(rules),
+            Box::new(storage),
+            RuntimeIndexingOptions {
+                roots,
+                policy: CoordinatorPolicy::new(Duration::from_secs(60), Duration::from_secs(60)),
+                initial_generation: 0,
+            },
+            |_| {},
+        )
+        .unwrap();
+
+        handle.handoff();
+
+        let storage = SqliteStorage::open(root.path().join("handoff-drain.sqlite")).unwrap();
+        let deltas = storage.committed_index_deltas_after(0).unwrap();
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(deltas[0].upserts[0].name, "before-standby.md");
+    }
+
+    #[test]
+    fn handoff_reports_worker_panic_as_recovery_required() {
+        struct PanickingScanner;
+
+        impl RuntimeBatchScanner for PanickingScanner {
+            fn scan_batch_cancellable(
+                &self,
+                _batch: crate::core::index_update_coordinator::CoordinatorBatch,
+                _is_cancelled: &dyn Fn() -> bool,
+            ) -> Result<TargetedScanResult, TargetedScanError> {
+                panic!("injected handoff worker panic")
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let storage = SqliteStorage::open(root.path().join("handoff-panic.sqlite")).unwrap();
+        let baseline_id = storage.save_completed_index_batch(1, &[]).unwrap();
+        storage
+            .activate_baseline_and_clear_incremental_state(baseline_id, 0)
+            .unwrap();
+        let roots = vec![root.path().to_path_buf()];
+        let (sender, inbox) = WatchEventInbox::bounded(roots.clone(), 1);
+        assert_eq!(
+            sender.try_send(IndexWatchEvent::Write(root.path().join("panic.md"))),
+            crate::core::index_watcher::WatchSendOutcome::Queued
+        );
+        let handle = start_runtime_indexing_with_scanner(
+            None,
+            inbox,
+            Box::new(PanickingScanner),
+            Box::new(storage),
+            RuntimeIndexingOptions {
+                roots,
+                policy: CoordinatorPolicy::new(Duration::from_secs(60), Duration::from_secs(60)),
+                initial_generation: 0,
+            },
+            |_| {},
+        )
+        .unwrap();
+
+        assert_eq!(
+            handle.handoff(),
+            RuntimeIndexingHandoffOutcome::RecoveryRequired
+        );
     }
 
     #[test]

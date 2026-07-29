@@ -8,6 +8,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const MAX_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(50);
+pub const MAX_PENDING_UNIQUE_PATHS: usize = 8192;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoordinatorPushOutcome {
+    Queued,
+    CapacityReached,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CoordinatorPolicy {
@@ -63,9 +70,23 @@ impl CoordinatorState {
         }
     }
 
-    pub fn push_event(&mut self, event: IndexWatchEvent, observed_at: Instant) {
-        self.events.push(event);
+    pub fn push_event(
+        &mut self,
+        event: IndexWatchEvent,
+        observed_at: Instant,
+    ) -> CoordinatorPushOutcome {
+        if self.events.len() >= MAX_PENDING_UNIQUE_PATHS.saturating_sub(1) {
+            let mut candidate = self.events.clone();
+            candidate.push(event);
+            if candidate.len() > MAX_PENDING_UNIQUE_PATHS {
+                return CoordinatorPushOutcome::CapacityReached;
+            }
+            self.events = candidate;
+        } else {
+            self.events.push(event);
+        }
         self.observe(observed_at);
+        CoordinatorPushOutcome::Queued
     }
 
     pub fn mark_dirty_root(&mut self, root: PathBuf, observed_at: Instant) {
@@ -112,6 +133,14 @@ impl CoordinatorState {
 
     pub fn dirty_root_count(&self) -> usize {
         self.dirty_roots.len()
+    }
+
+    pub fn discard_individual_events(&mut self) {
+        let _ = self.events.drain_batch();
+        if self.dirty_roots.is_empty() {
+            self.first_event_at = None;
+            self.last_event_at = None;
+        }
     }
 
     fn observe(&mut self, observed_at: Instant) {
@@ -246,5 +275,30 @@ mod tests {
         assert!(state.next_wait(start) <= Duration::from_millis(250));
         shutdown.request();
         assert!(worker_shutdown.is_requested());
+    }
+
+    #[test]
+    fn coordinator_caps_pending_unique_paths_at_8192() {
+        let start = Instant::now();
+        let mut state = CoordinatorState::new(CoordinatorPolicy::production());
+        for index in 0..MAX_PENDING_UNIQUE_PATHS {
+            assert_eq!(
+                state.push_event(
+                    IndexWatchEvent::Write(PathBuf::from(format!("file-{index}.txt"))),
+                    start,
+                ),
+                CoordinatorPushOutcome::Queued
+            );
+        }
+
+        assert_eq!(state.pending_event_count(), MAX_PENDING_UNIQUE_PATHS);
+        assert_eq!(
+            state.push_event(
+                IndexWatchEvent::Write(PathBuf::from("one-too-many.txt")),
+                start,
+            ),
+            CoordinatorPushOutcome::CapacityReached
+        );
+        assert_eq!(state.pending_event_count(), MAX_PENDING_UNIQUE_PATHS);
     }
 }
