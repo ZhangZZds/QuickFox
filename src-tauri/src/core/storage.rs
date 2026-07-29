@@ -3,9 +3,11 @@
 use crate::core::index::{IndexedEntry, IndexedEntryKind};
 use crate::core::index_entry::{
     build_search_text, normalize_path_key_for_mode, normalize_path_text_key_for_mode,
-    ContentIndexState, PathComparisonMode,
+    path_is_same_or_descendant_for_mode, ContentIndexState, PathComparisonMode,
 };
 use crate::core::layered_index::CommittedIndexDelta;
+#[cfg(test)]
+use crate::core::targeted_index_scanner::baseline_manifest_from_entries;
 use crate::core::targeted_index_scanner::{
     DirectoryFingerprint, FileSystemEntryKind, KnownIndexedChild,
 };
@@ -788,119 +790,8 @@ impl SqliteStorage {
         generation: u64,
         mut on_query: impl FnMut(),
     ) -> Result<Vec<CommittedIndexDelta>, StorageError> {
-        let generation = generation_to_i64(generation)?;
         on_query();
-        let mut statement = self.connection.prepare(
-            r#"
-            SELECT
-                batches.generation,
-                entries.ordinal,
-                entries.operation,
-                entries.path,
-                entries.entry_json
-            FROM index_delta_batches AS batches
-            LEFT JOIN index_delta_entries AS entries ON entries.batch_id = batches.id
-            WHERE batches.status = 'committed' AND batches.generation > ?1
-            ORDER BY batches.generation ASC, entries.ordinal ASC
-            "#,
-        )?;
-        let rows = statement.query_map(params![generation], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, Option<i64>>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, Option<String>>(4)?,
-            ))
-        })?;
-        let mut deltas = Vec::new();
-        let mut current_generation = None;
-        let mut expected_ordinal = 0_i64;
-        let mut upserts = Vec::new();
-        let mut removals = Vec::new();
-        let mut paths = BTreeSet::new();
-        for row in rows {
-            let (raw_generation, ordinal, operation, path, entry_json) = row?;
-            let row_generation = u64::try_from(raw_generation).map_err(|_| {
-                StorageError::InvalidJournal("journal generation must not be negative".to_owned())
-            })?;
-            if current_generation != Some(row_generation) {
-                if let Some(generation) = current_generation {
-                    deltas.push(CommittedIndexDelta {
-                        generation,
-                        upserts: std::mem::take(&mut upserts),
-                        removals: std::mem::take(&mut removals),
-                    });
-                    paths.clear();
-                    expected_ordinal = 0;
-                }
-                current_generation = Some(row_generation);
-            }
-            let Some(ordinal) = ordinal else {
-                continue;
-            };
-            if ordinal != expected_ordinal {
-                return Err(StorageError::InvalidJournal(format!(
-                    "generation {row_generation} has a non-contiguous ordinal"
-                )));
-            }
-            expected_ordinal += 1;
-            let operation = operation.ok_or_else(|| {
-                StorageError::InvalidJournal(format!(
-                    "generation {row_generation} has a missing operation"
-                ))
-            })?;
-            let path = normalize_path_text_key_for_mode(
-                &path.ok_or_else(|| {
-                    StorageError::InvalidJournal(format!(
-                        "generation {row_generation} has a missing path"
-                    ))
-                })?,
-                self.comparison_mode,
-            );
-            if path.is_empty() || !paths.insert(path.clone()) {
-                return Err(StorageError::InvalidJournal(format!(
-                    "generation {row_generation} has an empty or duplicate path"
-                )));
-            }
-            match operation.as_str() {
-                "upsert" => {
-                    let json = entry_json.ok_or_else(|| {
-                        StorageError::InvalidJournal(format!(
-                            "generation {row_generation} upsert is missing entry JSON"
-                        ))
-                    })?;
-                    let entry: IndexedEntry = serde_json::from_str(&json)?;
-                    if normalize_path_text_key_for_mode(&entry.path, self.comparison_mode) != path {
-                        return Err(StorageError::InvalidJournal(format!(
-                            "generation {row_generation} upsert path does not match its entry JSON"
-                        )));
-                    }
-                    upserts.push(entry);
-                }
-                "remove" => {
-                    if entry_json.is_some() {
-                        return Err(StorageError::InvalidJournal(format!(
-                            "generation {row_generation} removal unexpectedly contains entry JSON"
-                        )));
-                    }
-                    removals.push(PathBuf::from(path));
-                }
-                _ => {
-                    return Err(StorageError::InvalidJournal(format!(
-                        "generation {row_generation} contains an unknown operation"
-                    )));
-                }
-            }
-        }
-        if let Some(generation) = current_generation {
-            deltas.push(CommittedIndexDelta {
-                generation,
-                upserts,
-                removals,
-            });
-        }
-        Ok(deltas)
+        load_committed_index_deltas_after(&self.connection, generation, self.comparison_mode)
     }
 
     pub fn replace_directory_manifest(
@@ -1020,8 +911,14 @@ impl SqliteStorage {
         validate_manifest_tree_rows(manifest, self.comparison_mode)?;
         let transaction = self.connection.unchecked_transaction()?;
         activate_baseline_in_transaction(&transaction, baseline_id, baseline_generation)?;
+        let tail = load_committed_index_deltas_after(
+            &transaction,
+            baseline_generation,
+            self.comparison_mode,
+        )?;
+        let manifest = merge_manifest_with_committed_deltas(manifest, &tail, self.comparison_mode);
         transaction.execute("DELETE FROM index_directory_manifest", [])?;
-        upsert_manifest_rows(&transaction, manifest, self.comparison_mode)?;
+        upsert_manifest_rows(&transaction, &manifest, self.comparison_mode)?;
         validate_persisted_manifest_tree(&transaction, self.comparison_mode)?;
         transaction.execute(
             "DELETE FROM index_delta_batches WHERE generation <= ?1",
@@ -1760,6 +1657,166 @@ impl SqliteStorage {
         self.connection.execute("DELETE FROM input_history", [])?;
         Ok(())
     }
+}
+
+fn load_committed_index_deltas_after(
+    connection: &Connection,
+    generation: u64,
+    comparison_mode: PathComparisonMode,
+) -> Result<Vec<CommittedIndexDelta>, StorageError> {
+    let generation = generation_to_i64(generation)?;
+    let mut statement = connection.prepare(
+        r#"
+        SELECT
+            batches.generation,
+            entries.ordinal,
+            entries.operation,
+            entries.path,
+            entries.entry_json
+        FROM index_delta_batches AS batches
+        LEFT JOIN index_delta_entries AS entries ON entries.batch_id = batches.id
+        WHERE batches.status = 'committed' AND batches.generation > ?1
+        ORDER BY batches.generation ASC, entries.ordinal ASC
+        "#,
+    )?;
+    let rows = statement.query_map(params![generation], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, Option<i64>>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, Option<String>>(4)?,
+        ))
+    })?;
+    let mut deltas = Vec::new();
+    let mut current_generation = None;
+    let mut expected_ordinal = 0_i64;
+    let mut upserts = Vec::new();
+    let mut removals = Vec::new();
+    let mut paths = BTreeSet::new();
+    for row in rows {
+        let (raw_generation, ordinal, operation, path, entry_json) = row?;
+        let row_generation = u64::try_from(raw_generation).map_err(|_| {
+            StorageError::InvalidJournal("journal generation must not be negative".to_owned())
+        })?;
+        if current_generation != Some(row_generation) {
+            if let Some(generation) = current_generation {
+                deltas.push(CommittedIndexDelta {
+                    generation,
+                    upserts: std::mem::take(&mut upserts),
+                    removals: std::mem::take(&mut removals),
+                });
+                paths.clear();
+                expected_ordinal = 0;
+            }
+            current_generation = Some(row_generation);
+        }
+        let Some(ordinal) = ordinal else {
+            continue;
+        };
+        if ordinal != expected_ordinal {
+            return Err(StorageError::InvalidJournal(format!(
+                "generation {row_generation} has a non-contiguous ordinal"
+            )));
+        }
+        expected_ordinal += 1;
+        let operation = operation.ok_or_else(|| {
+            StorageError::InvalidJournal(format!(
+                "generation {row_generation} has a missing operation"
+            ))
+        })?;
+        let path = normalize_path_text_key_for_mode(
+            &path.ok_or_else(|| {
+                StorageError::InvalidJournal(format!(
+                    "generation {row_generation} has a missing path"
+                ))
+            })?,
+            comparison_mode,
+        );
+        if path.is_empty() || !paths.insert(path.clone()) {
+            return Err(StorageError::InvalidJournal(format!(
+                "generation {row_generation} has an empty or duplicate path"
+            )));
+        }
+        match operation.as_str() {
+            "upsert" => {
+                let json = entry_json.ok_or_else(|| {
+                    StorageError::InvalidJournal(format!(
+                        "generation {row_generation} upsert is missing entry JSON"
+                    ))
+                })?;
+                let entry: IndexedEntry = serde_json::from_str(&json)?;
+                if normalize_path_text_key_for_mode(&entry.path, comparison_mode) != path {
+                    return Err(StorageError::InvalidJournal(format!(
+                        "generation {row_generation} upsert path does not match its entry JSON"
+                    )));
+                }
+                upserts.push(entry);
+            }
+            "remove" => {
+                if entry_json.is_some() {
+                    return Err(StorageError::InvalidJournal(format!(
+                        "generation {row_generation} removal unexpectedly contains entry JSON"
+                    )));
+                }
+                removals.push(PathBuf::from(path));
+            }
+            _ => {
+                return Err(StorageError::InvalidJournal(format!(
+                    "generation {row_generation} contains an unknown operation"
+                )));
+            }
+        }
+    }
+    if let Some(generation) = current_generation {
+        deltas.push(CommittedIndexDelta {
+            generation,
+            upserts,
+            removals,
+        });
+    }
+    Ok(deltas)
+}
+
+fn merge_manifest_with_committed_deltas(
+    manifest: &[DirectoryFingerprint],
+    deltas: &[CommittedIndexDelta],
+    comparison_mode: PathComparisonMode,
+) -> Vec<DirectoryFingerprint> {
+    let mut rows: BTreeMap<String, DirectoryFingerprint> = manifest
+        .iter()
+        .cloned()
+        .map(|row| {
+            (
+                normalize_path_text_key_for_mode(&row.path, comparison_mode),
+                row,
+            )
+        })
+        .collect();
+    for delta in deltas {
+        for removal in &delta.removals {
+            rows.retain(|_, row| {
+                !path_is_same_or_descendant_for_mode(removal, Path::new(&row.path), comparison_mode)
+            });
+        }
+        for entry in &delta.upserts {
+            if entry.kind != IndexedEntryKind::Directory && !Path::new(&entry.path).is_dir() {
+                continue;
+            }
+            rows.insert(
+                normalize_path_text_key_for_mode(&entry.path, comparison_mode),
+                DirectoryFingerprint {
+                    path: entry.path.clone(),
+                    parent: (entry.path != entry.root)
+                        .then(|| entry.parent.clone())
+                        .filter(|parent| !parent.is_empty()),
+                    root: entry.root.clone(),
+                    modified_ms: entry.modified_ms,
+                },
+            );
+        }
+    }
+    rows.into_values().collect()
 }
 
 fn validate_delta(
@@ -3447,6 +3504,122 @@ mod tests {
 
         drop(storage);
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn activation_replays_successor_directory_create_into_stale_manifest_before_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let created = root.join("created");
+        fs::create_dir_all(&created).unwrap();
+        let database_path = temp.path().join("activation-create.sqlite");
+        let storage = SqliteStorage::open(database_path.clone()).unwrap();
+        let initial_baseline_id = storage.save_completed_index_batch(1, &[]).unwrap();
+        let stale_manifest = baseline_manifest_from_entries(&[], std::slice::from_ref(&root));
+        storage
+            .activate_baseline_with_manifest_and_clear_incremental_state(
+                initial_baseline_id,
+                0,
+                &stale_manifest,
+            )
+            .unwrap();
+        let created_entry =
+            IndexedEntry::from_path_metadata(&created, &root, IndexedEntryKind::Directory);
+        storage
+            .commit_incremental_batch(
+                &CommittedIndexDelta {
+                    generation: 1,
+                    upserts: vec![created_entry],
+                    removals: Vec::new(),
+                },
+                &[fingerprint(
+                    &created.to_string_lossy(),
+                    Some(&root.to_string_lossy()),
+                    &root.to_string_lossy(),
+                    1,
+                )],
+                &[],
+            )
+            .unwrap();
+        let baseline_id = storage.save_completed_index_batch(2, &[]).unwrap();
+
+        storage
+            .activate_baseline_with_manifest_and_clear_incremental_state(
+                baseline_id,
+                0,
+                &stale_manifest,
+            )
+            .unwrap();
+        drop(storage);
+
+        let reopened = SqliteStorage::open(database_path).unwrap();
+        let manifest = reopened.directory_manifest_for_root(&root).unwrap();
+        assert!(manifest
+            .iter()
+            .any(|row| row.path == created.to_string_lossy()));
+        assert_eq!(reopened.committed_index_deltas_after(0).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn activation_replays_successor_directory_delete_into_stale_manifest_before_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let deleted = root.join("deleted");
+        fs::create_dir_all(&deleted).unwrap();
+        let database_path = temp.path().join("activation-delete.sqlite");
+        let storage = SqliteStorage::open(database_path.clone()).unwrap();
+        let deleted_entry =
+            IndexedEntry::from_path_metadata(&deleted, &root, IndexedEntryKind::Directory);
+        let initial_baseline_id = storage
+            .save_completed_index_batch(1, std::slice::from_ref(&deleted_entry))
+            .unwrap();
+        let stale_manifest =
+            baseline_manifest_from_entries(&[deleted_entry], std::slice::from_ref(&root));
+        storage
+            .activate_baseline_with_manifest_and_clear_incremental_state(
+                initial_baseline_id,
+                0,
+                &stale_manifest,
+            )
+            .unwrap();
+        storage
+            .commit_incremental_batch(
+                &CommittedIndexDelta {
+                    generation: 1,
+                    upserts: Vec::new(),
+                    removals: vec![deleted.clone()],
+                },
+                &[],
+                std::slice::from_ref(&deleted),
+            )
+            .unwrap();
+        fs::remove_dir_all(&deleted).unwrap();
+        let baseline_id = storage
+            .save_completed_index_batch(
+                2,
+                &[IndexedEntry::from_path_metadata(
+                    &deleted,
+                    &root,
+                    IndexedEntryKind::Directory,
+                )],
+            )
+            .unwrap();
+
+        storage
+            .activate_baseline_with_manifest_and_clear_incremental_state(
+                baseline_id,
+                0,
+                &stale_manifest,
+            )
+            .unwrap();
+        drop(storage);
+
+        let reopened = SqliteStorage::open(database_path).unwrap();
+        let manifest = reopened.directory_manifest_for_root(&root).unwrap();
+        assert!(!manifest
+            .iter()
+            .any(|row| row.path == deleted.to_string_lossy()));
+        assert_eq!(reopened.committed_index_deltas_after(0).unwrap().len(), 1);
     }
 
     #[test]

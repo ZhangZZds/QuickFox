@@ -14,6 +14,7 @@ pub mod index_watcher;
 pub mod layered_index;
 pub mod platform;
 pub mod providers;
+pub mod root_availability_monitor;
 pub mod runtime_indexing;
 pub mod search;
 pub mod storage;

@@ -13,7 +13,7 @@ use crate::core::targeted_index_scanner::{
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender, TryRecvError};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -51,6 +51,7 @@ pub struct RuntimeIndexingHandle {
     shutdown: CoordinatorShutdown,
     join: Option<JoinHandle<()>>,
     recovery_required: Arc<AtomicBool>,
+    last_committed_generation: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,10 +60,18 @@ pub enum RuntimeIndexingHandoffOutcome {
     RecoveryRequired,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeIndexingHandoff {
+    pub outcome: RuntimeIndexingHandoffOutcome,
+    pub last_committed_generation: u64,
+}
+
+#[derive(Debug, Clone)]
 enum RuntimeIndexingCommand {
     StopNow,
     Handoff,
+    Fence(SyncSender<u64>),
+    Resume,
 }
 
 impl RuntimeIndexingHandle {
@@ -71,20 +80,44 @@ impl RuntimeIndexingHandle {
     }
 
     pub fn handoff(mut self) -> RuntimeIndexingHandoffOutcome {
-        if self
-            .command
-            .try_send(RuntimeIndexingCommand::Handoff)
-            .is_err()
-        {
+        self.finish_handoff().outcome
+    }
+
+    pub fn handoff_with_generation(mut self) -> RuntimeIndexingHandoff {
+        self.finish_handoff()
+    }
+
+    pub fn fence(&mut self) -> Result<u64, String> {
+        let (reply, response) = mpsc::sync_channel(1);
+        self.command
+            .send(RuntimeIndexingCommand::Fence(reply))
+            .map_err(|_| "runtime indexing worker is unavailable".to_owned())?;
+        response
+            .recv()
+            .map_err(|_| "runtime indexing worker stopped before revision fence".to_owned())
+    }
+
+    pub fn resume(&mut self) -> Result<(), String> {
+        self.command
+            .send(RuntimeIndexingCommand::Resume)
+            .map_err(|_| "runtime indexing worker is unavailable".to_owned())
+    }
+
+    fn finish_handoff(&mut self) -> RuntimeIndexingHandoff {
+        if self.command.send(RuntimeIndexingCommand::Handoff).is_err() {
             self.recovery_required.store(true, Ordering::Release);
         }
         if !self.join_worker() {
             self.recovery_required.store(true, Ordering::Release);
         }
-        if self.recovery_required.load(Ordering::Acquire) {
+        let outcome = if self.recovery_required.load(Ordering::Acquire) {
             RuntimeIndexingHandoffOutcome::RecoveryRequired
         } else {
             RuntimeIndexingHandoffOutcome::Clean
+        };
+        RuntimeIndexingHandoff {
+            outcome,
+            last_committed_generation: self.last_committed_generation.load(Ordering::Acquire),
         }
     }
 
@@ -170,6 +203,8 @@ fn start_runtime_indexing_with_scanner(
     let worker_shutdown = shutdown.clone();
     let recovery_required = Arc::new(AtomicBool::new(false));
     let worker_recovery_required = Arc::clone(&recovery_required);
+    let last_committed_generation = Arc::new(AtomicU64::new(options.initial_generation));
+    let worker_last_committed_generation = Arc::clone(&last_committed_generation);
     let (command, command_receiver) = mpsc::sync_channel(1);
     let join = thread::Builder::new()
         .name("quickfox-runtime-indexing".to_owned())
@@ -193,6 +228,7 @@ fn start_runtime_indexing_with_scanner(
                 degraded_roots: std::collections::BTreeSet::new(),
                 baseline_refresh_requested: false,
                 recovery_required: worker_recovery_required,
+                last_committed_generation: worker_last_committed_generation,
             }
             .run();
         })
@@ -203,6 +239,7 @@ fn start_runtime_indexing_with_scanner(
         shutdown,
         join: Some(join),
         recovery_required,
+        last_committed_generation,
     })
 }
 
@@ -221,6 +258,7 @@ struct RuntimeIndexingService {
     degraded_roots: std::collections::BTreeSet<PathBuf>,
     baseline_refresh_requested: bool,
     recovery_required: Arc<AtomicBool>,
+    last_committed_generation: Arc<AtomicU64>,
 }
 
 impl RuntimeIndexingService {
@@ -232,6 +270,14 @@ impl RuntimeIndexingService {
                     self.finish_handoff();
                     return;
                 }
+                Ok(RuntimeIndexingCommand::Fence(reply)) => {
+                    self.finish_fence();
+                    let _ = reply.send(self.last_committed_generation.load(Ordering::Acquire));
+                    if !self.wait_for_fence_release() {
+                        return;
+                    }
+                }
+                Ok(RuntimeIndexingCommand::Resume) => {}
                 Ok(RuntimeIndexingCommand::StopNow) | Err(TryRecvError::Disconnected) => return,
                 Err(TryRecvError::Empty) => {}
             }
@@ -259,6 +305,10 @@ impl RuntimeIndexingService {
 
     fn finish_handoff(&mut self) {
         self.watcher.take();
+        self.finish_fence();
+    }
+
+    fn finish_fence(&mut self) {
         while !self.shutdown.is_requested() {
             let Ok(event) = self.inbox.try_recv() else {
                 break;
@@ -269,6 +319,29 @@ impl RuntimeIndexingService {
         if !self.coordinator.is_empty() {
             self.commit_ready_batch();
         }
+    }
+
+    fn wait_for_fence_release(&mut self) -> bool {
+        while !self.shutdown.is_requested() {
+            match self
+                .command_receiver
+                .recv_timeout(std::time::Duration::from_millis(50))
+            {
+                Ok(RuntimeIndexingCommand::Resume) => return true,
+                Ok(RuntimeIndexingCommand::Handoff) => {
+                    self.finish_handoff();
+                    return false;
+                }
+                Ok(RuntimeIndexingCommand::StopNow) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return false;
+                }
+                Ok(RuntimeIndexingCommand::Fence(reply)) => {
+                    let _ = reply.send(self.last_committed_generation.load(Ordering::Acquire));
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+        }
+        false
     }
 
     fn drain_inbox(&mut self) {
@@ -403,6 +476,8 @@ impl RuntimeIndexingService {
             self.status.degradation_code = None;
         }
         (self.publish)(RuntimeIndexingEvent::DeltaCommitted(delta));
+        self.last_committed_generation
+            .store(self.next_generation, Ordering::Release);
         self.next_generation = self.next_generation.saturating_add(1);
         self.publish_status();
         if failed_root_count > 0 {
@@ -1451,12 +1526,76 @@ mod tests {
         )
         .unwrap();
 
-        handle.handoff();
+        let handoff = handle.handoff_with_generation();
 
         let storage = SqliteStorage::open(root.path().join("handoff-drain.sqlite")).unwrap();
         let deltas = storage.committed_index_deltas_after(0).unwrap();
         assert_eq!(deltas.len(), 1);
         assert_eq!(deltas[0].upserts[0].name, "before-standby.md");
+        assert_eq!(handoff.outcome, RuntimeIndexingHandoffOutcome::Clean);
+        assert_eq!(handoff.last_committed_generation, 1);
+    }
+
+    #[test]
+    fn revision_fence_pauses_old_service_and_resume_drains_later_events() {
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("before-fence.md");
+        let second = root.path().join("after-fence.md");
+        fs::write(&first, "first").unwrap();
+        fs::write(&second, "second").unwrap();
+        let database_path = root.path().join("revision-pause.sqlite");
+        let storage = SqliteStorage::open(database_path.clone()).unwrap();
+        let baseline_id = storage.save_completed_index_batch(1, &[]).unwrap();
+        storage
+            .activate_baseline_and_clear_incremental_state(baseline_id, 0)
+            .unwrap();
+        let roots = vec![root.path().to_path_buf()];
+        let rules = IndexPathRules::from_plan(&IndexScanPlan {
+            include_roots: roots.clone(),
+            ..IndexScanPlan::default()
+        })
+        .unwrap();
+        let (sender, inbox) = WatchEventInbox::bounded(roots.clone(), 16);
+        assert_eq!(
+            sender.try_send(IndexWatchEvent::Create(first)),
+            crate::core::index_watcher::WatchSendOutcome::Queued
+        );
+        let mut handle = start_runtime_indexing_from_parts(
+            None,
+            inbox,
+            TargetedIndexScanner::new(rules),
+            Box::new(storage),
+            RuntimeIndexingOptions {
+                roots,
+                policy: CoordinatorPolicy::new(Duration::from_secs(60), Duration::from_secs(60)),
+                initial_generation: 0,
+            },
+            |_| {},
+        )
+        .unwrap();
+
+        assert_eq!(handle.fence().unwrap(), 1);
+        assert_eq!(
+            sender.try_send(IndexWatchEvent::Create(second)),
+            crate::core::index_watcher::WatchSendOutcome::Queued
+        );
+        assert_eq!(
+            SqliteStorage::open(database_path.clone())
+                .unwrap()
+                .highest_committed_generation()
+                .unwrap(),
+            1
+        );
+        handle.resume().unwrap();
+        let handoff = handle.handoff_with_generation();
+        assert_eq!(handoff.last_committed_generation, 2);
+        assert_eq!(
+            SqliteStorage::open(database_path)
+                .unwrap()
+                .highest_committed_generation()
+                .unwrap(),
+            2
+        );
     }
 
     #[test]
