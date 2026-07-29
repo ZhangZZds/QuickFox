@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 
 use crate::core::platform::WakeShortcut;
@@ -297,7 +298,18 @@ impl ConfigStore {
             fs::create_dir_all(parent)?;
         }
         let content = toml::to_string_pretty(config)?;
-        fs::write(&self.path, content)?;
+        let temporary = self.path.with_extension("quickfox.tmp");
+        let write_result = (|| -> Result<(), std::io::Error> {
+            let mut file = fs::File::create(&temporary)?;
+            file.write_all(content.as_bytes())?;
+            file.sync_all()?;
+            fs::rename(&temporary, &self.path)?;
+            Ok(())
+        })();
+        if write_result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        write_result?;
         Ok(())
     }
 

@@ -941,6 +941,28 @@ impl SqliteStorage {
         Ok(())
     }
 
+    pub fn restore_baseline_after_failed_revision(
+        &self,
+        baseline_id: i64,
+        baseline_generation: u64,
+        manifest: &[DirectoryFingerprint],
+    ) -> Result<(), StorageError> {
+        validate_manifest_rows(manifest, self.comparison_mode)?;
+        validate_manifest_tree_rows(manifest, self.comparison_mode)?;
+        let transaction = self.connection.unchecked_transaction()?;
+        activate_baseline_in_transaction(&transaction, baseline_id, baseline_generation)?;
+        transaction.execute("DELETE FROM index_delta_batches", [])?;
+        transaction.execute("DELETE FROM index_directory_manifest", [])?;
+        upsert_manifest_rows(&transaction, manifest, self.comparison_mode)?;
+        validate_persisted_manifest_tree(&transaction, self.comparison_mode)?;
+        transaction.execute(
+            "UPDATE index_runtime_state SET last_generation = ?1 WHERE singleton = 1",
+            params![generation_to_i64(baseline_generation)?],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn save_runtime_state(&self, state: &IncrementalRuntimeState) -> Result<(), StorageError> {
         if state.baseline_generation > state.last_generation {
             return Err(StorageError::InvalidJournal(
@@ -3810,6 +3832,55 @@ mod tests {
             assert_eq!(manifest[0].modified_ms, Some(expected_modified));
             assert_eq!(reopened.committed_index_deltas_after(0).unwrap().len(), 1);
         }
+    }
+
+    #[test]
+    fn failed_revision_restore_discards_candidate_tail_and_rewinds_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        let storage = SqliteStorage::open(temp.path().join("revision-rollback.sqlite")).unwrap();
+        let old_manifest = vec![fingerprint(
+            &root.to_string_lossy(),
+            None,
+            &root.to_string_lossy(),
+            7,
+        )];
+        let rollback_id = storage.save_completed_index_batch(1, &[]).unwrap();
+        storage
+            .activate_baseline_with_manifest_and_clear_incremental_state(
+                rollback_id,
+                3,
+                &old_manifest,
+            )
+            .unwrap();
+        storage
+            .commit_incremental_batch(
+                &CommittedIndexDelta {
+                    generation: 4,
+                    upserts: vec![indexed_entry(&root.join("candidate.txt").to_string_lossy())],
+                    removals: Vec::new(),
+                },
+                &[fingerprint(
+                    &root.to_string_lossy(),
+                    None,
+                    &root.to_string_lossy(),
+                    99,
+                )],
+                &[],
+            )
+            .unwrap();
+
+        storage
+            .restore_baseline_after_failed_revision(rollback_id, 3, &old_manifest)
+            .unwrap();
+
+        assert!(storage.committed_index_deltas_after(3).unwrap().is_empty());
+        assert_eq!(storage.highest_committed_generation().unwrap(), 3);
+        assert_eq!(
+            storage.directory_manifest_for_root(&root).unwrap(),
+            old_manifest
+        );
     }
 
     #[test]

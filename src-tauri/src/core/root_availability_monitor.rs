@@ -20,6 +20,32 @@ struct MonitorCancellation {
     wake: Condvar,
 }
 
+#[derive(Default)]
+struct MonitorCompletion {
+    completed: Mutex<bool>,
+    wake: Condvar,
+}
+
+#[derive(Clone)]
+pub struct MonitorCompletionWaiter(Arc<MonitorCompletion>);
+
+impl MonitorCompletionWaiter {
+    pub fn wait(&self) {
+        let mut completed = self
+            .0
+            .completed
+            .lock()
+            .expect("monitor completion poisoned");
+        while !*completed {
+            completed = self
+                .0
+                .wake
+                .wait(completed)
+                .expect("monitor completion poisoned");
+        }
+    }
+}
+
 impl MonitorCancellation {
     fn cancel(&self) {
         *self.cancelled.lock().expect("root monitor cancel poisoned") = true;
@@ -122,12 +148,30 @@ pub fn spawn_root_availability_monitor_with(
 pub fn spawn_root_availability_monitor_with_completion(
     spawner: &dyn RootMonitorSpawner,
     interval: Duration,
-    mut probe: impl FnMut() -> Result<bool, String> + Send + 'static,
+    probe: impl FnMut() -> Result<bool, String> + Send + 'static,
     on_ready: impl FnOnce() -> Result<(), String> + Send + 'static,
     on_exit: impl FnOnce(&MonitorExit) + Send + 'static,
 ) -> Result<RootAvailabilityMonitorHandle, String> {
+    spawn_root_availability_monitor_with_completion_gate(
+        spawner,
+        interval,
+        probe,
+        on_ready,
+        move |outcome, _| on_exit(outcome),
+    )
+}
+
+pub fn spawn_root_availability_monitor_with_completion_gate(
+    spawner: &dyn RootMonitorSpawner,
+    interval: Duration,
+    mut probe: impl FnMut() -> Result<bool, String> + Send + 'static,
+    on_ready: impl FnOnce() -> Result<(), String> + Send + 'static,
+    on_exit: impl FnOnce(&MonitorExit, MonitorCompletionWaiter) + Send + 'static,
+) -> Result<RootAvailabilityMonitorHandle, String> {
     let cancellation = Arc::new(MonitorCancellation::default());
     let worker_cancellation = Arc::clone(&cancellation);
+    let completion = Arc::new(MonitorCompletion::default());
+    let completion_waiter = MonitorCompletionWaiter(Arc::clone(&completion));
     let join = spawner.spawn(Box::new(move || {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut on_ready = Some(on_ready);
@@ -154,7 +198,14 @@ pub fn spawn_root_availability_monitor_with_completion(
             }
         }))
         .unwrap_or(MonitorExit::ThreadPanicked);
-        on_exit(&outcome);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            on_exit(&outcome, completion_waiter)
+        }));
+        *completion
+            .completed
+            .lock()
+            .expect("monitor completion poisoned") = true;
+        completion.wake.notify_all();
         outcome
     }))?;
     Ok(RootAvailabilityMonitorHandle {
@@ -261,6 +312,38 @@ mod tests {
             *panic_exit.lock().unwrap(),
             Some(MonitorExit::ThreadPanicked)
         );
+    }
+
+    #[test]
+    fn completion_waiter_releases_retry_only_after_exit_observer_returns() {
+        let retry_ran = Arc::new(AtomicBool::new(false));
+        let retry_from_worker = Arc::clone(&retry_ran);
+        let retry_from_observer = Arc::clone(&retry_ran);
+        let retry_join = Arc::new(Mutex::new(None));
+        let retry_join_from_worker = Arc::clone(&retry_join);
+        let mut monitor = spawn_root_availability_monitor_with_completion_gate(
+            &SystemRootMonitorSpawner,
+            Duration::from_secs(60),
+            || Err("probe failed".to_owned()),
+            || Ok(()),
+            move |_, completion| {
+                let retry = thread::spawn(move || {
+                    completion.wait();
+                    retry_from_worker.store(true, Ordering::Release);
+                });
+                *retry_join_from_worker.lock().unwrap() = Some(retry);
+                thread::yield_now();
+                assert!(!retry_from_observer.load(Ordering::Acquire));
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            monitor.join(),
+            MonitorExit::ProbeFailed("probe failed".to_owned())
+        );
+        retry_join.lock().unwrap().take().unwrap().join().unwrap();
+        assert!(retry_ran.load(Ordering::Acquire));
     }
 
     #[test]

@@ -23,7 +23,7 @@ pub fn compatible_tail_start_generation(
         .max(scan_start_generation)
 }
 
-pub trait RefreshWorkerSpawner {
+pub trait RefreshWorkerSpawner: Send + Sync {
     fn spawn(&self, task: Box<dyn FnOnce() + Send>) -> Result<(), String>;
 }
 
