@@ -13,6 +13,11 @@ use crate::core::index_entry::{
     IndexedEntryKind, PathComparisonMode, RuntimeIncrementalStatus, ScanEvent,
 };
 use crate::core::index_journal::recover_layered_index;
+use crate::core::index_refresh_orchestrator::{
+    authoritative_install_generation, compatible_tail_start_generation, refresh_request_decision,
+    startup_readiness, RefreshRequestDecision, RefreshRequestReason, RefreshWorkerSpawner,
+    RevisionCaptureFence, StartupReadiness, SystemRefreshWorkerSpawner,
+};
 use crate::core::index_scanner::{IndexPathRules, IndexScanPlan, IndexScanStage};
 use crate::core::index_watcher::RuntimeIndexWatcher;
 #[cfg(test)]
@@ -34,7 +39,7 @@ use crate::core::runtime_indexing::{
 use crate::core::search::{HistoryScores, QueryParser, QueryParserConfig, Ranker, SearchResult};
 use crate::core::storage::SqliteStorage;
 use crate::core::targeted_index_scanner::{
-    baseline_manifest_from_entries, DirectoryFingerprint, TargetedIndexScanner,
+    baseline_manifest_from_entries, DirectoryFingerprint, StdFileSystemProbe, TargetedIndexScanner,
 };
 use keytap::{EventKind, Key, Tap};
 use serde::Serialize;
@@ -108,7 +113,9 @@ struct IndexRefreshControl {
     next_service_epoch: u64,
     active_service: Option<RuntimeServiceIdentity>,
     standby_watcher: Option<RuntimeIndexWatcher>,
+    revision_capture_fence: Option<RevisionCaptureFence>,
     restart_recovery_revision: Option<u64>,
+    root_retry_revision: Option<u64>,
 }
 
 impl IndexRefreshControl {
@@ -121,7 +128,9 @@ impl IndexRefreshControl {
             next_service_epoch: 0,
             active_service: None,
             standby_watcher: None,
+            revision_capture_fence: None,
             restart_recovery_revision: None,
+            root_retry_revision: None,
         }
     }
 }
@@ -134,6 +143,7 @@ struct IndexRefreshStart {
 struct IndexRefreshHandoff {
     tail_deltas: Vec<CommittedIndexDelta>,
     manifest: Vec<crate::core::targeted_index_scanner::DirectoryFingerprint>,
+    authoritative_generation: u64,
 }
 
 #[derive(Debug, Default)]
@@ -357,30 +367,75 @@ fn save_config(
         return Err(format!("{error:?}"));
     }
 
-    let refresh_fence = state
-        .index_refresh_fence
-        .lock()
-        .expect("index refresh fence poisoned");
-    let mut runtime = state
-        .runtime
-        .lock()
-        .expect("quickfox runtime lock poisoned");
+    let watcher = RuntimeIndexWatcher::watch_roots(refresh_capture_roots(&config)?)
+        .map_err(|failure| failure.message)?;
+    let storage =
+        storage_store().ok_or_else(|| "index journal storage is unavailable".to_owned())?;
     if let Some(store) = config_store() {
         store.save(&config).map_err(|error| format!("{error:?}"))?;
     }
-    replace_runtime_config_for_full_refresh(&mut runtime, config);
-    let next_shortcut = current_wake_shortcut(&runtime.config);
-    drop(runtime);
-    drop(refresh_fence);
+    let next_shortcut = transition_runtime_config_revision(&state, config, watcher, &storage)?;
     refresh_enabled_global_hotkey_status(&app, &next_shortcut);
     let _ = start_background_index_refresh(app, &state)?;
 
     Ok("saved")
 }
 
+fn transition_runtime_config_revision(
+    state: &QuickFoxAppState,
+    config: QuickFoxConfig,
+    watcher: RuntimeIndexWatcher,
+    storage: &SqliteStorage,
+) -> Result<WakeShortcut, String> {
+    let _refresh_fence = state
+        .index_refresh_fence
+        .lock()
+        .expect("index refresh fence poisoned");
+    wait_for_revision_capture_registration();
+    let previous = {
+        let mut runtime = state
+            .runtime
+            .lock()
+            .expect("quickfox runtime lock poisoned");
+        runtime.index_refresh.active_service = None;
+        runtime.runtime_indexing.take()
+    };
+    let handoff_requires_recovery = previous
+        .is_some_and(|handle| handle.handoff() == RuntimeIndexingHandoffOutcome::RecoveryRequired);
+    let fence_generation = storage
+        .highest_committed_generation()
+        .map_err(|error| error.to_string())?;
+    let mut runtime = state
+        .runtime
+        .lock()
+        .expect("quickfox runtime lock poisoned");
+    replace_runtime_config_for_full_refresh(&mut runtime, config);
+    runtime.index_refresh.standby_watcher = Some(watcher);
+    runtime.index_refresh.revision_capture_fence = Some(
+        RevisionCaptureFence::after_old_service_join(fence_generation),
+    );
+    if handoff_requires_recovery {
+        runtime.incremental_status.state = IncrementalState::Degraded;
+        runtime.incremental_status.degradation_code =
+            Some(IndexDegradationCode::FullRefreshFallback);
+    }
+    let next_shortcut = current_wake_shortcut(&runtime.config);
+    Ok(next_shortcut)
+}
+
+fn wait_for_revision_capture_registration() {
+    #[cfg(target_os = "macos")]
+    thread::sleep(std::time::Duration::from_millis(500));
+
+    #[cfg(not(target_os = "macos"))]
+    thread::yield_now();
+}
+
 fn replace_runtime_config_for_full_refresh(runtime: &mut QuickFoxRuntime, config: QuickFoxConfig) {
     runtime.index_refresh.standby_watcher.take();
+    runtime.index_refresh.revision_capture_fence = None;
     runtime.index_refresh.restart_recovery_revision = None;
+    runtime.index_refresh.root_retry_revision = None;
     runtime.config = config;
     runtime.index_refresh.config_revision = runtime.index_refresh.config_revision.saturating_add(1);
     runtime.index_refresh.config_fingerprint = index_semantic_config_fingerprint(&runtime.config);
@@ -944,6 +999,14 @@ fn start_background_index_refresh<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: &QuickFoxAppState,
 ) -> Result<IndexStatus, String> {
+    start_background_index_refresh_with_spawner(app, state, &SystemRefreshWorkerSpawner)
+}
+
+fn start_background_index_refresh_with_spawner<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: &QuickFoxAppState,
+    spawner: &dyn RefreshWorkerSpawner,
+) -> Result<IndexStatus, String> {
     let start = {
         let mut runtime = state
             .runtime
@@ -957,9 +1020,13 @@ fn start_background_index_refresh<R: tauri::Runtime>(
     let IndexRefreshStart { identity, config } = start;
     if let Err(error) = prepare_refresh_standby_capture(state, &identity, &config) {
         let message = error.clone();
+        let unavailable_roots = message == "one or more configured index roots are unavailable";
         record_index_refresh_runtime_failure(state, &identity, RuntimeRestartFailureKind::Watcher);
         let _ = apply_failed_index_refresh_for_identity(state, &identity, error);
-        if finish_current_index_refresh(state, &identity) {
+        let retry_now = finish_current_index_refresh(state, &identity);
+        if unavailable_roots {
+            schedule_configured_root_recovery(app.clone(), state, &identity);
+        } else if retry_now {
             let _ = start_background_index_refresh(app.clone(), state);
         }
         return Err(message);
@@ -999,9 +1066,11 @@ fn start_background_index_refresh<R: tauri::Runtime>(
 
     let spawn_identity = identity.clone();
     let spawn_failure_app = app.clone();
-    let spawn_result = thread::Builder::new()
-        .name("quickfox-index-refresh".to_owned())
-        .spawn(move || {
+    let spawn_result = spawn_refresh_worker_for_identity(
+        state,
+        &spawn_identity,
+        spawner,
+        Box::new(move || {
             let scanner = IndexScanner;
             let mut accumulator = IndexRefreshAccumulator::default();
             let mut update_result = Ok(());
@@ -1104,7 +1173,7 @@ fn start_background_index_refresh<R: tauri::Runtime>(
             if update_result.is_ok() && !scan_failed {
                 let completed_at_ms = current_time_ms();
                 let app_for_update = app.clone();
-                let final_payload = accumulator.final_payload();
+                let mut final_payload = accumulator.final_payload();
                 let handoff_state = app.state::<QuickFoxAppState>();
                 let (handoff, handoff_error) = match prepare_index_refresh_handoff(
                     &handoff_state,
@@ -1131,12 +1200,17 @@ fn start_background_index_refresh<R: tauri::Runtime>(
                     .as_ref()
                     .map(|handoff| handoff.tail_deltas.clone())
                     .unwrap_or_default();
+                let authoritative_generation = handoff
+                    .as_ref()
+                    .map(|handoff| handoff.authoritative_generation)
+                    .unwrap_or(baseline_generation);
                 let content_entries =
                     entries_after_committed_deltas(final_payload.entries.clone(), &tail_deltas);
+                final_payload.entries = content_entries.clone();
                 let should_build_content_index =
                     should_build_content_index_for_config(&config, &content_entries);
                 let persistence_state = app.state::<QuickFoxAppState>();
-                let persistence =
+                let mut persistence =
                     if let Some(handoff) = &handoff {
                         let manifest = handoff.manifest.clone();
                         persist_index_refresh_for_identity(
@@ -1144,7 +1218,7 @@ fn start_background_index_refresh<R: tauri::Runtime>(
                             &identity,
                             completed_at_ms,
                             final_payload,
-                            baseline_generation,
+                            authoritative_generation,
                             move |completed_at_ms, entries, baseline_generation, _| {
                                 persist_and_activate_baseline_with_manifest(
                                     completed_at_ms,
@@ -1163,15 +1237,31 @@ fn start_background_index_refresh<R: tauri::Runtime>(
                     matches!(persistence, BaselinePersistenceOutcome::Completed(_));
                 let app_for_state = app_for_update.clone();
                 let persistence_identity = identity.clone();
-                let persistence_tail_deltas = tail_deltas.clone();
+                let persistence_tail_deltas =
+                    if baseline_persistence_completed && !should_build_content_index {
+                        match finalize_durable_refresh_successor(
+                            &persistence_state,
+                            &identity,
+                            authoritative_generation,
+                        ) {
+                            Ok(tail) => tail,
+                            Err(error) => {
+                                persistence = BaselinePersistenceOutcome::Failed(error);
+                                Vec::new()
+                            }
+                        }
+                    } else {
+                        Vec::new()
+                    };
                 update_result = app_for_update.run_on_main_thread(move || {
                     let state = app_for_state.state::<QuickFoxAppState>();
                     match apply_baseline_persistence_outcome_for_identity(
                         &state,
                         &persistence_identity,
-                        baseline_generation,
+                        authoritative_generation,
                         persistence,
                         completed_at_ms,
+                        !should_build_content_index,
                         &persistence_tail_deltas,
                     ) {
                         BaselinePersistenceApplicationOutcome::Applied(Some(application)) => {
@@ -1264,12 +1354,12 @@ fn start_background_index_refresh<R: tauri::Runtime>(
                             .as_ref()
                             .map(|handoff| handoff.manifest.clone())
                             .unwrap_or_default();
-                        let persistence = persist_index_refresh_for_identity(
+                        let mut persistence = persist_index_refresh_for_identity(
                             &persistence_state,
                             &identity,
                             content_completed_at_ms,
                             content_payload,
-                            baseline_generation,
+                            authoritative_generation,
                             move |completed_at_ms, entries, baseline_generation, _| {
                                 persist_and_activate_baseline_with_manifest(
                                     completed_at_ms,
@@ -1282,7 +1372,22 @@ fn start_background_index_refresh<R: tauri::Runtime>(
                         let app_for_update = app.clone();
                         let app_for_state = app_for_update.clone();
                         let content_identity = identity.clone();
-                        let content_tail_deltas = tail_deltas.clone();
+                        let content_tail_deltas =
+                            if matches!(persistence, BaselinePersistenceOutcome::Completed(_)) {
+                                match finalize_durable_refresh_successor(
+                                    &persistence_state,
+                                    &identity,
+                                    authoritative_generation,
+                                ) {
+                                    Ok(tail) => tail,
+                                    Err(error) => {
+                                        persistence = BaselinePersistenceOutcome::Failed(error);
+                                        Vec::new()
+                                    }
+                                }
+                            } else {
+                                Vec::new()
+                            };
                         update_result = app_for_update.run_on_main_thread(move || {
                             let state = app_for_state.state::<QuickFoxAppState>();
                             match persistence {
@@ -1291,7 +1396,7 @@ fn start_background_index_refresh<R: tauri::Runtime>(
                                         apply_completed_content_index_refresh_for_identity(
                                             &state,
                                             &content_identity,
-                                            baseline_generation,
+                                            authoritative_generation,
                                             content_index,
                                             payload,
                                             content_completed_at_ms,
@@ -1387,17 +1492,129 @@ fn start_background_index_refresh<R: tauri::Runtime>(
                     let _ = start_background_index_refresh(app.clone(), &state);
                 }
             }
-        });
-    if let Err(error) = spawn_result {
-        let message = error.to_string();
-        let _ = apply_failed_index_refresh_for_identity(state, &spawn_identity, message.clone());
-        if finish_current_index_refresh(state, &spawn_identity) {
+        }),
+    );
+    if let Err(failure) = spawn_result {
+        if failure.retry {
             let _ = start_background_index_refresh(spawn_failure_app, state);
         }
-        return Err(message);
+        return Err(failure.message);
     }
 
     Ok(status)
+}
+
+fn schedule_configured_root_recovery<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: &QuickFoxAppState,
+    identity: &IndexRefreshIdentity,
+) {
+    schedule_configured_root_recovery_with(app, state, identity, |app| {
+        let dispatch = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            let state = dispatch.state::<QuickFoxAppState>();
+            let _ = start_background_index_refresh(dispatch.clone(), &state);
+        });
+    });
+}
+
+fn schedule_configured_root_recovery_with<R, F>(
+    app: tauri::AppHandle<R>,
+    state: &QuickFoxAppState,
+    identity: &IndexRefreshIdentity,
+    on_ready: F,
+) where
+    R: tauri::Runtime,
+    F: FnOnce(tauri::AppHandle<R>) + Send + 'static,
+{
+    {
+        let mut runtime = state
+            .runtime
+            .lock()
+            .expect("quickfox runtime lock poisoned");
+        if runtime.index_refresh.config_revision != identity.config_revision
+            || runtime.index_refresh.config_fingerprint != identity.config_fingerprint
+            || runtime.index_refresh.root_retry_revision == Some(identity.config_revision)
+        {
+            return;
+        }
+        runtime.index_refresh.root_retry_revision = Some(identity.config_revision);
+        runtime.incremental_status.dirty_roots = build_scan_options(&runtime.config)
+            .include_dirs
+            .iter()
+            .filter(|root| !root.is_dir())
+            .count();
+    }
+    let revision = identity.config_revision;
+    let fingerprint = identity.config_fingerprint.clone();
+    let _ = thread::Builder::new()
+        .name("quickfox-index-root-recovery".to_owned())
+        .spawn(move || loop {
+            thread::sleep(std::time::Duration::from_secs(1));
+            let state = app.state::<QuickFoxAppState>();
+            let ready = {
+                let runtime = state
+                    .runtime
+                    .lock()
+                    .expect("quickfox runtime lock poisoned");
+                if runtime.index_refresh.config_revision != revision
+                    || runtime.index_refresh.config_fingerprint != fingerprint
+                {
+                    return;
+                }
+                build_scan_options(&runtime.config)
+                    .include_dirs
+                    .iter()
+                    .all(|root| root.is_dir())
+            };
+            if !ready {
+                continue;
+            }
+            {
+                let mut runtime = state
+                    .runtime
+                    .lock()
+                    .expect("quickfox runtime lock poisoned");
+                if runtime.index_refresh.config_revision != revision
+                    || runtime.index_refresh.config_fingerprint != fingerprint
+                {
+                    return;
+                }
+                runtime.index_refresh.root_retry_revision = None;
+                runtime.incremental_status.dirty_roots = 0;
+            }
+            on_ready(app.clone());
+            return;
+        });
+}
+
+struct RefreshWorkerSpawnFailure {
+    message: String,
+    retry: bool,
+}
+
+fn spawn_refresh_worker_for_identity(
+    state: &QuickFoxAppState,
+    identity: &IndexRefreshIdentity,
+    spawner: &dyn RefreshWorkerSpawner,
+    task: Box<dyn FnOnce() + Send>,
+) -> Result<(), RefreshWorkerSpawnFailure> {
+    spawner
+        .spawn(task)
+        .map_err(|message| RefreshWorkerSpawnFailure {
+            retry: apply_refresh_worker_spawn_failure(state, identity, message.clone()),
+            message,
+        })
+}
+
+fn apply_refresh_worker_spawn_failure(
+    state: &QuickFoxAppState,
+    identity: &IndexRefreshIdentity,
+    error: String,
+) -> bool {
+    record_index_refresh_runtime_failure(state, identity, RuntimeRestartFailureKind::WorkerSpawn);
+    let _ = apply_failed_index_refresh_for_identity(state, identity, error);
+    finish_current_index_refresh(state, identity)
 }
 
 fn schedule_pending_refresh_after_superseded<R: tauri::Runtime>(
@@ -1470,13 +1687,14 @@ fn prepare_index_refresh_handoff(
                     runtime.runtime_indexing.take(),
                     capture_watcher,
                     roots,
+                    runtime.index_refresh.revision_capture_fence.take(),
                 )))
             }
         } else {
             Err("index refresh standby watcher is unavailable".to_owned())
         }
     };
-    let (previous, capture_watcher, roots) = match handoff_parts {
+    let (previous, capture_watcher, roots, revision_capture_fence) = match handoff_parts {
         Ok(Some(parts)) => parts,
         Ok(None) => return Ok(None),
         Err(error) => {
@@ -1499,10 +1717,11 @@ fn prepare_index_refresh_handoff(
         }
     }
 
-    let standby_watcher = RuntimeIndexWatcher::watch_roots(roots.clone()).map_err(|failure| {
+    let successor_watcher = RuntimeIndexWatcher::watch_roots(roots.clone()).map_err(|failure| {
         record_index_refresh_runtime_failure(state, identity, RuntimeRestartFailureKind::Watcher);
         failure.message
     })?;
+    wait_for_revision_capture_registration();
     let capture_storage = storage_store().ok_or_else(|| {
         record_index_refresh_runtime_failure(state, identity, RuntimeRestartFailureKind::Storage);
         "index journal storage is unavailable".to_owned()
@@ -1531,7 +1750,7 @@ fn prepare_index_refresh_handoff(
     })?;
     let capture_handle = start_runtime_indexing(
         capture_watcher,
-        TargetedIndexScanner::new(rules),
+        TargetedIndexScanner::new(rules.clone()),
         Box::new(capture_storage),
         RuntimeIndexingOptions {
             roots: roots.clone(),
@@ -1553,20 +1772,79 @@ fn prepare_index_refresh_handoff(
         return Err("standby capture handoff requires a recovery scan".to_owned());
     }
 
+    let successor_storage = storage_store().ok_or_else(|| {
+        record_index_refresh_runtime_failure(state, identity, RuntimeRestartFailureKind::Storage);
+        "index journal storage is unavailable".to_owned()
+    })?;
+    let successor_generation = successor_storage
+        .highest_committed_generation()
+        .map_err(|error| error.to_string())?;
+    install_durable_refresh_successor(
+        state,
+        identity,
+        successor_watcher,
+        rules,
+        roots.clone(),
+        successor_storage,
+        successor_generation,
+    )?;
+
     let storage = storage_store().ok_or_else(|| {
         record_index_refresh_runtime_failure(state, identity, RuntimeRestartFailureKind::Storage);
         "index journal storage is unavailable".to_owned()
     })?;
-    let (tail_deltas, manifest) =
-        load_full_refresh_handoff_snapshot(&storage, scan_start_generation, &roots, entries)
-            .inspect_err(|_| {
-                record_index_refresh_runtime_failure(
-                    state,
-                    identity,
-                    RuntimeRestartFailureKind::Storage,
-                );
-            })?;
+    let (tail_deltas, manifest) = load_revision_compatible_handoff_snapshot(
+        &storage,
+        scan_start_generation,
+        revision_capture_fence,
+        &roots,
+        entries,
+    )
+    .inspect_err(|_| {
+        record_index_refresh_runtime_failure(state, identity, RuntimeRestartFailureKind::Storage);
+    })?;
 
+    Ok(Some(IndexRefreshHandoff {
+        authoritative_generation: authoritative_install_generation(
+            scan_start_generation,
+            &tail_deltas
+                .iter()
+                .map(|delta| delta.generation)
+                .collect::<Vec<_>>(),
+        ),
+        tail_deltas,
+        manifest,
+    }))
+}
+
+fn install_durable_refresh_successor(
+    state: &QuickFoxAppState,
+    identity: &IndexRefreshIdentity,
+    watcher: RuntimeIndexWatcher,
+    rules: IndexPathRules,
+    roots: Vec<PathBuf>,
+    storage: SqliteStorage,
+    initial_generation: u64,
+) -> Result<(), String> {
+    let handle = start_runtime_indexing(
+        watcher,
+        TargetedIndexScanner::new(rules),
+        Box::new(storage),
+        RuntimeIndexingOptions {
+            roots,
+            policy: crate::core::index_update_coordinator::CoordinatorPolicy::production(),
+            initial_generation,
+        },
+        |_| {},
+    )
+    .map_err(|failure| {
+        record_index_refresh_runtime_failure(
+            state,
+            identity,
+            RuntimeRestartFailureKind::WorkerSpawn,
+        );
+        failure.message
+    })?;
     let _fence = state
         .index_refresh_fence
         .lock()
@@ -1576,13 +1854,13 @@ fn prepare_index_refresh_handoff(
         .lock()
         .expect("quickfox runtime lock poisoned");
     if !index_refresh_identity_is_current(&runtime, identity) {
-        return Ok(None);
+        drop(runtime);
+        handle.stop();
+        return Err("index refresh was superseded before successor activation".to_owned());
     }
-    runtime.index_refresh.standby_watcher = Some(standby_watcher);
-    Ok(Some(IndexRefreshHandoff {
-        tail_deltas,
-        manifest,
-    }))
+    runtime.runtime_indexing = Some(handle);
+    runtime.incremental_status.state = IncrementalState::Preparing;
+    Ok(())
 }
 
 fn record_index_refresh_runtime_failure(
@@ -1628,6 +1906,60 @@ fn detach_runtime_indexing_for_refresh(
     runtime.runtime_indexing.take()
 }
 
+fn finalize_durable_refresh_successor(
+    state: &QuickFoxAppState,
+    identity: &IndexRefreshIdentity,
+    baseline_generation: u64,
+) -> Result<Vec<CommittedIndexDelta>, String> {
+    let storage =
+        storage_store().ok_or_else(|| "index journal storage is unavailable".to_owned())?;
+    finalize_durable_refresh_successor_with_storage(state, identity, baseline_generation, &storage)
+}
+
+fn finalize_durable_refresh_successor_with_storage(
+    state: &QuickFoxAppState,
+    identity: &IndexRefreshIdentity,
+    baseline_generation: u64,
+    storage: &SqliteStorage,
+) -> Result<Vec<CommittedIndexDelta>, String> {
+    let config = {
+        let runtime = state
+            .runtime
+            .lock()
+            .expect("quickfox runtime lock poisoned");
+        runtime.config.clone()
+    };
+    let roots = refresh_capture_roots(&config)?;
+    let standby = RuntimeIndexWatcher::watch_roots(roots).map_err(|failure| failure.message)?;
+    wait_for_revision_capture_registration();
+    let handle = {
+        let _fence = state
+            .index_refresh_fence
+            .lock()
+            .expect("index refresh fence poisoned");
+        let mut runtime = state
+            .runtime
+            .lock()
+            .expect("quickfox runtime lock poisoned");
+        if !index_refresh_identity_is_current(&runtime, identity) {
+            return Err("index refresh was superseded before successor handoff".to_owned());
+        }
+        runtime.index_refresh.active_service = None;
+        runtime.index_refresh.standby_watcher = Some(standby);
+        runtime
+            .runtime_indexing
+            .take()
+            .ok_or_else(|| "durable refresh successor is unavailable".to_owned())?
+    };
+    if handle.handoff() == RuntimeIndexingHandoffOutcome::RecoveryRequired {
+        record_index_refresh_runtime_failure(state, identity, RuntimeRestartFailureKind::Handoff);
+        return Err("durable refresh successor requires recovery".to_owned());
+    }
+    storage
+        .committed_index_deltas_after(baseline_generation)
+        .map_err(|error| error.to_string())
+}
+
 fn load_full_refresh_handoff_snapshot(
     storage: &SqliteStorage,
     scan_start_generation: u64,
@@ -1655,6 +1987,18 @@ fn load_full_refresh_handoff_snapshot(
         .collect();
     refresh_tail_touched_manifest_fingerprints(&mut manifest_by_path, &touched_paths, roots);
     Ok((tail_deltas, manifest_by_path.into_values().collect()))
+}
+
+fn load_revision_compatible_handoff_snapshot(
+    storage: &SqliteStorage,
+    scan_start_generation: u64,
+    revision_capture_fence: Option<RevisionCaptureFence>,
+    roots: &[PathBuf],
+    scanned_entries: &[IndexedEntry],
+) -> Result<(Vec<CommittedIndexDelta>, Vec<DirectoryFingerprint>), String> {
+    let compatible_tail_start =
+        compatible_tail_start_generation(scan_start_generation, revision_capture_fence);
+    load_full_refresh_handoff_snapshot(storage, compatible_tail_start, roots, scanned_entries)
 }
 
 fn refresh_tail_touched_manifest_fingerprints(
@@ -1701,7 +2045,6 @@ fn prepare_refresh_standby_capture(
     config: &QuickFoxConfig,
 ) -> Result<(), String> {
     let roots = refresh_capture_roots(config)?;
-    let watcher = RuntimeIndexWatcher::watch_roots(roots).map_err(|failure| failure.message)?;
     let _fence = state
         .index_refresh_fence
         .lock()
@@ -1713,6 +2056,15 @@ fn prepare_refresh_standby_capture(
     if !index_refresh_identity_is_current(&runtime, identity) {
         return Err("index refresh was superseded before standby capture".to_owned());
     }
+    if runtime
+        .index_refresh
+        .standby_watcher
+        .as_ref()
+        .is_some_and(|watcher| watcher.watched_roots() == roots)
+    {
+        return Ok(());
+    }
+    let watcher = RuntimeIndexWatcher::watch_roots(roots).map_err(|failure| failure.message)?;
     runtime.index_refresh.standby_watcher = Some(watcher);
     Ok(())
 }
@@ -1943,6 +2295,7 @@ fn apply_baseline_persistence_outcome_for_identity(
     baseline_generation: u64,
     outcome: BaselinePersistenceOutcome,
     completed_at_ms: i64,
+    complete_lifecycle: bool,
     tail_deltas: &[CommittedIndexDelta],
 ) -> BaselinePersistenceApplicationOutcome {
     let _fence = state
@@ -1958,29 +2311,42 @@ fn apply_baseline_persistence_outcome_for_identity(
     ) {
         return BaselinePersistenceApplicationOutcome::Superseded;
     }
-    let mut application = apply_baseline_persistence_outcome(
-        state,
-        identity.lifecycle_generation,
-        baseline_generation,
-        outcome,
-        completed_at_ms,
-    );
-    if application
-        .as_ref()
-        .is_some_and(|application| application.completed)
-        && !tail_deltas.is_empty()
-    {
-        let mut runtime = state
-            .runtime
-            .lock()
-            .expect("quickfox runtime lock poisoned");
-        for delta in tail_deltas {
-            runtime.index.apply_delta(delta.clone());
+    let application = match outcome {
+        BaselinePersistenceOutcome::Completed(payload) => {
+            let mut runtime = state
+                .runtime
+                .lock()
+                .expect("quickfox runtime lock poisoned");
+            let entry_count = payload.entries.len();
+            let baseline = build_search_index_for_config(&runtime.config, payload.entries);
+            let installed = runtime.index.replace_baseline_with_authoritative_tail(
+                baseline,
+                baseline_generation,
+                tail_deltas,
+            );
+            let lifecycle_completed = !complete_lifecycle
+                || runtime.index_lifecycle.complete_refresh(
+                    identity.lifecycle_generation,
+                    entry_count,
+                    completed_at_ms,
+                );
+            if installed {
+                runtime.manifest_ready = true;
+                runtime.last_report = payload.summary;
+            }
+            Some(BaselinePersistenceApplication {
+                status: runtime.index_status(),
+                completed: installed && lifecycle_completed,
+            })
         }
-        if let Some(application) = &mut application {
-            application.status = runtime.index_status();
-        }
-    }
+        outcome => apply_baseline_persistence_outcome(
+            state,
+            identity.lifecycle_generation,
+            baseline_generation,
+            outcome,
+            completed_at_ms,
+        ),
+    };
     BaselinePersistenceApplicationOutcome::Applied(application)
 }
 
@@ -2006,24 +2372,34 @@ fn apply_completed_content_index_refresh_for_identity(
     ) {
         return None;
     }
-    let status = apply_completed_content_index_refresh(
-        state,
-        identity.lifecycle_generation,
-        baseline_generation,
-        content_index,
-        payload,
-        completed_at_ms,
-    )?;
     if tail_deltas.is_empty() {
-        return Some(status);
+        return apply_completed_content_index_refresh(
+            state,
+            identity.lifecycle_generation,
+            baseline_generation,
+            content_index,
+            payload,
+            completed_at_ms,
+        );
     }
     let mut runtime = state
         .runtime
         .lock()
         .expect("quickfox runtime lock poisoned");
-    for delta in tail_deltas {
-        runtime.index.apply_delta(delta.clone());
+    let entry_count = payload.entries.len();
+    if !runtime.index.replace_baseline_with_authoritative_tail(
+        content_index,
+        baseline_generation,
+        tail_deltas,
+    ) || !runtime.index_lifecycle.complete_refresh(
+        identity.lifecycle_generation,
+        entry_count,
+        completed_at_ms,
+    ) {
+        return None;
     }
+    runtime.manifest_ready = true;
+    runtime.last_report = payload.summary;
     Some(runtime.index_status())
 }
 
@@ -2142,16 +2518,16 @@ fn apply_completed_index_refresh(
         .lock()
         .expect("quickfox runtime lock poisoned");
     let entry_count = payload.entries.len();
+    let baseline = build_search_index_for_config(&runtime.config, payload.entries);
     if !runtime
-        .index_lifecycle
-        .complete_refresh(generation, entry_count, completed_at_ms)
+        .index
+        .replace_baseline_with_authoritative_tail(baseline, baseline_generation, &[])
+        || !runtime
+            .index_lifecycle
+            .complete_refresh(generation, entry_count, completed_at_ms)
     {
         return None;
     }
-    let baseline = build_search_index_for_config(&runtime.config, payload.entries);
-    runtime
-        .index
-        .replace_baseline_search_index(baseline, baseline_generation);
     runtime.manifest_ready = true;
     runtime.last_report = payload.summary;
     Some(runtime.index_status())
@@ -2171,15 +2547,16 @@ fn apply_completed_content_index_refresh(
         .lock()
         .expect("quickfox runtime lock poisoned");
     let entry_count = payload.entries.len();
-    if !runtime
+    if !runtime.index.replace_baseline_with_authoritative_tail(
+        content_index,
+        baseline_generation,
+        &[],
+    ) || !runtime
         .index_lifecycle
         .complete_refresh(generation, entry_count, completed_at_ms)
     {
         return None;
     }
-    runtime
-        .index
-        .replace_baseline_search_index(content_index, baseline_generation);
     runtime.manifest_ready = true;
     runtime.last_report = payload.summary;
     Some(runtime.index_status())
@@ -2553,11 +2930,16 @@ fn apply_runtime_indexing_event(
                 return None;
             }
             runtime.index.apply_delta(delta);
-            let request_refresh = baseline_refresh_event_for_delta_state(
+            let delta_safety_reached = baseline_refresh_event_for_delta_state(
                 runtime.index.delta_entry_count(),
                 runtime.index.estimated_delta_bytes(),
             )
             .is_some();
+            let request_refresh = delta_safety_reached
+                && refresh_request_decision(
+                    runtime.index_refresh.active.is_some(),
+                    RefreshRequestReason::DeltaSafetyLimit,
+                ) == RefreshRequestDecision::Start;
             Some(RuntimeIndexingEventApplication {
                 status: runtime.index_status(),
                 request_refresh,
@@ -2584,12 +2966,19 @@ fn apply_runtime_indexing_event(
             if baseline_refresh_requires_manifest_rebuild(reason) {
                 runtime.manifest_ready = false;
             }
-            if runtime.index_refresh.active.is_some() {
+            let request_reason = if reason == BaselineRefreshReason::DeltaSafetyLimit {
+                RefreshRequestReason::DeltaSafetyLimit
+            } else {
+                RefreshRequestReason::DirtyRoots
+            };
+            let decision =
+                refresh_request_decision(runtime.index_refresh.active.is_some(), request_reason);
+            if decision == RefreshRequestDecision::QueueRerun {
                 runtime.index_refresh.pending = true;
             }
             Some(RuntimeIndexingEventApplication {
                 status: runtime.index_status(),
-                request_refresh: true,
+                request_refresh: decision != RefreshRequestDecision::AbsorbedByActiveRefresh,
             })
         }
     }
@@ -2696,10 +3085,71 @@ fn should_persist_index_checkpoint(stage: &str, is_final: bool) -> bool {
 fn build_runtime() -> QuickFoxRuntime {
     let config = load_startup_config();
     if let Some(storage) = storage_store() {
-        let recovery = recover_layered_index(&storage);
-        return build_runtime_from_recovery(config, recovery);
+        return build_runtime_with_startup_calibration(config, &storage);
     }
     build_runtime_from_snapshot(config, load_latest_index_snapshot())
+}
+
+fn build_runtime_with_startup_calibration(
+    config: QuickFoxConfig,
+    storage: &SqliteStorage,
+) -> QuickFoxRuntime {
+    let roots = build_scan_options(&config).include_dirs;
+    let all_roots_available = roots.iter().all(|root| root.is_dir());
+    let mut calibration_succeeded = all_roots_available;
+    if all_roots_available {
+        let options = build_scan_options(&config);
+        if let Ok(rules) = IndexPathRules::from_plan(&IndexScanPlan {
+            include_roots: roots.clone(),
+            exclude_dirs: options.exclude_dirs,
+            exclude_patterns: options.exclude_patterns,
+            respect_project_ignores: options.respect_project_ignores,
+            stage: None,
+        }) {
+            let scanner = TargetedIndexScanner::new(rules);
+            let probe = StdFileSystemProbe;
+            let mut generation = storage.highest_committed_generation().unwrap_or_default();
+            for root in &roots {
+                let Ok(calibration) = scanner.calibrate_root(&probe, storage, storage, root) else {
+                    calibration_succeeded = false;
+                    break;
+                };
+                if !calibration.failures.is_empty() {
+                    calibration_succeeded = false;
+                    continue;
+                }
+                if !calibration.upserts.is_empty()
+                    || !calibration.removals.is_empty()
+                    || !calibration.manifest_upserts.is_empty()
+                    || !calibration.manifest_removals.is_empty()
+                {
+                    generation = generation.saturating_add(1);
+                    if let Err(error) = storage.commit_incremental_batch(
+                        &CommittedIndexDelta {
+                            generation,
+                            upserts: calibration.upserts,
+                            removals: calibration.removals,
+                        },
+                        &calibration.manifest_upserts,
+                        &calibration.manifest_removals,
+                    ) {
+                        eprintln!("QuickFox startup calibration commit failed: {error}");
+                        calibration_succeeded = false;
+                    }
+                }
+            }
+        } else {
+            calibration_succeeded = false;
+        }
+    }
+    let recovery = recover_layered_index(storage);
+    let mut runtime = build_runtime_from_recovery(config, recovery);
+    if !calibration_succeeded && runtime.config.index.watcher_enabled {
+        runtime.manifest_ready = false;
+        runtime.incremental_status.state = IncrementalState::Degraded;
+        runtime.incremental_status.degradation_code = Some(IndexDegradationCode::CalibrationFailed);
+    }
+    runtime
 }
 
 fn build_runtime_from_recovery(
@@ -2716,12 +3166,16 @@ fn build_runtime_from_recovery(
         incremental_status.state = IncrementalState::Degraded;
         incremental_status.degradation_code = Some(code);
     }
-    let configured_roots: Vec<PathBuf> = build_scan_options(&config)
-        .include_dirs
-        .into_iter()
-        .filter(|root| root.is_dir())
-        .collect();
-    let manifest_ready = recovery.manifest_covers_roots(&configured_roots);
+    let configured_roots = build_scan_options(&config).include_dirs;
+    let availability: Vec<bool> = configured_roots.iter().map(|root| root.is_dir()).collect();
+    let manifest_ready = startup_readiness(
+        &availability,
+        recovery.manifest_covers_roots(&configured_roots),
+    ) == StartupReadiness::Ready;
+    if !manifest_ready && config.index.watcher_enabled {
+        incremental_status.state = IncrementalState::Degraded;
+        incremental_status.degradation_code = Some(IndexDegradationCode::CalibrationFailed);
+    }
     let index_refresh = IndexRefreshControl::for_config(&config);
     QuickFoxRuntime {
         config,
@@ -3766,9 +4220,10 @@ mod tests {
             runtime.index_status().kind,
             crate::core::index::IndexStatusKind::Ready
         );
+        assert_eq!(runtime.incremental_status.state, IncrementalState::Degraded);
         assert_eq!(
-            runtime.incremental_status.state,
-            IncrementalState::Preparing
+            runtime.incremental_status.degradation_code,
+            Some(IndexDegradationCode::CalibrationFailed)
         );
         assert!(!runtime.manifest_ready);
         assert!(runtime.runtime_indexing.is_none());
@@ -3815,10 +4270,114 @@ mod tests {
         );
 
         assert!(!runtime.manifest_ready);
+        assert_eq!(runtime.incremental_status.state, IncrementalState::Degraded);
+    }
+
+    #[test]
+    fn startup_calibration_recovers_changes_made_while_application_was_off() {
+        let temp = tempfile::Builder::new()
+            .prefix("quickfox-startup-")
+            .tempdir_in(std::env::temp_dir())
+            .unwrap();
+        let root_alias = temp.path().join("root");
+        fs::create_dir_all(&root_alias).unwrap();
+        let root = root_alias.canonicalize().unwrap();
+        let storage = SqliteStorage::open(temp.path().join("startup-calibration.sqlite")).unwrap();
+        let baseline_id = storage.save_completed_index_batch(1, &[]).unwrap();
+        storage
+            .activate_baseline_with_manifest_and_clear_incremental_state(
+                baseline_id,
+                0,
+                &[DirectoryFingerprint {
+                    path: root.to_string_lossy().into_owned(),
+                    parent: None,
+                    root: root.to_string_lossy().into_owned(),
+                    modified_ms: Some(-1),
+                }],
+            )
+            .unwrap();
+        let created_while_off = root.join("while-off.md");
+        fs::write(&created_while_off, "new").unwrap();
+        let config = QuickFoxConfig::default_with_index_dirs(vec![root.to_string_lossy().into()]);
+
+        let runtime = build_runtime_with_startup_calibration(config, &storage);
+
+        assert_eq!(runtime.index.entry_count(), 1);
+        assert_eq!(runtime.index.generation(), 1);
+        assert!(runtime.manifest_ready);
+    }
+
+    #[test]
+    fn startup_with_missing_configured_root_stays_degraded_and_retryable() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("removed-root");
+        fs::create_dir_all(&root).unwrap();
+        let storage = SqliteStorage::open(temp.path().join("missing-root.sqlite")).unwrap();
+        let baseline_id = storage.save_completed_index_batch(1, &[]).unwrap();
+        storage
+            .activate_baseline_with_manifest_and_clear_incremental_state(
+                baseline_id,
+                0,
+                &baseline_manifest_from_entries(&[], std::slice::from_ref(&root)),
+            )
+            .unwrap();
+        fs::remove_dir_all(&root).unwrap();
+        let config = QuickFoxConfig::default_with_index_dirs(vec![root.to_string_lossy().into()]);
+
+        let runtime = build_runtime_with_startup_calibration(config, &storage);
+
+        assert!(!runtime.manifest_ready);
+        assert_eq!(runtime.incremental_status.state, IncrementalState::Degraded);
         assert_eq!(
-            runtime.incremental_status.state,
-            IncrementalState::Preparing
+            runtime.incremental_status.degradation_code,
+            Some(IndexDegradationCode::CalibrationFailed)
         );
+    }
+
+    #[test]
+    fn missing_root_recovery_monitor_dispatches_when_root_returns() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("temporarily-unavailable");
+        let config =
+            QuickFoxConfig::default_with_index_dirs(vec![missing.to_string_lossy().into()]);
+        let mut runtime = build_runtime_from_snapshot(config, None);
+        let identity = begin_runtime_index_refresh(&mut runtime).unwrap().identity;
+        runtime.index_refresh.active = None;
+        let app = tauri::test::mock_app();
+        app.manage(QuickFoxAppState {
+            runtime: Mutex::new(runtime),
+            index_refresh_fence: Mutex::new(()),
+            window_state: Mutex::new(LauncherWindowState::default()),
+            global_hotkey_status: Mutex::new(pending_global_hotkey_status()),
+        });
+        let state = app.state::<QuickFoxAppState>();
+        let dispatched = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dispatched_from_monitor = Arc::clone(&dispatched);
+
+        schedule_configured_root_recovery_with(
+            app.handle().clone(),
+            &state,
+            &identity,
+            move |_| {
+                dispatched_from_monitor.store(true, std::sync::atomic::Ordering::Release);
+            },
+        );
+        assert_eq!(
+            state.runtime.lock().unwrap().incremental_status.dirty_roots,
+            1
+        );
+        fs::create_dir_all(&missing).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !dispatched.load(std::sync::atomic::Ordering::Acquire)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        assert!(dispatched.load(std::sync::atomic::Ordering::Acquire));
+        let runtime = state.runtime.lock().unwrap();
+        assert_eq!(runtime.index_refresh.root_retry_revision, None);
+        assert_eq!(runtime.incremental_status.dirty_roots, 0);
     }
 
     #[test]
@@ -4200,6 +4759,7 @@ mod tests {
                 0,
                 current_outcome,
                 3,
+                true,
                 &[],
             )
         else {
@@ -4387,6 +4947,66 @@ mod tests {
         assert!(application.request_refresh);
         assert!(runtime.index_refresh.pending);
         assert_eq!(runtime.index_refresh.active, Some(refresh.identity));
+    }
+
+    #[test]
+    fn active_refresh_absorbs_delta_safety_without_queuing_second_full_scan() {
+        let config = QuickFoxConfig::default_with_index_dirs(vec!["/tmp".to_owned()]);
+        let service = RuntimeServiceIdentity {
+            epoch: 1,
+            config_revision: 0,
+        };
+        let mut runtime = build_runtime_from_snapshot(config, None);
+        let refresh = begin_runtime_index_refresh(&mut runtime).expect("refresh starts");
+        runtime.index_refresh.active_service = Some(service);
+
+        let application = apply_runtime_indexing_event(
+            &mut runtime,
+            &service,
+            RuntimeIndexingEvent::BaselineRefreshRequired {
+                reason: BaselineRefreshReason::DeltaSafetyLimit,
+            },
+        )
+        .expect("active service delta safety is acknowledged");
+
+        assert!(!application.request_refresh);
+        assert!(!runtime.index_refresh.pending);
+        assert_eq!(runtime.index_refresh.active, Some(refresh.identity));
+    }
+
+    #[test]
+    fn active_refresh_absorbs_delta_commit_that_crosses_safety_limit() {
+        let config = QuickFoxConfig::default_with_index_dirs(vec!["/tmp".to_owned()]);
+        let service = RuntimeServiceIdentity {
+            epoch: 1,
+            config_revision: 0,
+        };
+        let mut runtime = build_runtime_from_snapshot(config, None);
+        begin_runtime_index_refresh(&mut runtime).expect("refresh starts");
+        runtime.index_refresh.active_service = Some(service);
+        let upserts = (0..crate::core::runtime_indexing::MAX_DELTA_ENTRIES)
+            .map(|ordinal| {
+                IndexedEntry::legacy(
+                    format!("/tmp/{ordinal}.md"),
+                    format!("{ordinal}.md"),
+                    IndexedEntryKind::File,
+                )
+            })
+            .collect();
+
+        let application = apply_runtime_indexing_event(
+            &mut runtime,
+            &service,
+            RuntimeIndexingEvent::DeltaCommitted(CommittedIndexDelta {
+                generation: 1,
+                upserts,
+                removals: vec![],
+            }),
+        )
+        .expect("committed safety delta is applied");
+
+        assert!(!application.request_refresh);
+        assert!(!runtime.index_refresh.pending);
     }
 
     #[test]
@@ -4678,6 +5298,171 @@ mod tests {
     }
 
     #[test]
+    fn revision_handoff_fence_excludes_old_service_journal_tail() {
+        let temp = tempfile::tempdir().unwrap();
+        let new_root = temp.path().join("new-root");
+        fs::create_dir_all(&new_root).unwrap();
+        let storage = SqliteStorage::open(temp.path().join("revision-fence.sqlite")).unwrap();
+        let baseline_id = storage.save_completed_index_batch(1, &[]).unwrap();
+        storage
+            .activate_baseline_with_manifest_and_clear_incremental_state(
+                baseline_id,
+                0,
+                &baseline_manifest_from_entries(&[], std::slice::from_ref(&new_root)),
+            )
+            .unwrap();
+        storage
+            .commit_incremental_batch(
+                &CommittedIndexDelta {
+                    generation: 1,
+                    upserts: vec![IndexedEntry::from_path_metadata(
+                        "/old-root/contamination.md",
+                        "/old-root",
+                        IndexedEntryKind::File,
+                    )],
+                    removals: vec![],
+                },
+                &[],
+                &[],
+            )
+            .unwrap();
+        let new_entry = IndexedEntry::from_path_metadata(
+            new_root.join("captured.md"),
+            &new_root,
+            IndexedEntryKind::File,
+        );
+        storage
+            .commit_incremental_batch(
+                &CommittedIndexDelta {
+                    generation: 2,
+                    upserts: vec![new_entry.clone()],
+                    removals: vec![],
+                },
+                &[],
+                &[],
+            )
+            .unwrap();
+
+        let (tail, _) = load_revision_compatible_handoff_snapshot(
+            &storage,
+            0,
+            Some(RevisionCaptureFence::after_old_service_join(1)),
+            std::slice::from_ref(&new_root),
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].generation, 2);
+        assert_eq!(tail[0].upserts, vec![new_entry]);
+    }
+
+    #[test]
+    fn production_config_transition_joins_old_service_before_generation_fence() {
+        let temp = tempfile::Builder::new()
+            .prefix("quickfox-revision-transition-")
+            .tempdir_in(std::env::temp_dir())
+            .unwrap();
+        let old_alias = temp.path().join("old-root");
+        let new_alias = temp.path().join("new-root");
+        fs::create_dir_all(&old_alias).unwrap();
+        fs::create_dir_all(&new_alias).unwrap();
+        let old_root = old_alias.canonicalize().unwrap();
+        let new_root = new_alias.canonicalize().unwrap();
+        let database_path = temp.path().join("transition.sqlite");
+        let storage = SqliteStorage::open(database_path.clone()).unwrap();
+        let baseline_id = storage.save_completed_index_batch(1, &[]).unwrap();
+        storage
+            .activate_baseline_with_manifest_and_clear_incremental_state(
+                baseline_id,
+                0,
+                &baseline_manifest_from_entries(&[], std::slice::from_ref(&old_root)),
+            )
+            .unwrap();
+        let old_config =
+            QuickFoxConfig::default_with_index_dirs(vec![old_root.to_string_lossy().into()]);
+        let old_rules = IndexPathRules::from_plan(&IndexScanPlan {
+            include_roots: vec![old_root.clone()],
+            exclude_dirs: vec![],
+            exclude_patterns: vec![],
+            respect_project_ignores: false,
+            stage: None,
+        })
+        .unwrap();
+        let old_handle = start_runtime_indexing(
+            RuntimeIndexWatcher::watch_roots(vec![old_root.clone()]).unwrap(),
+            TargetedIndexScanner::new(old_rules),
+            Box::new(SqliteStorage::open(database_path.clone()).unwrap()),
+            RuntimeIndexingOptions {
+                roots: vec![old_root.clone()],
+                policy: crate::core::index_update_coordinator::CoordinatorPolicy::production(),
+                initial_generation: 0,
+            },
+            |_| {},
+        )
+        .unwrap();
+        wait_for_revision_capture_registration();
+        let old_event = old_root.join("old-event.md");
+        fs::write(&old_event, "old").unwrap();
+        std::thread::sleep(Duration::from_millis(750));
+        let mut runtime = build_runtime_from_recovery(
+            old_config,
+            recover_layered_index(&SqliteStorage::open(database_path.clone()).unwrap()),
+        );
+        runtime.runtime_indexing = Some(old_handle);
+        runtime.index_refresh.active_service = Some(RuntimeServiceIdentity {
+            epoch: 1,
+            config_revision: 0,
+        });
+        let state = QuickFoxAppState {
+            runtime: Mutex::new(runtime),
+            index_refresh_fence: Mutex::new(()),
+            window_state: Mutex::new(LauncherWindowState::default()),
+            global_hotkey_status: Mutex::new(pending_global_hotkey_status()),
+        };
+        let new_config =
+            QuickFoxConfig::default_with_index_dirs(vec![new_root.to_string_lossy().into()]);
+
+        transition_runtime_config_revision(
+            &state,
+            new_config,
+            RuntimeIndexWatcher::watch_roots(vec![new_root.clone()]).unwrap(),
+            &storage,
+        )
+        .unwrap();
+
+        let fence_generation = storage.highest_committed_generation().unwrap();
+        assert_eq!(fence_generation, 1);
+        assert_eq!(
+            compatible_tail_start_generation(
+                0,
+                state
+                    .runtime
+                    .lock()
+                    .unwrap()
+                    .index_refresh
+                    .revision_capture_fence
+            ),
+            1
+        );
+        fs::write(old_root.join("after-fence.md"), "must not commit").unwrap();
+        std::thread::sleep(Duration::from_millis(750));
+        assert_eq!(storage.highest_committed_generation().unwrap(), 1);
+        assert_eq!(
+            state
+                .runtime
+                .lock()
+                .unwrap()
+                .index_refresh
+                .standby_watcher
+                .as_ref()
+                .unwrap()
+                .watched_roots(),
+            std::slice::from_ref(&new_root)
+        );
+    }
+
+    #[test]
     fn standby_capture_is_live_before_full_scan_handoff() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("new-configured-root");
@@ -4849,6 +5634,117 @@ mod tests {
     }
 
     #[test]
+    fn production_successor_persists_event_before_activation_and_crash_recovery() {
+        let temp = tempfile::Builder::new()
+            .prefix("quickfox-successor-")
+            .tempdir_in(std::env::temp_dir())
+            .unwrap();
+        let root_alias = temp.path().join("root");
+        fs::create_dir_all(&root_alias).unwrap();
+        let root = root_alias.canonicalize().unwrap();
+        let database_path = temp.path().join("successor.sqlite");
+        let storage = SqliteStorage::open(database_path.clone()).unwrap();
+        let baseline_id = storage.save_completed_index_batch(1, &[]).unwrap();
+        storage
+            .activate_baseline_with_manifest_and_clear_incremental_state(
+                baseline_id,
+                0,
+                &baseline_manifest_from_entries(&[], std::slice::from_ref(&root)),
+            )
+            .unwrap();
+        let config = QuickFoxConfig::default_with_index_dirs(vec![root.to_string_lossy().into()]);
+        let mut runtime =
+            build_runtime_from_recovery(config.clone(), recover_layered_index(&storage));
+        let refresh = begin_runtime_index_refresh(&mut runtime).unwrap();
+        let state = QuickFoxAppState {
+            runtime: Mutex::new(runtime),
+            index_refresh_fence: Mutex::new(()),
+            window_state: Mutex::new(LauncherWindowState::default()),
+            global_hotkey_status: Mutex::new(pending_global_hotkey_status()),
+        };
+        let options = build_scan_options(&config);
+        let rules = IndexPathRules::from_plan(&IndexScanPlan {
+            include_roots: vec![root.clone()],
+            exclude_dirs: options.exclude_dirs,
+            exclude_patterns: options.exclude_patterns,
+            respect_project_ignores: options.respect_project_ignores,
+            stage: None,
+        })
+        .unwrap();
+        install_durable_refresh_successor(
+            &state,
+            &refresh.identity,
+            RuntimeIndexWatcher::watch_roots(vec![root.clone()]).unwrap(),
+            rules,
+            vec![root.clone()],
+            SqliteStorage::open(database_path.clone()).unwrap(),
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            state.runtime.lock().unwrap().incremental_status.state,
+            IncrementalState::Preparing
+        );
+        std::thread::sleep(Duration::from_millis(500));
+        let arrived_before_activation = root.join("before-activation.md");
+        fs::write(&arrived_before_activation, "durable").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(6);
+        while std::time::Instant::now() < deadline
+            && storage.highest_committed_generation().unwrap() == 0
+        {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(storage.highest_committed_generation().unwrap(), 1);
+
+        let tail =
+            finalize_durable_refresh_successor_with_storage(&state, &refresh.identity, 0, &storage)
+                .unwrap();
+        assert_eq!(tail.len(), 1);
+        let standby_inbox = state
+            .runtime
+            .lock()
+            .unwrap()
+            .index_refresh
+            .standby_watcher
+            .as_mut()
+            .unwrap()
+            .take_inbox()
+            .unwrap();
+        let after_successor_handoff = root.join("after-successor-handoff.md");
+        fs::write(&after_successor_handoff, "captured by standby").unwrap();
+        let observed = standby_inbox
+            .recv_timeout(Duration::from_secs(3))
+            .map(|event| match event {
+                IndexWatchEvent::Create(path)
+                | IndexWatchEvent::Write(path)
+                | IndexWatchEvent::Remove(path) => path == after_successor_handoff,
+                IndexWatchEvent::Rename { from, to } => {
+                    from == after_successor_handoff || to == after_successor_handoff
+                }
+            })
+            .unwrap_or(false);
+        assert!(
+            observed,
+            "standby watcher must cover final apply/restart gap"
+        );
+        let recovered = recover_layered_index(&SqliteStorage::open(database_path).unwrap());
+        assert_eq!(recovered.index.entry_count(), 1);
+        assert_eq!(
+            recovered
+                .index
+                .search(
+                    &crate::core::search::QueryRequest::new(
+                        "before-activation",
+                        crate::core::search::SearchMode::Normal,
+                    ),
+                    10,
+                )
+                .len(),
+            1
+        );
+    }
+
+    #[test]
     fn runtime_restart_failures_share_degraded_once_per_revision_recovery_funnel() {
         for failure in [
             RuntimeRestartFailureKind::Watcher,
@@ -4911,6 +5807,44 @@ mod tests {
     }
 
     #[test]
+    fn injected_refresh_spawn_failure_clears_standby_and_queues_one_retry() {
+        struct FailingSpawner;
+        impl RefreshWorkerSpawner for FailingSpawner {
+            fn spawn(&self, _task: Box<dyn FnOnce() + Send>) -> Result<(), String> {
+                Err("injected spawn failure".to_owned())
+            }
+        }
+        let config = QuickFoxConfig::default_with_index_dirs(vec!["/tmp".to_owned()]);
+        let mut runtime = build_runtime_from_snapshot(config, None);
+        let refresh = begin_runtime_index_refresh(&mut runtime).unwrap();
+        runtime.index_refresh.standby_watcher =
+            Some(RuntimeIndexWatcher::watch_roots(vec![PathBuf::from("/tmp")]).unwrap());
+        let state = QuickFoxAppState {
+            runtime: Mutex::new(runtime),
+            index_refresh_fence: Mutex::new(()),
+            window_state: Mutex::new(LauncherWindowState::default()),
+            global_hotkey_status: Mutex::new(pending_global_hotkey_status()),
+        };
+
+        let failure = match spawn_refresh_worker_for_identity(
+            &state,
+            &refresh.identity,
+            &FailingSpawner,
+            Box::new(|| {}),
+        ) {
+            Ok(()) => panic!("injected spawn must fail"),
+            Err(failure) => failure,
+        };
+
+        assert!(failure.retry);
+        assert_eq!(failure.message, "injected spawn failure");
+        let runtime = state.runtime.lock().unwrap();
+        assert!(runtime.index_refresh.standby_watcher.is_none());
+        assert_eq!(runtime.incremental_status.state, IncrementalState::Degraded);
+        assert!(!runtime.index_refresh.pending);
+    }
+
+    #[test]
     fn refresh_baseline_generation_absorbs_a_committed_but_queued_runtime_publish() {
         let queued_delta = CommittedIndexDelta {
             generation: 1,
@@ -4969,6 +5903,123 @@ mod tests {
         assert_eq!(runtime.index.generation(), 1);
         assert_eq!(runtime.index.entries().len(), 1);
         assert_eq!(runtime.index.entries()[0].name, "new.md");
+    }
+
+    #[test]
+    fn production_baseline_apply_replaces_older_scan_with_authoritative_tail() {
+        let config = QuickFoxConfig::default_with_index_dirs(vec!["/tmp".to_owned()]);
+        let mut runtime = build_runtime_from_snapshot(config, None);
+        runtime.index.replace_baseline(
+            vec![IndexedEntry::legacy(
+                "/tmp/old.md",
+                "old.md",
+                IndexedEntryKind::File,
+            )],
+            3,
+        );
+        runtime.index.apply_delta(CommittedIndexDelta {
+            generation: 4,
+            upserts: vec![IndexedEntry::legacy(
+                "/tmp/stale-overlay.md",
+                "stale-overlay.md",
+                IndexedEntryKind::File,
+            )],
+            removals: vec![],
+        });
+        runtime.index.apply_delta(CommittedIndexDelta {
+            generation: 5,
+            upserts: vec![],
+            removals: vec![],
+        });
+        let refresh = begin_runtime_index_refresh(&mut runtime).unwrap();
+        let state = QuickFoxAppState {
+            runtime: Mutex::new(runtime),
+            index_refresh_fence: Mutex::new(()),
+            window_state: Mutex::new(LauncherWindowState::default()),
+            global_hotkey_status: Mutex::new(pending_global_hotkey_status()),
+        };
+        let tail = vec![
+            CommittedIndexDelta {
+                generation: 4,
+                upserts: vec![IndexedEntry::legacy(
+                    "/tmp/tail.md",
+                    "tail.md",
+                    IndexedEntryKind::File,
+                )],
+                removals: vec![],
+            },
+            CommittedIndexDelta {
+                generation: 5,
+                upserts: vec![],
+                removals: vec![],
+            },
+        ];
+
+        let outcome = apply_baseline_persistence_outcome_for_identity(
+            &state,
+            &refresh.identity,
+            3,
+            BaselinePersistenceOutcome::Completed(IndexRefreshPayload {
+                entries: vec![IndexedEntry::legacy(
+                    "/tmp/new.md",
+                    "new.md",
+                    IndexedEntryKind::File,
+                )],
+                summary: IndexReport::default(),
+            }),
+            10,
+            true,
+            &tail,
+        );
+
+        assert!(matches!(
+            outcome,
+            BaselinePersistenceApplicationOutcome::Applied(Some(BaselinePersistenceApplication {
+                completed: true,
+                ..
+            }))
+        ));
+        let runtime = state.runtime.lock().unwrap();
+        assert_eq!(runtime.index.generation(), 5);
+        assert_eq!(
+            runtime
+                .index
+                .search(
+                    &crate::core::search::QueryRequest::new(
+                        "new",
+                        crate::core::search::SearchMode::Normal
+                    ),
+                    10
+                )
+                .len(),
+            1
+        );
+        assert_eq!(
+            runtime
+                .index
+                .search(
+                    &crate::core::search::QueryRequest::new(
+                        "tail",
+                        crate::core::search::SearchMode::Normal
+                    ),
+                    10
+                )
+                .len(),
+            1
+        );
+        assert_eq!(
+            runtime
+                .index
+                .search(
+                    &crate::core::search::QueryRequest::new(
+                        "stale-overlay",
+                        crate::core::search::SearchMode::Normal
+                    ),
+                    10
+                )
+                .len(),
+            0
+        );
     }
 
     #[test]
@@ -5044,6 +6095,46 @@ mod tests {
             runtime.index.entries()[0].content_index_state,
             ContentIndexState::NotIndexed
         );
+    }
+
+    #[test]
+    fn production_baseline_apply_stays_refreshing_until_content_install() {
+        let config = QuickFoxConfig::default_with_index_dirs(vec!["/tmp".to_owned()]);
+        let mut runtime = build_runtime_from_snapshot(config, None);
+        let refresh = begin_runtime_index_refresh(&mut runtime).unwrap();
+        let state = QuickFoxAppState {
+            runtime: Mutex::new(runtime),
+            index_refresh_fence: Mutex::new(()),
+            window_state: Mutex::new(LauncherWindowState::default()),
+            global_hotkey_status: Mutex::new(pending_global_hotkey_status()),
+        };
+
+        let outcome = apply_baseline_persistence_outcome_for_identity(
+            &state,
+            &refresh.identity,
+            0,
+            BaselinePersistenceOutcome::Completed(IndexRefreshPayload {
+                entries: vec![IndexedEntry::legacy(
+                    "/tmp/name.md",
+                    "name.md",
+                    IndexedEntryKind::File,
+                )],
+                summary: IndexReport::default(),
+            }),
+            10,
+            false,
+            &[],
+        );
+
+        let BaselinePersistenceApplicationOutcome::Applied(Some(application)) = outcome else {
+            panic!("baseline applies");
+        };
+        assert!(application.completed);
+        assert_eq!(
+            application.status.kind,
+            crate::core::index::IndexStatusKind::Building
+        );
+        assert!(state.runtime.lock().unwrap().index_refresh.active.is_some());
     }
 
     #[test]

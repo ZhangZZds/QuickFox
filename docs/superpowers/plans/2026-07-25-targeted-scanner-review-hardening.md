@@ -19,6 +19,7 @@
 ### Task 1: 修正 path key 与 configured root 选择
 
 **Files:**
+
 - Modify: `src-tauri/src/core/index_entry.rs`
 - Modify: `src-tauri/src/core/index_scanner.rs`
 - Test: `src-tauri/src/core/targeted_index_scanner.rs`
@@ -51,6 +52,7 @@ Expected: native/Windows mode、大小写和段边界测试全部通过。
 ### Task 2: 可取消 visitor 目录枚举
 
 **Files:**
+
 - Modify/Test: `src-tauri/src/core/targeted_index_scanner.rs`
 
 - [x] **Step 1: 写失败测试**
@@ -90,6 +92,7 @@ Expected: cancellation 与 calibration/direct diff 测试通过。
 ### Task 3: 线性折叠 missing subtree
 
 **Files:**
+
 - Modify/Test: `src-tauri/src/core/targeted_index_scanner.rs`
 
 - [x] **Step 1: 写失败测试**
@@ -118,6 +121,7 @@ Expected: probe 数线性有界且折叠语义不变。
 ### Task 4: batch ignore cache 与单文件直接扫描
 
 **Files:**
+
 - Modify: `src-tauri/src/core/index_scanner.rs`
 - Modify/Test: `src-tauri/src/core/targeted_index_scanner.rs`
 
@@ -148,6 +152,7 @@ Expected: IO 随 depth 有界，ignore priority/negation/git exclude/global/canc
 ### Task 5: 完整验证与提交
 
 **Files:**
+
 - Verify: `docs/superpowers/plans/2026-07-25-targeted-scanner-review-hardening.md`
 - Verify: `src-tauri/src/core/index_entry.rs`
 - Verify: `src-tauri/src/core/index_scanner.rs`

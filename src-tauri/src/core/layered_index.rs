@@ -262,6 +262,37 @@ impl LayeredSearchIndex {
         if generation < self.generation {
             return;
         }
+        self.install_baseline(baseline, generation);
+    }
+
+    pub fn replace_baseline_with_authoritative_tail(
+        &mut self,
+        baseline: SearchIndex,
+        baseline_generation: u64,
+        tail: &[CommittedIndexDelta],
+    ) -> bool {
+        let mut expected = baseline_generation.saturating_add(1);
+        for delta in tail {
+            if delta.generation != expected {
+                return false;
+            }
+            expected = expected.saturating_add(1);
+        }
+        let authoritative_generation = tail
+            .last()
+            .map(|delta| delta.generation)
+            .unwrap_or(baseline_generation);
+        if authoritative_generation < self.generation {
+            return false;
+        }
+        self.install_baseline(baseline, baseline_generation);
+        for delta in tail {
+            self.apply_delta(delta.clone());
+        }
+        true
+    }
+
+    fn install_baseline(&mut self, baseline: SearchIndex, generation: u64) {
         self.baseline_by_path = baseline
             .entries()
             .iter()
@@ -837,6 +868,53 @@ mod tests {
         assert_eq!(index.delta_entry_count(), 0);
         assert_eq!(index.entry_count(), 1);
         assert_eq!(index.search(&request("compacted"), 20).len(), 1);
+    }
+
+    #[test]
+    fn authoritative_tail_can_replace_a_baseline_older_than_current_overlay() {
+        let root = PathBuf::from("/tmp/root");
+        let make_delta = |generation, upserts| CommittedIndexDelta {
+            generation,
+            upserts,
+            removals: vec![],
+        };
+        let mut index = LayeredSearchIndex::from_baseline(vec![entry(
+            root.join("old.md"),
+            &root,
+            IndexedEntryKind::File,
+        )]);
+        index.apply_delta(make_delta(
+            4,
+            vec![entry(
+                root.join("old-overlay.md"),
+                &root,
+                IndexedEntryKind::File,
+            )],
+        ));
+        index.apply_delta(make_delta(5, vec![]));
+
+        let installed = index.replace_baseline_with_authoritative_tail(
+            SearchIndex::from_entries(vec![entry(
+                root.join("new.md"),
+                &root,
+                IndexedEntryKind::File,
+            )]),
+            3,
+            &[
+                make_delta(
+                    4,
+                    vec![entry(root.join("tail.md"), &root, IndexedEntryKind::File)],
+                ),
+                make_delta(5, vec![]),
+            ],
+        );
+
+        assert!(installed);
+        assert_eq!(index.generation(), 5);
+        assert_eq!(index.entry_count(), 2);
+        assert_eq!(index.search(&request("old"), 10).len(), 0);
+        assert_eq!(index.search(&request("new"), 10).len(), 1);
+        assert_eq!(index.search(&request("tail"), 10).len(), 1);
     }
 
     #[test]

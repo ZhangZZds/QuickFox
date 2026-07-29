@@ -13,6 +13,7 @@
 ### Task 1: Content lookup lifecycle
 
 **Files:**
+
 - Modify: `src-tauri/src/core/index.rs`
 - Test: `src-tauri/src/core/index.rs`
 
@@ -45,6 +46,7 @@ Expected: PASS。
 ### Task 2: Delta-sized layered content visibility snapshot
 
 **Files:**
+
 - Modify: `src-tauri/src/core/index.rs`
 - Modify: `src-tauri/src/core/layered_index.rs`
 - Test: `src-tauri/src/core/layered_index.rs`
@@ -83,6 +85,7 @@ Expected: PASS，且现有 >10k content-only/mixed 回归继续通过。
 ### Task 3: Verification and commit
 
 **Files:**
+
 - Modify: `openspec/changes/complete-runtime-incremental-indexing/design.md`
 - Do not modify: `openspec/changes/complete-runtime-incremental-indexing/tasks.md`
 
