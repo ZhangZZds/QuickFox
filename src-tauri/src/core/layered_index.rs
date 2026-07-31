@@ -182,13 +182,22 @@ pub struct LayeredSearchIndex {
 
 impl Default for LayeredSearchIndex {
     fn default() -> Self {
-        Self::from_baseline(Vec::new())
+        Self::from_search_index(SearchIndex::default())
     }
 }
 
 impl LayeredSearchIndex {
+    /// Panicking convenience for tests and known-bounded fixtures.
+    /// Production baseline recovery and refresh must use [`Self::try_from_baseline`].
     pub fn from_baseline(entries: Vec<IndexedEntry>) -> Self {
-        Self::from_search_index(SearchIndex::from_entries(entries))
+        Self::try_from_baseline(entries)
+            .expect("known-size layered baseline exceeded compact u32 limits")
+    }
+
+    pub fn try_from_baseline(
+        entries: Vec<IndexedEntry>,
+    ) -> Result<Self, crate::core::compact_index::CompactIndexBuildError> {
+        SearchIndex::try_from_entries(entries).map(Self::from_search_index)
     }
 
     pub fn from_search_index(baseline: SearchIndex) -> Self {
@@ -310,8 +319,39 @@ impl LayeredSearchIndex {
         true
     }
 
+    /// Panicking convenience for tests and known-bounded fixtures.
+    /// Production baseline installation must use [`Self::try_replace_baseline`].
     pub fn replace_baseline(&mut self, entries: Vec<IndexedEntry>, generation: u64) {
-        self.replace_baseline_search_index(SearchIndex::from_entries(entries), generation);
+        self.try_replace_baseline(entries, generation)
+            .expect("known-size layered baseline exceeded compact u32 limits");
+    }
+
+    pub fn try_replace_baseline(
+        &mut self,
+        entries: Vec<IndexedEntry>,
+        generation: u64,
+    ) -> Result<(), crate::core::compact_index::CompactIndexBuildError> {
+        if generation < self.generation {
+            return Ok(());
+        }
+        let baseline = SearchIndex::try_from_entries(entries)?;
+        self.replace_baseline_search_index(baseline, generation);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_replace_baseline_with_arena_limit(
+        &mut self,
+        entries: Vec<IndexedEntry>,
+        generation: u64,
+        arena_limit: usize,
+    ) -> Result<(), crate::core::compact_index::CompactIndexBuildError> {
+        if generation < self.generation {
+            return Ok(());
+        }
+        let baseline = SearchIndex::try_from_entries_with_arena_limit(entries, arena_limit)?;
+        self.replace_baseline_search_index(baseline, generation);
+        Ok(())
     }
 
     pub fn replace_baseline_search_index(&mut self, baseline: SearchIndex, generation: u64) {
@@ -1092,6 +1132,32 @@ mod tests {
         assert_eq!(index.delta_entry_count(), 0);
         assert_eq!(index.entry_count(), 1);
         assert_eq!(index.search(&request("compacted"), 20).len(), 1);
+    }
+
+    #[test]
+    fn fallible_baseline_replace_preserves_last_known_good_on_arena_error() {
+        let old = entry(
+            PathBuf::from("/tmp/root/old.md"),
+            Path::new("/tmp/root"),
+            IndexedEntryKind::File,
+        );
+        let replacement = entry(
+            PathBuf::from("/tmp/root/replacement.md"),
+            Path::new("/tmp/root"),
+            IndexedEntryKind::File,
+        );
+        let mut index = LayeredSearchIndex::from_baseline(vec![old]);
+
+        let error = index
+            .try_replace_baseline_with_arena_limit(vec![replacement], 7, 8)
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            crate::core::compact_index::CompactIndexBuildError::ArenaTooLarge { .. }
+        ));
+        assert_eq!(index.generation(), 0);
+        assert_eq!(index.materialized_entries()[0].path, "/tmp/root/old.md");
     }
 
     #[test]

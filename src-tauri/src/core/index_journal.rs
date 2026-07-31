@@ -241,13 +241,28 @@ pub fn replay_deltas(
 }
 
 pub fn recover_layered_index(repository: &(impl IndexJournalRepository + ?Sized)) -> IndexRecovery {
+    recover_layered_index_with_options(repository, None)
+}
+
+#[cfg(test)]
+fn recover_layered_index_with_arena_limit(
+    repository: &(impl IndexJournalRepository + ?Sized),
+    arena_limit: usize,
+) -> IndexRecovery {
+    recover_layered_index_with_options(repository, Some(arena_limit))
+}
+
+fn recover_layered_index_with_options(
+    repository: &(impl IndexJournalRepository + ?Sized),
+    arena_limit: Option<usize>,
+) -> IndexRecovery {
     match repository.incremental_schema_is_ready() {
         Ok(true) => {}
-        Ok(false) | Err(_) => return latest_baseline_fallback(repository),
+        Ok(false) | Err(_) => return latest_baseline_fallback(repository, arena_limit),
     }
     let baseline = match repository.incremental_recovery_baseline() {
         Ok(baseline) => baseline,
-        Err(_) => return latest_baseline_fallback(repository),
+        Err(_) => return latest_baseline_fallback(repository, arena_limit),
     };
     if !baseline.available {
         return unavailable_recovery();
@@ -269,16 +284,27 @@ pub fn recover_layered_index(repository: &(impl IndexJournalRepository + ?Sized)
             true,
             IndexDegradationCode::JournalReplayFailed,
             IndexFallbackReason::FullRefreshFallback,
+            arena_limit,
         );
     }
     let manifest_roots = match repository.directory_manifest_roots() {
         Ok(roots) => roots,
         Err(_) => {
-            return failed_manifest_recovery(baseline, baseline_generation, baseline_entry_count);
+            return failed_manifest_recovery(
+                baseline,
+                baseline_generation,
+                baseline_entry_count,
+                arena_limit,
+            );
         }
     };
     if repository.validate_directory_manifest().is_err() {
-        return failed_manifest_recovery(baseline, baseline_generation, baseline_entry_count);
+        return failed_manifest_recovery(
+            baseline,
+            baseline_generation,
+            baseline_entry_count,
+            arena_limit,
+        );
     }
     let manifest_root_keys: std::collections::BTreeSet<String> =
         manifest_roots.iter().map(normalize_path_key).collect();
@@ -291,17 +317,33 @@ pub fn recover_layered_index(repository: &(impl IndexJournalRepository + ?Sized)
     let deltas = match repository.committed_index_deltas_after(baseline_generation) {
         Ok(deltas) => deltas,
         Err(_) => {
-            return failed_recovery(baseline, baseline_generation, baseline_entry_count, true);
+            return failed_recovery(
+                baseline,
+                baseline_generation,
+                baseline_entry_count,
+                true,
+                arena_limit,
+            );
         }
     };
     let deltas = match ordered_unique_deltas(&deltas) {
         Ok(deltas) => deltas,
         Err(_) => {
-            return failed_recovery(baseline, baseline_generation, baseline_entry_count, true);
+            return failed_recovery(
+                baseline,
+                baseline_generation,
+                baseline_entry_count,
+                true,
+                arena_limit,
+            );
         }
     };
     let mut index = LayeredSearchIndex::default();
-    index.replace_baseline(baseline, baseline_generation);
+    if try_replace_recovery_baseline(&mut index, baseline, baseline_generation, arena_limit)
+        .is_err()
+    {
+        return index_build_failure_recovery(baseline_entry_count, true);
+    }
     for delta in deltas {
         index.apply_delta(delta);
     }
@@ -317,10 +359,13 @@ pub fn recover_layered_index(repository: &(impl IndexJournalRepository + ?Sized)
     }
 }
 
-fn latest_baseline_fallback(repository: &(impl IndexJournalRepository + ?Sized)) -> IndexRecovery {
+fn latest_baseline_fallback(
+    repository: &(impl IndexJournalRepository + ?Sized),
+    arena_limit: Option<usize>,
+) -> IndexRecovery {
     let baseline = match repository.latest_completed_recovery_baseline() {
         Ok(baseline) => baseline,
-        Err(_) => return failed_recovery(Vec::new(), 0, 0, false),
+        Err(_) => return failed_recovery(Vec::new(), 0, 0, false, arena_limit),
     };
     let baseline_entry_count = baseline.entries.len();
     failed_recovery(
@@ -328,6 +373,7 @@ fn latest_baseline_fallback(repository: &(impl IndexJournalRepository + ?Sized))
         baseline.generation,
         baseline_entry_count,
         baseline.available,
+        arena_limit,
     )
 }
 
@@ -349,6 +395,7 @@ fn failed_recovery(
     baseline_generation: u64,
     baseline_entry_count: usize,
     baseline_available: bool,
+    arena_limit: Option<usize>,
 ) -> IndexRecovery {
     baseline_only_recovery(
         baseline,
@@ -357,6 +404,7 @@ fn failed_recovery(
         baseline_available,
         IndexDegradationCode::JournalReplayFailed,
         IndexFallbackReason::JournalRecoveryFailed,
+        arena_limit,
     )
 }
 
@@ -364,6 +412,7 @@ fn failed_manifest_recovery(
     baseline: Vec<IndexedEntry>,
     baseline_generation: u64,
     baseline_entry_count: usize,
+    arena_limit: Option<usize>,
 ) -> IndexRecovery {
     baseline_only_recovery(
         baseline,
@@ -372,6 +421,7 @@ fn failed_manifest_recovery(
         true,
         IndexDegradationCode::CalibrationFailed,
         IndexFallbackReason::FullRefreshFallback,
+        arena_limit,
     )
 }
 
@@ -382,9 +432,14 @@ fn baseline_only_recovery(
     baseline_available: bool,
     degradation: IndexDegradationCode,
     fallback_reason: IndexFallbackReason,
+    arena_limit: Option<usize>,
 ) -> IndexRecovery {
     let mut index = LayeredSearchIndex::default();
-    index.replace_baseline(baseline, baseline_generation);
+    if try_replace_recovery_baseline(&mut index, baseline, baseline_generation, arena_limit)
+        .is_err()
+    {
+        return index_build_failure_recovery(baseline_entry_count, baseline_available);
+    }
     IndexRecovery {
         index,
         degradation: Some(degradation),
@@ -393,6 +448,36 @@ fn baseline_only_recovery(
         baseline_available,
         manifest_ready: false,
         needs_manifest_rebuild: baseline_available,
+        manifest_roots: std::collections::BTreeSet::new(),
+    }
+}
+
+fn try_replace_recovery_baseline(
+    index: &mut LayeredSearchIndex,
+    baseline: Vec<IndexedEntry>,
+    generation: u64,
+    arena_limit: Option<usize>,
+) -> Result<(), crate::core::compact_index::CompactIndexBuildError> {
+    #[cfg(test)]
+    if let Some(arena_limit) = arena_limit {
+        return index.try_replace_baseline_with_arena_limit(baseline, generation, arena_limit);
+    }
+    let _ = arena_limit;
+    index.try_replace_baseline(baseline, generation)
+}
+
+fn index_build_failure_recovery(
+    baseline_entry_count: usize,
+    needs_manifest_rebuild: bool,
+) -> IndexRecovery {
+    IndexRecovery {
+        index: LayeredSearchIndex::default(),
+        degradation: Some(IndexDegradationCode::JournalReplayFailed),
+        fallback_reason: Some(IndexFallbackReason::JournalRecoveryFailed),
+        baseline_entry_count,
+        baseline_available: false,
+        manifest_ready: false,
+        needs_manifest_rebuild,
         manifest_roots: std::collections::BTreeSet::new(),
     }
 }
@@ -582,6 +667,26 @@ mod tests {
         assert_eq!(repository.latest_loads.get(), 0);
         assert_eq!(search_titles(&recovery.index, "active"), vec!["active.md"]);
         assert!(search_titles(&recovery.index, "latest").is_empty());
+    }
+
+    #[test]
+    fn arena_failure_degrades_journal_recovery_without_panicking() {
+        let repository = CountingRecoveryRepository::new();
+
+        let recovery = recover_layered_index_with_arena_limit(&repository, 8);
+
+        assert_eq!(recovery.index.entry_count(), 0);
+        assert!(!recovery.baseline_available());
+        assert_eq!(
+            recovery.degradation_code(),
+            Some(IndexDegradationCode::JournalReplayFailed)
+        );
+        assert_eq!(
+            recovery.fallback_reason(),
+            Some(IndexFallbackReason::JournalRecoveryFailed)
+        );
+        assert_eq!(recovery.baseline_entry_count(), 1);
+        assert!(recovery.needs_manifest_rebuild());
     }
 
     #[test]

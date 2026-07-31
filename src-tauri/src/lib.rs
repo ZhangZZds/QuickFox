@@ -5324,9 +5324,20 @@ fn apply_index_refresh_progress(
     }
     if runtime.index.entry_count() == 0 {
         let index_generation = runtime.index.generation();
-        runtime
+        if let Err(error) = runtime
             .index
-            .replace_baseline(payload.entries, index_generation);
+            .try_replace_baseline(payload.entries, index_generation)
+        {
+            runtime.index_lifecycle.fail_refresh(
+                generation,
+                format!("compact index arena build failed: {error:?}"),
+            );
+            runtime.manifest_ready = false;
+            runtime.incremental_status.state = IncrementalState::Degraded;
+            runtime.incremental_status.degradation_code =
+                Some(IndexDegradationCode::FullRefreshFallback);
+            return Some(runtime.index_status());
+        }
         runtime.index_refresh.search_view_epoch =
             runtime.index_refresh.search_view_epoch.saturating_add(1);
     }
