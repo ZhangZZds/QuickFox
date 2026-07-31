@@ -1,6 +1,6 @@
 //! Baseline, delta overlay, and tombstone composition for runtime file search.
 
-use crate::core::content_index::ContentPathFilter;
+use crate::core::content_index::{ContentIndex, ContentPathFilter};
 use crate::core::index::{FileSearchIndex, IndexedEntry, IndexedEntryKind, SearchIndex};
 use crate::core::index_entry::{normalize_path_key, normalize_path_text_key};
 use crate::core::search::{QueryRequest, SearchResult};
@@ -126,6 +126,15 @@ impl ContentVisibilitySnapshot {
         Arc::new(move |path: &str| snapshot.is_visible(path))
     }
 
+    fn overlay_path_filter(snapshot: &Arc<Self>) -> ContentPathFilter {
+        let snapshot = Arc::clone(snapshot);
+        Arc::new(move |path: &str| {
+            snapshot
+                .overlay_paths
+                .contains(&normalize_path_text_key(path))
+        })
+    }
+
     fn is_visible(&self, path: &str) -> bool {
         let key = normalize_path_text_key(path);
         if self.overlay_paths.contains(&key) || self.exact_tombstones.contains(&key) {
@@ -155,6 +164,7 @@ pub struct LayeredSearchIndex {
     baseline: SearchIndex,
     baseline_by_path: BTreeMap<String, IndexedEntryKind>,
     overlay_entries: BTreeMap<String, IndexedEntry>,
+    overlay_generations: BTreeMap<String, u64>,
     overlay: SearchIndex,
     tombstones: PathTombstones,
     content_visibility: Arc<ContentVisibilitySnapshot>,
@@ -190,6 +200,7 @@ impl LayeredSearchIndex {
             baseline,
             baseline_by_path,
             overlay_entries: BTreeMap::new(),
+            overlay_generations: BTreeMap::new(),
             overlay: SearchIndex::default(),
             tombstones: PathTombstones::default(),
             content_visibility: Arc::new(ContentVisibilitySnapshot::default()),
@@ -209,6 +220,7 @@ impl LayeredSearchIndex {
             return;
         }
 
+        let generation = delta.generation;
         for removal in delta.removals {
             let key = normalize_path_key(removal);
             let is_directory = self.path_is_directory(&key);
@@ -216,9 +228,12 @@ impl LayeredSearchIndex {
             if is_directory {
                 self.overlay_entries
                     .retain(|overlay_key, _| !path_matches(&key, overlay_key));
+                self.overlay_generations
+                    .retain(|overlay_key, _| !path_matches(&key, overlay_key));
                 self.tombstones.insert_directory(key.clone());
             } else {
                 self.overlay_entries.remove(&key);
+                self.overlay_generations.remove(&key);
                 self.tombstones.insert_exact(key.clone());
             }
             let visible_after = self.count_visible_scope(&key, is_directory);
@@ -233,10 +248,13 @@ impl LayeredSearchIndex {
             if replaces_directory {
                 self.overlay_entries
                     .retain(|overlay_key, _| !path_is_descendant(&key, overlay_key));
+                self.overlay_generations
+                    .retain(|overlay_key, _| !path_is_descendant(&key, overlay_key));
                 self.tombstones.insert_directory(key.clone());
             }
             self.tombstones.remove_exact(&key);
             self.overlay_entries.insert(key.clone(), entry);
+            self.overlay_generations.insert(key.clone(), generation);
             let visible_after = self.count_visible_scope(&key, replaces_directory);
             self.adjust_visible_count(visible_before, visible_after);
         }
@@ -251,7 +269,43 @@ impl LayeredSearchIndex {
             self.overlay_compact_build_ids
                 .push(self.overlay.compact_build_id());
         }
-        self.generation = delta.generation;
+        self.generation = generation;
+    }
+
+    pub(crate) fn content_index_for_delta(&self) -> Option<ContentIndex> {
+        self.baseline.content_index_clone()
+    }
+
+    pub(crate) fn publish_content_delta(
+        &mut self,
+        generation: u64,
+        updated_entries: &[IndexedEntry],
+        content_index: ContentIndex,
+    ) -> bool {
+        if generation > self.generation {
+            return false;
+        }
+        let mut changed = false;
+        for updated in updated_entries {
+            let key = normalize_path_text_key(&updated.path);
+            let Some(current) = self.overlay_entries.get_mut(&key) else {
+                continue;
+            };
+            if self.overlay_generations.get(&key) != Some(&generation)
+                || !same_content_target(current, updated)
+                || current.content_index_state == updated.content_index_state
+            {
+                continue;
+            }
+            current.content_index_state = updated.content_index_state.clone();
+            changed = true;
+        }
+        if !changed {
+            return false;
+        }
+        self.overlay = SearchIndex::from_entries(self.overlay_entries.values().cloned().collect());
+        self.overlay.attach_content_index(content_index);
+        true
     }
 
     pub fn replace_baseline(&mut self, entries: Vec<IndexedEntry>, generation: u64) {
@@ -301,6 +355,7 @@ impl LayeredSearchIndex {
         self.visible_entry_count = self.baseline_by_path.len();
         self.baseline = baseline;
         self.overlay_entries.clear();
+        self.overlay_generations.clear();
         self.overlay = SearchIndex::default();
         self.tombstones.clear();
         self.content_visibility = Arc::new(ContentVisibilitySnapshot::default());
@@ -351,7 +406,12 @@ impl LayeredSearchIndex {
         let baseline_has_content_feedback = baseline_results
             .iter()
             .any(|result| result.id == "feedback:content-index-unavailable");
-        let overlay_results = self.overlay.search_with_limit(query, candidate_budget);
+        let overlay_results = self.overlay.search_with_limit_visible_and_content_filter(
+            query,
+            candidate_budget,
+            ContentVisibilitySnapshot::overlay_path_filter(&self.content_visibility),
+            |_| true,
+        );
         let max_results = candidate_budget.saturating_mul(2);
         let mut seen_ids = HashSet::with_capacity(max_results.min(1024));
         let mut merged = Vec::with_capacity(max_results.min(1024));
@@ -395,6 +455,16 @@ impl LayeredSearchIndex {
             .saturating_add(std::mem::size_of::<BTreeMap<String, IndexedEntry>>());
         let overlay_index = self.overlay.memory_estimate();
         overlay_bytes
+            .saturating_add(
+                self.overlay_generations
+                    .keys()
+                    .map(|path| {
+                        path.capacity()
+                            .saturating_add(std::mem::size_of::<(String, u64)>())
+                    })
+                    .sum::<usize>()
+                    .saturating_add(std::mem::size_of::<BTreeMap<String, u64>>()),
+            )
             .saturating_add(overlay_index.entry_struct_bytes)
             .saturating_add(overlay_index.entry_string_bytes)
             .saturating_add(overlay_index.cached_search_text_bytes)
@@ -537,6 +607,14 @@ impl LayeredSearchIndex {
     }
 }
 
+fn same_content_target(current: &IndexedEntry, updated: &IndexedEntry) -> bool {
+    current.path == updated.path
+        && current.kind == updated.kind
+        && current.root == updated.root
+        && current.modified_ms == updated.modified_ms
+        && current.size_bytes == updated.size_bytes
+}
+
 impl FileSearchIndex for LayeredSearchIndex {
     fn search_files(&self, query: &QueryRequest, limit: usize) -> Vec<SearchResult> {
         self.search(query, limit)
@@ -670,6 +748,104 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].title, "new-readme.md");
         assert_eq!(index.entry_count(), 1);
+    }
+
+    #[test]
+    fn incremental_content_publish_makes_overlay_searchable_and_clears_renamed_document() {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path();
+        let old_path = root.join("old-name.md");
+        let new_path = root.join("new-name.md");
+        std::fs::write(&old_path, "stale needle").unwrap();
+        let options = ContentIndexOptions {
+            index_dir: root.join("content-index"),
+            max_file_bytes: DEFAULT_MAX_CONTENT_BYTES,
+        };
+        let mut baseline_entries = vec![named_entry(old_path.clone(), root, "old-name.md")];
+        let content_index = ContentIndex::build(&mut baseline_entries, options.clone()).unwrap();
+        let mut index = LayeredSearchIndex::from_search_index(
+            SearchIndex::from_entries_with_content_index(baseline_entries, content_index),
+        );
+
+        std::fs::rename(&old_path, &new_path).unwrap();
+        std::fs::write(&new_path, "fresh haystack").unwrap();
+        let upsert = named_entry(new_path.clone(), root, "new-name.md");
+        index.apply_delta(CommittedIndexDelta {
+            generation: 1,
+            upserts: vec![upsert.clone()],
+            removals: vec![old_path.clone()],
+        });
+        assert_eq!(
+            index.search(&request("new-name"), 20).len(),
+            1,
+            "name/path delta is visible before content indexing"
+        );
+        assert!(index.search(&request("content:haystack"), 20).is_empty());
+
+        let mut content_index = index
+            .content_index_for_delta()
+            .expect("baseline content index remains available");
+        let mut content_upserts = vec![upsert];
+        let outcome = content_index.apply_content_delta(
+            &mut content_upserts,
+            std::slice::from_ref(&old_path),
+            &options,
+        );
+        assert!(outcome.failures.is_empty());
+        assert!(index.publish_content_delta(1, &content_upserts, content_index));
+
+        let results = index.search(&request("content:haystack"), 20);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "new-name.md");
+        assert!(index.search(&request("content:needle"), 20).is_empty());
+        assert_eq!(
+            index
+                .materialized_entries()
+                .into_iter()
+                .find(|entry| entry.path == new_path.to_string_lossy())
+                .unwrap()
+                .content_index_state,
+            crate::core::index_entry::ContentIndexState::Indexed
+        );
+    }
+
+    #[test]
+    fn overlay_content_filter_runs_before_tantivy_top_docs_cutoff() {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path();
+        let hidden_root = root.join("hidden");
+        std::fs::create_dir_all(&hidden_root).unwrap();
+        let mut baseline_entries = Vec::new();
+        for ordinal in 0..60 {
+            let path = hidden_root.join(format!("high-{ordinal}.md"));
+            std::fs::write(&path, "needle needle needle needle").unwrap();
+            baseline_entries.push(named_entry(path, root, &format!("high-{ordinal}.md")));
+        }
+        let visible = root.join("visible.md");
+        std::fs::write(&visible, "needle").unwrap();
+        let options = ContentIndexOptions {
+            index_dir: root.join("content-index"),
+            max_file_bytes: DEFAULT_MAX_CONTENT_BYTES,
+        };
+        let content_index = ContentIndex::build(&mut baseline_entries, options.clone()).unwrap();
+        let mut index = LayeredSearchIndex::from_search_index(
+            SearchIndex::from_entries_with_content_index(baseline_entries, content_index),
+        );
+        let visible_entry = named_entry(visible, root, "visible.md");
+        index.apply_delta(CommittedIndexDelta {
+            generation: 1,
+            upserts: vec![visible_entry.clone()],
+            removals: vec![hidden_root],
+        });
+        let mut delta_index = index.content_index_for_delta().unwrap();
+        let mut upserts = vec![visible_entry];
+        let outcome = delta_index.apply_content_delta(&mut upserts, &[], &options);
+        assert!(outcome.failures.is_empty());
+        assert!(index.publish_content_delta(1, &upserts, delta_index));
+
+        let results = index.search(&request("content:needle"), 5);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "visible.md");
     }
 
     #[test]

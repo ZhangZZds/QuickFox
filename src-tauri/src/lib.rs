@@ -5,7 +5,9 @@ use crate::core::config::{
     classify_index_config_change, ConfigStore, IndexConfigChange, IndexPerformanceMode,
     QuickFoxConfig,
 };
-use crate::core::content_index::{ContentIndex, ContentIndexOptions};
+use crate::core::content_index::{
+    ContentDeltaOutcome, ContentDeltaTurn, ContentIndex, ContentIndexOptions,
+};
 use crate::core::index::{
     FileSearchIndex, IndexLifecycle, IndexReport, IndexScanOptions, IndexScanner, IndexStatus,
     SearchIndex,
@@ -53,7 +55,7 @@ use serde::Serialize;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::Instant;
 use tauri::image::Image;
@@ -76,6 +78,33 @@ struct QuickFoxRuntime {
     incremental_status: RuntimeIncrementalStatus,
     manifest_ready: bool,
     index_refresh: IndexRefreshControl,
+}
+
+type ContentDeltaJob = Box<dyn FnOnce() + Send + 'static>;
+const CONTENT_DELTA_QUEUE_CAPACITY: usize = 8;
+static CONTENT_DELTA_QUEUE: OnceLock<Option<mpsc::SyncSender<ContentDeltaJob>>> = OnceLock::new();
+
+fn enqueue_content_delta_job(job: ContentDeltaJob) -> Result<(), ContentDeltaJob> {
+    let sender = CONTENT_DELTA_QUEUE.get_or_init(|| {
+        let (sender, receiver) =
+            mpsc::sync_channel::<ContentDeltaJob>(CONTENT_DELTA_QUEUE_CAPACITY);
+        match thread::Builder::new()
+            .name("quickfox-content-delta".to_owned())
+            .spawn(move || {
+                while let Ok(job) = receiver.recv() {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                }
+            }) {
+            Ok(_) => Some(sender),
+            Err(_) => None,
+        }
+    });
+    let Some(sender) = sender else {
+        return Err(job);
+    };
+    sender.try_send(job).map_err(|error| match error {
+        mpsc::TrySendError::Full(job) | mpsc::TrySendError::Disconnected(job) => job,
+    })
 }
 
 struct QuickFoxAppState {
@@ -4814,12 +4843,44 @@ fn publish_runtime_indexing_event<R: tauri::Runtime>(
                     .expect("quickfox runtime lock poisoned");
                 apply_runtime_indexing_event(&mut runtime, &service, event)
             };
-            let Some(application) = application else {
+            let Some(mut application) = application else {
                 return;
             };
+            let content_delta = application.content_delta.take();
             let _ = dispatch.emit("quickfox://index-status", application.status);
             if application.request_refresh {
                 let _ = start_background_index_refresh(dispatch.clone(), &state);
+            }
+            if let Some(content_delta) = content_delta {
+                let content_app = dispatch.clone();
+                let job: ContentDeltaJob = Box::new(move || {
+                    let completion = content_delta.execute();
+                    let publish_app = content_app.clone();
+                    let recovery_app = content_app.clone();
+                    if content_app
+                        .run_on_main_thread(move || {
+                            let state = publish_app.state::<QuickFoxAppState>();
+                            let application = {
+                                let mut runtime = state
+                                    .runtime
+                                    .lock()
+                                    .expect("quickfox runtime lock poisoned");
+                                apply_runtime_content_delta_completion(&mut runtime, completion)
+                            };
+                            if let Some(application) = application {
+                                let _ =
+                                    publish_app.emit("quickfox://index-status", application.status);
+                            }
+                        })
+                        .is_err()
+                    {
+                        let state = recovery_app.state::<QuickFoxAppState>();
+                        let _ = start_background_index_refresh(recovery_app.clone(), &state);
+                    }
+                });
+                if enqueue_content_delta_job(job).is_err() {
+                    let _ = start_background_index_refresh(dispatch.clone(), &state);
+                }
             }
         })
         .is_err();
@@ -4972,6 +5033,46 @@ fn mark_runtime_dispatch_recovery_spawn_failure<R: tauri::Runtime>(
 struct RuntimeIndexingEventApplication {
     status: IndexStatus,
     request_refresh: bool,
+    content_delta: Option<RuntimeContentDeltaRequest>,
+}
+
+struct RuntimeContentDeltaRequest {
+    service: RuntimeServiceIdentity,
+    generation: u64,
+    search_view_epoch: u64,
+    content_index: ContentIndex,
+    turn: ContentDeltaTurn,
+    upserts: Vec<IndexedEntry>,
+    removals: Vec<PathBuf>,
+    options: ContentIndexOptions,
+}
+
+struct RuntimeContentDeltaCompletion {
+    service: RuntimeServiceIdentity,
+    generation: u64,
+    search_view_epoch: u64,
+    content_index: ContentIndex,
+    upserts: Vec<IndexedEntry>,
+    outcome: ContentDeltaOutcome,
+}
+
+impl RuntimeContentDeltaRequest {
+    fn execute(mut self) -> RuntimeContentDeltaCompletion {
+        let outcome = self.content_index.apply_content_delta_in_turn(
+            self.turn,
+            &mut self.upserts,
+            &self.removals,
+            &self.options,
+        );
+        RuntimeContentDeltaCompletion {
+            service: self.service,
+            generation: self.generation,
+            search_view_epoch: self.search_view_epoch,
+            content_index: self.content_index,
+            upserts: self.upserts,
+            outcome,
+        }
+    }
 }
 
 fn apply_runtime_indexing_event(
@@ -4994,8 +5095,10 @@ fn apply_runtime_indexing_event(
                 return Some(RuntimeIndexingEventApplication {
                     status: runtime.index_status(),
                     request_refresh: true,
+                    content_delta: None,
                 });
             }
+            let content_delta_source = delta.clone();
             runtime.index.apply_delta(delta);
             let delta_safety_reached = baseline_refresh_event_for_delta_state(
                 runtime.index.delta_entry_count(),
@@ -5007,9 +5110,12 @@ fn apply_runtime_indexing_event(
                     runtime.index_refresh.active.is_some(),
                     RefreshRequestReason::DeltaSafetyLimit,
                 ) == RefreshRequestDecision::Start;
+            let content_delta =
+                prepare_runtime_content_delta(runtime, *service, content_delta_source);
             Some(RuntimeIndexingEventApplication {
                 status: runtime.index_status(),
                 request_refresh,
+                content_delta,
             })
         }
         RuntimeIndexingEvent::Status(incremental_status) => {
@@ -5035,6 +5141,7 @@ fn apply_runtime_indexing_event(
             Some(RuntimeIndexingEventApplication {
                 status: runtime.index_status(),
                 request_refresh: false,
+                content_delta: None,
             })
         }
         RuntimeIndexingEvent::BaselineRefreshRequired { reason } => {
@@ -5059,9 +5166,79 @@ fn apply_runtime_indexing_event(
             Some(RuntimeIndexingEventApplication {
                 status: runtime.index_status(),
                 request_refresh: decision != RefreshRequestDecision::AbsorbedByActiveRefresh,
+                content_delta: None,
             })
         }
     }
+}
+
+fn prepare_runtime_content_delta(
+    runtime: &QuickFoxRuntime,
+    service: RuntimeServiceIdentity,
+    delta: CommittedIndexDelta,
+) -> Option<RuntimeContentDeltaRequest> {
+    let content_roots = content_index_roots(&runtime.config);
+    if content_roots.is_empty() {
+        return None;
+    }
+    let content_index = runtime.index.content_index_for_delta()?;
+    let upserts: Vec<_> = delta
+        .upserts
+        .into_iter()
+        .filter(|entry| entry_is_under_content_root(entry, &content_roots))
+        .collect();
+    let removals: Vec<_> = delta
+        .removals
+        .into_iter()
+        .filter(|path| {
+            content_roots
+                .iter()
+                .any(|root| path.starts_with(root) || root.starts_with(path))
+        })
+        .collect();
+    if upserts.is_empty() && removals.is_empty() {
+        return None;
+    }
+    let turn = content_index.reserve_delta_turn();
+    Some(RuntimeContentDeltaRequest {
+        service,
+        generation: delta.generation,
+        search_view_epoch: runtime.index_refresh.search_view_epoch,
+        content_index,
+        turn,
+        upserts,
+        removals,
+        options: content_index_options(&runtime.config),
+    })
+}
+
+fn apply_runtime_content_delta_completion(
+    runtime: &mut QuickFoxRuntime,
+    completion: RuntimeContentDeltaCompletion,
+) -> Option<RuntimeIndexingEventApplication> {
+    if completion.service.config_revision != runtime.index_refresh.config_revision
+        || completion.search_view_epoch != runtime.index_refresh.search_view_epoch
+    {
+        return None;
+    }
+    if !completion.outcome.failures.is_empty() {
+        eprintln!(
+            "QuickFox content delta completed with {} per-entry failures",
+            completion.outcome.failures.len()
+        );
+    }
+    if !runtime.index.publish_content_delta(
+        completion.generation,
+        &completion.upserts,
+        completion.content_index,
+    ) {
+        return None;
+    }
+    Some(RuntimeIndexingEventApplication {
+        status: runtime.index_status(),
+        request_refresh: false,
+        content_delta: None,
+    })
 }
 
 fn baseline_refresh_requires_manifest_rebuild(reason: BaselineRefreshReason) -> bool {
@@ -5372,7 +5549,7 @@ fn build_search_index_with_content_for_config(
     mut entries: Vec<IndexedEntry>,
 ) -> Result<SearchIndex, String> {
     let content_roots = content_index_roots(config);
-    if content_roots.is_empty() || entries.is_empty() {
+    if content_roots.is_empty() {
         return Ok(SearchIndex::from_entries(entries));
     }
 
@@ -5381,10 +5558,6 @@ fn build_search_index_with_content_for_config(
         .filter(|entry| entry_is_under_content_root(entry, &content_roots))
         .cloned()
         .collect();
-    if content_entries.is_empty() {
-        return Ok(SearchIndex::from_entries(entries));
-    }
-
     ContentIndex::build(&mut content_entries, content_index_options(config))
         .map_err(|error| error.to_string())
         .map(|content_index| {
@@ -5404,13 +5577,9 @@ fn build_search_index_with_content_for_config(
 
 fn should_build_content_index_for_config(
     config: &QuickFoxConfig,
-    entries: &[IndexedEntry],
+    _entries: &[IndexedEntry],
 ) -> bool {
-    let content_roots = content_index_roots(config);
-    !content_roots.is_empty()
-        && entries
-            .iter()
-            .any(|entry| entry_is_under_content_root(entry, &content_roots))
+    !content_index_roots(config).is_empty()
 }
 
 fn content_index_roots(config: &QuickFoxConfig) -> Vec<PathBuf> {
@@ -7733,6 +7902,603 @@ mod tests {
         assert!(!application.request_refresh);
         assert_eq!(runtime.index.generation(), 1);
         assert_eq!(runtime.index.entry_count(), 1);
+    }
+
+    #[test]
+    fn content_failure_keeps_committed_name_path_visible_without_runtime_degradation() {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("new-report.md");
+        fs::write(&file, "temporary content").unwrap();
+        let entry = IndexedEntry::from_path_metadata(&file, &root, IndexedEntryKind::File);
+        let delta = CommittedIndexDelta {
+            generation: 1,
+            upserts: vec![entry],
+            removals: Vec::new(),
+        };
+        let storage = SqliteStorage::open(workspace.path().join("runtime.sqlite")).unwrap();
+        let baseline_id = storage.save_completed_index_batch(1, &[]).unwrap();
+        storage
+            .activate_baseline_and_clear_incremental_state(baseline_id, 0)
+            .unwrap();
+        storage.commit_incremental_batch(&delta, &[], &[]).unwrap();
+
+        let mut config =
+            QuickFoxConfig::default_with_index_dirs(vec![root.to_string_lossy().into()]);
+        config.index.content_include_dirs = vec![root.to_string_lossy().into()];
+        let options = ContentIndexOptions {
+            index_dir: workspace.path().join("content-index"),
+            max_file_bytes: config.index.content_max_file_bytes,
+        };
+        let content_index = ContentIndex::build(&mut [], options).unwrap();
+        let mut runtime = build_runtime_from_snapshot(config, None);
+        runtime.index = LayeredSearchIndex::from_search_index(
+            SearchIndex::from_entries_with_content_index(Vec::new(), content_index),
+        );
+        let service = RuntimeServiceIdentity {
+            epoch: 1,
+            config_revision: 0,
+        };
+        runtime.index_refresh.active_service = Some(service);
+        fs::remove_file(&file).unwrap();
+
+        let first = apply_runtime_indexing_event(
+            &mut runtime,
+            &service,
+            RuntimeIndexingEvent::DeltaCommitted(delta),
+        )
+        .expect("name/path phase publishes first");
+        assert_eq!(
+            runtime
+                .index
+                .search(
+                    &crate::core::search::QueryRequest::new(
+                        "new-report",
+                        crate::core::search::SearchMode::Normal,
+                    ),
+                    20,
+                )
+                .len(),
+            1
+        );
+        assert_eq!(runtime.incremental_status.degradation_code, None);
+
+        let completion = first
+            .content_delta
+            .expect("content phase scheduled")
+            .execute();
+        let second = apply_runtime_content_delta_completion(&mut runtime, completion)
+            .expect("content state change publishes second");
+
+        assert!(!second.request_refresh);
+        let refreshed = runtime
+            .index
+            .materialized_entries()
+            .into_iter()
+            .find(|candidate| candidate.path == file.to_string_lossy())
+            .unwrap();
+        assert_eq!(refreshed.content_index_state, ContentIndexState::ReadFailed);
+        assert_eq!(runtime.incremental_status.degradation_code, None);
+        assert_eq!(
+            storage
+                .committed_index_deltas_after(0)
+                .unwrap()
+                .into_iter()
+                .map(|delta| delta.generation)
+                .collect::<Vec<_>>(),
+            vec![1],
+            "content phase must not rewrite the name/path journal"
+        );
+    }
+
+    #[test]
+    fn successful_runtime_content_delta_publishes_searchable_overlay_state() {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("incremental.md");
+        fs::write(&file, "runtime delta haystack").unwrap();
+        let entry = IndexedEntry::from_path_metadata(&file, &root, IndexedEntryKind::File);
+        let mut config =
+            QuickFoxConfig::default_with_index_dirs(vec![root.to_string_lossy().into_owned()]);
+        config.index.content_include_dirs = vec![root.to_string_lossy().into_owned()];
+        let initial_index =
+            build_search_index_with_content_for_config(&config, Vec::new()).unwrap();
+        let mut runtime = build_runtime_from_snapshot(config, None);
+        runtime.index = LayeredSearchIndex::from_search_index(initial_index);
+        let service = RuntimeServiceIdentity {
+            epoch: 1,
+            config_revision: 0,
+        };
+        runtime.index_refresh.active_service = Some(service);
+
+        let first = apply_runtime_indexing_event(
+            &mut runtime,
+            &service,
+            RuntimeIndexingEvent::DeltaCommitted(CommittedIndexDelta {
+                generation: 1,
+                upserts: vec![entry],
+                removals: Vec::new(),
+            }),
+        )
+        .unwrap();
+        assert!(runtime
+            .index
+            .search(
+                &crate::core::search::QueryRequest::new(
+                    "content:haystack",
+                    crate::core::search::SearchMode::Normal,
+                ),
+                20,
+            )
+            .is_empty());
+
+        let completion = first.content_delta.unwrap().execute();
+        assert!(apply_runtime_content_delta_completion(&mut runtime, completion).is_some());
+
+        let results = runtime.index.search(
+            &crate::core::search::QueryRequest::new(
+                "content:haystack",
+                crate::core::search::SearchMode::Normal,
+            ),
+            20,
+        );
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "incremental.md");
+        assert_eq!(
+            runtime.index.materialized_entries()[0].content_index_state,
+            ContentIndexState::Indexed
+        );
+    }
+
+    #[test]
+    fn production_runtime_publish_runs_async_content_phase_and_second_status_event() {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("production.md");
+        fs::write(&file, "production async needle").unwrap();
+        let mut config =
+            QuickFoxConfig::default_with_index_dirs(vec![root.to_string_lossy().into_owned()]);
+        config.index.content_include_dirs = vec![root.to_string_lossy().into_owned()];
+        let initial_index =
+            build_search_index_with_content_for_config(&config, Vec::new()).unwrap();
+        let mut runtime = build_runtime_from_snapshot(config, None);
+        runtime.index = LayeredSearchIndex::from_search_index(initial_index);
+        let service = RuntimeServiceIdentity {
+            epoch: 1,
+            config_revision: 0,
+        };
+        runtime.index_refresh.active_service = Some(service);
+        let app = tauri::test::mock_app();
+        app.manage(QuickFoxAppState {
+            runtime: Mutex::new(runtime),
+            index_refresh_fence: Mutex::new(()),
+            window_state: Mutex::new(LauncherWindowState::default()),
+            global_hotkey_status: Mutex::new(pending_global_hotkey_status()),
+        });
+        let published = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&published);
+        tauri::Listener::listen(app.handle(), "quickfox://index-status", move |_| {
+            observed.fetch_add(1, Ordering::Relaxed);
+        });
+
+        publish_runtime_indexing_event(
+            app.handle().clone(),
+            service,
+            RuntimeIndexingEvent::DeltaCommitted(CommittedIndexDelta {
+                generation: 1,
+                upserts: vec![IndexedEntry::from_path_metadata(
+                    &file,
+                    &root,
+                    IndexedEntryKind::File,
+                )],
+                removals: Vec::new(),
+            }),
+        );
+        let state = app.state::<QuickFoxAppState>();
+        assert!(state
+            .runtime
+            .lock()
+            .unwrap()
+            .index
+            .search(
+                &crate::core::search::QueryRequest::new(
+                    "production",
+                    crate::core::search::SearchMode::Normal,
+                ),
+                20,
+            )
+            .iter()
+            .any(|result| result.title == "production.md"));
+
+        for _ in 0..200 {
+            if state.runtime.lock().unwrap().index.materialized_entries()[0].content_index_state
+                == ContentIndexState::Indexed
+            {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let runtime = state.runtime.lock().unwrap();
+        assert_eq!(
+            runtime.index.materialized_entries()[0].content_index_state,
+            ContentIndexState::Indexed
+        );
+        assert!(runtime
+            .index
+            .search(
+                &crate::core::search::QueryRequest::new(
+                    "content:needle",
+                    crate::core::search::SearchMode::Normal,
+                ),
+                20,
+            )
+            .iter()
+            .any(|result| result.title == "production.md"));
+        assert_eq!(published.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn production_runtime_publish_keeps_name_visible_when_async_content_read_fails() {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("read-failed.md");
+        fs::write(&file, "temporary").unwrap();
+        let entry = IndexedEntry::from_path_metadata(&file, &root, IndexedEntryKind::File);
+        let mut config =
+            QuickFoxConfig::default_with_index_dirs(vec![root.to_string_lossy().into_owned()]);
+        config.index.content_include_dirs = vec![root.to_string_lossy().into_owned()];
+        let initial_index =
+            build_search_index_with_content_for_config(&config, Vec::new()).unwrap();
+        let mut runtime = build_runtime_from_snapshot(config, None);
+        runtime.index = LayeredSearchIndex::from_search_index(initial_index);
+        let service = RuntimeServiceIdentity {
+            epoch: 1,
+            config_revision: 0,
+        };
+        runtime.index_refresh.active_service = Some(service);
+        let app = tauri::test::mock_app();
+        app.manage(QuickFoxAppState {
+            runtime: Mutex::new(runtime),
+            index_refresh_fence: Mutex::new(()),
+            window_state: Mutex::new(LauncherWindowState::default()),
+            global_hotkey_status: Mutex::new(pending_global_hotkey_status()),
+        });
+        fs::remove_file(&file).unwrap();
+
+        publish_runtime_indexing_event(
+            app.handle().clone(),
+            service,
+            RuntimeIndexingEvent::DeltaCommitted(CommittedIndexDelta {
+                generation: 1,
+                upserts: vec![entry],
+                removals: Vec::new(),
+            }),
+        );
+        let state = app.state::<QuickFoxAppState>();
+        for _ in 0..200 {
+            if state.runtime.lock().unwrap().index.materialized_entries()[0].content_index_state
+                == ContentIndexState::ReadFailed
+            {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let runtime = state.runtime.lock().unwrap();
+        assert_eq!(
+            runtime.index.materialized_entries()[0].content_index_state,
+            ContentIndexState::ReadFailed
+        );
+        assert_eq!(runtime.incremental_status.degradation_code, None);
+        assert!(runtime
+            .index
+            .search(
+                &crate::core::search::QueryRequest::new(
+                    "read-failed",
+                    crate::core::search::SearchMode::Normal,
+                ),
+                20,
+            )
+            .iter()
+            .any(|result| result.title == "read-failed.md"));
+    }
+
+    #[test]
+    fn production_runtime_publish_removes_content_document_without_second_state_event() {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("removed.md");
+        fs::write(&file, "removed production needle").unwrap();
+        let entry = IndexedEntry::from_path_metadata(&file, &root, IndexedEntryKind::File);
+        let mut config =
+            QuickFoxConfig::default_with_index_dirs(vec![root.to_string_lossy().into_owned()]);
+        config.index.content_include_dirs = vec![root.to_string_lossy().into_owned()];
+        let initial_index =
+            build_search_index_with_content_for_config(&config, vec![entry]).unwrap();
+        let mut runtime = build_runtime_from_snapshot(config, None);
+        runtime.index = LayeredSearchIndex::from_search_index(initial_index);
+        let content_reader = runtime.index.content_index_for_delta().unwrap();
+        let service = RuntimeServiceIdentity {
+            epoch: 1,
+            config_revision: 0,
+        };
+        runtime.index_refresh.active_service = Some(service);
+        let app = tauri::test::mock_app();
+        app.manage(QuickFoxAppState {
+            runtime: Mutex::new(runtime),
+            index_refresh_fence: Mutex::new(()),
+            window_state: Mutex::new(LauncherWindowState::default()),
+            global_hotkey_status: Mutex::new(pending_global_hotkey_status()),
+        });
+        let published = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&published);
+        tauri::Listener::listen(app.handle(), "quickfox://index-status", move |_| {
+            observed.fetch_add(1, Ordering::Relaxed);
+        });
+
+        publish_runtime_indexing_event(
+            app.handle().clone(),
+            service,
+            RuntimeIndexingEvent::DeltaCommitted(CommittedIndexDelta {
+                generation: 1,
+                upserts: Vec::new(),
+                removals: vec![file],
+            }),
+        );
+        for _ in 0..200 {
+            if content_reader
+                .search("needle", None, 10)
+                .unwrap()
+                .is_empty()
+            {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        assert!(content_reader
+            .search("needle", None, 10)
+            .unwrap()
+            .is_empty());
+        assert_eq!(published.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            app.state::<QuickFoxAppState>()
+                .runtime
+                .lock()
+                .unwrap()
+                .incremental_status
+                .degradation_code,
+            None
+        );
+    }
+
+    #[test]
+    fn removal_only_content_delta_changes_no_second_status_revision() {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("remove.md");
+        fs::write(&file, "remove-only needle").unwrap();
+        let mut entry = IndexedEntry::from_path_metadata(&file, &root, IndexedEntryKind::File);
+        let mut config =
+            QuickFoxConfig::default_with_index_dirs(vec![root.to_string_lossy().into_owned()]);
+        config.index.content_include_dirs = vec![root.to_string_lossy().into_owned()];
+        let content_index = ContentIndex::build(
+            std::slice::from_mut(&mut entry),
+            ContentIndexOptions {
+                index_dir: workspace.path().join("content-index"),
+                max_file_bytes: config.index.content_max_file_bytes,
+            },
+        )
+        .unwrap();
+        let mut runtime = build_runtime_from_snapshot(config, None);
+        runtime.index = LayeredSearchIndex::from_search_index(
+            SearchIndex::from_entries_with_content_index(vec![entry], content_index),
+        );
+        let service = RuntimeServiceIdentity {
+            epoch: 1,
+            config_revision: 0,
+        };
+        runtime.index_refresh.active_service = Some(service);
+
+        let first = apply_runtime_indexing_event(
+            &mut runtime,
+            &service,
+            RuntimeIndexingEvent::DeltaCommitted(CommittedIndexDelta {
+                generation: 1,
+                upserts: Vec::new(),
+                removals: vec![file],
+            }),
+        )
+        .unwrap();
+        let view_epoch = runtime.index_refresh.search_view_epoch;
+        let completion = first.content_delta.unwrap().execute();
+
+        assert!(apply_runtime_content_delta_completion(&mut runtime, completion).is_none());
+        assert_eq!(runtime.index_refresh.search_view_epoch, view_epoch);
+        assert_eq!(runtime.incremental_status.degradation_code, None);
+    }
+
+    #[test]
+    fn removals_outside_content_roots_do_not_schedule_content_work() {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path().join("root");
+        let content_root = root.join("content");
+        fs::create_dir_all(&content_root).unwrap();
+        let mut config =
+            QuickFoxConfig::default_with_index_dirs(vec![root.to_string_lossy().into_owned()]);
+        config.index.content_include_dirs = vec![content_root.to_string_lossy().into_owned()];
+        let initial_index =
+            build_search_index_with_content_for_config(&config, Vec::new()).unwrap();
+        let mut runtime = build_runtime_from_snapshot(config, None);
+        runtime.index = LayeredSearchIndex::from_search_index(initial_index);
+        let service = RuntimeServiceIdentity {
+            epoch: 1,
+            config_revision: 0,
+        };
+        runtime.index_refresh.active_service = Some(service);
+
+        let outside_removals = (0..crate::core::index_watcher::DEFAULT_WATCH_CHANNEL_CAPACITY)
+            .map(|ordinal| root.join(format!("outside-{ordinal}.txt")))
+            .collect();
+        let application = apply_runtime_indexing_event(
+            &mut runtime,
+            &service,
+            RuntimeIndexingEvent::DeltaCommitted(CommittedIndexDelta {
+                generation: 1,
+                upserts: Vec::new(),
+                removals: outside_removals,
+            }),
+        )
+        .unwrap();
+
+        assert!(application.content_delta.is_none());
+    }
+
+    #[test]
+    fn queued_content_completions_for_consecutive_generations_both_publish() {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        let first_file = root.join("first.md");
+        let second_file = root.join("second.md");
+        fs::write(&first_file, "first alpha").unwrap();
+        fs::write(&second_file, "second beta").unwrap();
+        let mut config =
+            QuickFoxConfig::default_with_index_dirs(vec![root.to_string_lossy().into_owned()]);
+        config.index.content_include_dirs = vec![root.to_string_lossy().into_owned()];
+        let content_index = ContentIndex::build(
+            &mut [],
+            ContentIndexOptions {
+                index_dir: workspace.path().join("content-index"),
+                max_file_bytes: config.index.content_max_file_bytes,
+            },
+        )
+        .unwrap();
+        let mut runtime = build_runtime_from_snapshot(config, None);
+        runtime.index = LayeredSearchIndex::from_search_index(
+            SearchIndex::from_entries_with_content_index(Vec::new(), content_index),
+        );
+        let service = RuntimeServiceIdentity {
+            epoch: 1,
+            config_revision: 0,
+        };
+        runtime.index_refresh.active_service = Some(service);
+
+        let first = apply_runtime_indexing_event(
+            &mut runtime,
+            &service,
+            RuntimeIndexingEvent::DeltaCommitted(CommittedIndexDelta {
+                generation: 1,
+                upserts: vec![IndexedEntry::from_path_metadata(
+                    &first_file,
+                    &root,
+                    IndexedEntryKind::File,
+                )],
+                removals: Vec::new(),
+            }),
+        )
+        .unwrap()
+        .content_delta
+        .unwrap();
+        let second = apply_runtime_indexing_event(
+            &mut runtime,
+            &service,
+            RuntimeIndexingEvent::DeltaCommitted(CommittedIndexDelta {
+                generation: 2,
+                upserts: vec![IndexedEntry::from_path_metadata(
+                    &second_file,
+                    &root,
+                    IndexedEntryKind::File,
+                )],
+                removals: Vec::new(),
+            }),
+        )
+        .unwrap()
+        .content_delta
+        .unwrap();
+
+        let first_completion = first.execute();
+        let second_completion = second.execute();
+        assert!(apply_runtime_content_delta_completion(&mut runtime, first_completion).is_some());
+        assert!(apply_runtime_content_delta_completion(&mut runtime, second_completion).is_some());
+        assert_eq!(
+            runtime
+                .index
+                .materialized_entries()
+                .into_iter()
+                .filter(|entry| entry.content_index_state == ContentIndexState::Indexed)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn older_same_path_content_completion_cannot_overwrite_newer_generation() {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("same.md");
+        fs::write(&file, "same identity content").unwrap();
+        let entry = IndexedEntry::from_path_metadata(&file, &root, IndexedEntryKind::File);
+        let mut config =
+            QuickFoxConfig::default_with_index_dirs(vec![root.to_string_lossy().into_owned()]);
+        config.index.content_include_dirs = vec![root.to_string_lossy().into_owned()];
+        let content_index = ContentIndex::build(
+            &mut [],
+            ContentIndexOptions {
+                index_dir: workspace.path().join("content-index"),
+                max_file_bytes: config.index.content_max_file_bytes,
+            },
+        )
+        .unwrap();
+        let mut runtime = build_runtime_from_snapshot(config, None);
+        runtime.index = LayeredSearchIndex::from_search_index(
+            SearchIndex::from_entries_with_content_index(Vec::new(), content_index),
+        );
+        let service = RuntimeServiceIdentity {
+            epoch: 1,
+            config_revision: 0,
+        };
+        runtime.index_refresh.active_service = Some(service);
+        let mut older = apply_runtime_indexing_event(
+            &mut runtime,
+            &service,
+            RuntimeIndexingEvent::DeltaCommitted(CommittedIndexDelta {
+                generation: 1,
+                upserts: vec![entry.clone()],
+                removals: Vec::new(),
+            }),
+        )
+        .unwrap()
+        .content_delta
+        .unwrap()
+        .execute();
+        let newer = apply_runtime_indexing_event(
+            &mut runtime,
+            &service,
+            RuntimeIndexingEvent::DeltaCommitted(CommittedIndexDelta {
+                generation: 2,
+                upserts: vec![entry],
+                removals: Vec::new(),
+            }),
+        )
+        .unwrap()
+        .content_delta
+        .unwrap()
+        .execute();
+        older.upserts[0].content_index_state = ContentIndexState::ReadFailed;
+
+        assert!(apply_runtime_content_delta_completion(&mut runtime, newer).is_some());
+        assert!(apply_runtime_content_delta_completion(&mut runtime, older).is_none());
+        assert_eq!(
+            runtime.index.materialized_entries()[0].content_index_state,
+            ContentIndexState::Indexed
+        );
     }
 
     #[test]

@@ -176,6 +176,10 @@ impl SearchIndex {
         self.content_index.take()
     }
 
+    pub(crate) fn content_index_clone(&self) -> Option<ContentIndex> {
+        self.content_index.clone()
+    }
+
     fn rebuild_content_entry_lookup(&mut self) {
         self.content_entry_index_by_path = self
             .content_index

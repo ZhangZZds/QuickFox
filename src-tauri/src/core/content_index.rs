@@ -1,18 +1,19 @@
 //! Text content index boundary.
 
-use crate::core::index_entry::{ContentIndexState, IndexedEntry, IndexedEntryKind};
+use crate::core::index_entry::{ContentIndexState, IndexFailure, IndexedEntry, IndexedEntryKind};
 use crate::core::search::SearchSnippet;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, OnceLock};
 
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tantivy::collector::{BytesFilterCollector, TopDocs};
-use tantivy::query::QueryParser;
+use tantivy::query::{QueryParser, RegexQuery};
 use tantivy::schema::{Field, Schema, Value, FAST, STORED, STRING, TEXT};
 use tantivy::{doc, Index, IndexWriter, TantivyDocument, Term};
 
@@ -50,6 +51,12 @@ pub struct ContentIndexOptions {
     pub max_file_bytes: u64,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContentDeltaOutcome {
+    pub updated_states: BTreeMap<String, ContentIndexState>,
+    pub failures: Vec<IndexFailure>,
+}
+
 impl Default for ContentIndexOptions {
     fn default() -> Self {
         Self {
@@ -69,8 +76,35 @@ pub struct ContentIndex {
     content_field: Field,
     // Field order keeps the directory alive until every Tantivy handle above has dropped.
     _directory_lease: Arc<ContentIndexDirectoryLease>,
+    delta_sequence: Arc<std::sync::Mutex<ContentDeltaSequence>>,
     #[cfg(test)]
     last_collector_limit: Arc<AtomicUsize>,
+}
+
+#[derive(Debug, Default)]
+struct ContentDeltaSequence {
+    tail: Option<Receiver<()>>,
+}
+
+pub(crate) struct ContentDeltaTurn {
+    predecessor: Option<Receiver<()>>,
+    completion: Option<Sender<()>>,
+}
+
+impl ContentDeltaTurn {
+    fn wait(&mut self) {
+        if let Some(predecessor) = self.predecessor.take() {
+            let _ = predecessor.recv();
+        }
+    }
+}
+
+impl Drop for ContentDeltaTurn {
+    fn drop(&mut self) {
+        if let Some(completion) = self.completion.take() {
+            let _ = completion.send(());
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -353,9 +387,52 @@ impl ContentIndex {
             path_filter_field,
             content_field,
             _directory_lease: directory_lease,
+            delta_sequence: Arc::new(std::sync::Mutex::new(ContentDeltaSequence::default())),
             #[cfg(test)]
             last_collector_limit: Arc::new(AtomicUsize::new(0)),
         })
+    }
+
+    pub(crate) fn reserve_delta_turn(&self) -> ContentDeltaTurn {
+        let (completion, receiver) = mpsc::channel();
+        let predecessor = self
+            .delta_sequence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .tail
+            .replace(receiver);
+        ContentDeltaTurn {
+            predecessor,
+            completion: Some(completion),
+        }
+    }
+
+    pub(crate) fn apply_content_delta_in_turn(
+        &mut self,
+        turn: ContentDeltaTurn,
+        upserts: &mut [IndexedEntry],
+        removals: &[PathBuf],
+        options: &ContentIndexOptions,
+    ) -> ContentDeltaOutcome {
+        self.apply_content_delta_in_turn_with_extractor(
+            turn,
+            upserts,
+            removals,
+            options,
+            &PlainTextExtractor,
+        )
+    }
+
+    fn apply_content_delta_in_turn_with_extractor(
+        &mut self,
+        mut turn: ContentDeltaTurn,
+        upserts: &mut [IndexedEntry],
+        removals: &[PathBuf],
+        options: &ContentIndexOptions,
+        extractor: &dyn TextExtractor,
+    ) -> ContentDeltaOutcome {
+        turn.wait();
+        self.apply_content_delta_with_extractor(upserts, removals, options, extractor)
     }
 
     #[cfg(test)]
@@ -511,6 +588,88 @@ impl ContentIndex {
         Ok(())
     }
 
+    pub fn apply_content_delta(
+        &mut self,
+        upserts: &mut [IndexedEntry],
+        removals: &[PathBuf],
+        options: &ContentIndexOptions,
+    ) -> ContentDeltaOutcome {
+        self.apply_content_delta_with_extractor(upserts, removals, options, &PlainTextExtractor)
+    }
+
+    pub(crate) fn apply_content_delta_with_extractor(
+        &mut self,
+        upserts: &mut [IndexedEntry],
+        removals: &[PathBuf],
+        options: &ContentIndexOptions,
+        extractor: &dyn TextExtractor,
+    ) -> ContentDeltaOutcome {
+        let mut writer: IndexWriter = match self.index.writer(50_000_000) {
+            Ok(writer) => writer,
+            Err(error) => return content_delta_writer_failure(upserts, error.to_string()),
+        };
+        for path in removals {
+            let escaped = regex::escape(&path.to_string_lossy());
+            let query =
+                match RegexQuery::from_pattern(&format!(r"{escaped}([/\\].*)?"), self.path_field) {
+                    Ok(query) => query,
+                    Err(error) => return content_delta_writer_failure(upserts, error.to_string()),
+                };
+            if let Err(error) = writer.delete_query(Box::new(query)) {
+                return content_delta_writer_failure(upserts, error.to_string());
+            }
+        }
+        let mut states = Vec::with_capacity(upserts.len());
+        for entry in upserts.iter() {
+            writer.delete_term(Term::from_field_text(self.path_field, &entry.path));
+            let extraction = if entry.kind == IndexedEntryKind::File {
+                extractor.extract(Path::new(&entry.path), options.max_file_bytes)
+            } else {
+                ContentExtractionResult::UnsupportedType
+            };
+            let state = match extraction {
+                ContentExtractionResult::Text(content) => {
+                    if let Err(error) = writer.add_document(doc!(
+                    self.path_field => entry.path.clone(),
+                    self.path_filter_field => entry.path.as_bytes(),
+                    self.content_field => content,
+                    )) {
+                        return content_delta_writer_failure(upserts, error.to_string());
+                    }
+                    ContentIndexState::Indexed
+                }
+                ContentExtractionResult::TooLarge => ContentIndexState::SkippedTooLarge,
+                ContentExtractionResult::Binary | ContentExtractionResult::UnsupportedType => {
+                    if entry.kind == IndexedEntryKind::File {
+                        ContentIndexState::SkippedBinary
+                    } else {
+                        ContentIndexState::NotIndexed
+                    }
+                }
+                ContentExtractionResult::ReadFailed => ContentIndexState::ReadFailed,
+            };
+            states.push(state);
+        }
+        if let Err(error) = writer.commit() {
+            return content_delta_writer_failure(upserts, error.to_string());
+        }
+
+        let mut outcome = ContentDeltaOutcome::default();
+        for (entry, state) in upserts.iter_mut().zip(states) {
+            entry.content_index_state = state;
+            if entry.content_index_state == ContentIndexState::ReadFailed {
+                outcome.failures.push(IndexFailure {
+                    root: entry.path.clone(),
+                    message: "content read failed".to_owned(),
+                });
+            }
+            outcome
+                .updated_states
+                .insert(entry.path.clone(), entry.content_index_state.clone());
+        }
+        outcome
+    }
+
     pub fn memory_estimate(&self) -> ContentIndexMemoryEstimate {
         ContentIndexMemoryEstimate {
             resident_document_count: 0,
@@ -522,6 +681,24 @@ impl ContentIndex {
     pub(crate) fn last_collector_limit(&self) -> usize {
         self.last_collector_limit.load(Ordering::Relaxed)
     }
+}
+
+fn content_delta_writer_failure(
+    upserts: &mut [IndexedEntry],
+    message: String,
+) -> ContentDeltaOutcome {
+    let mut outcome = ContentDeltaOutcome::default();
+    for entry in upserts {
+        entry.content_index_state = ContentIndexState::ReadFailed;
+        outcome
+            .updated_states
+            .insert(entry.path.clone(), ContentIndexState::ReadFailed);
+        outcome.failures.push(IndexFailure {
+            root: entry.path.clone(),
+            message: format!("content index update failed: {message}"),
+        });
+    }
+    outcome
 }
 
 impl ExtractedDocument {
@@ -1134,6 +1311,215 @@ mod tests {
 
         assert_eq!(name_results.len(), 1);
         assert_eq!(name_results[0].title, "report.txt");
+    }
+
+    #[test]
+    fn content_delta_atomically_replaces_upserts_and_removes_documents() {
+        let workspace = tempfile::tempdir().unwrap();
+        let changed = workspace.path().join("changed.txt");
+        let removed = workspace.path().join("removed.txt");
+        fs::write(&changed, "old needle").unwrap();
+        fs::write(&removed, "remove me haystack").unwrap();
+        let options = ContentIndexOptions {
+            index_dir: workspace.path().join("tantivy-content"),
+            max_file_bytes: DEFAULT_MAX_CONTENT_BYTES,
+        };
+        let mut original_entries = vec![entry(&changed), entry(&removed)];
+        let mut content_index =
+            ContentIndex::build(&mut original_entries, options.clone()).unwrap();
+
+        fs::write(&changed, "fresh replacement").unwrap();
+        let mut upserts = vec![entry(&changed)];
+        let outcome = content_index.apply_content_delta(
+            &mut upserts,
+            std::slice::from_ref(&removed),
+            &options,
+        );
+
+        assert!(outcome.failures.is_empty());
+        assert_eq!(
+            outcome
+                .updated_states
+                .get(&changed.to_string_lossy().to_string()),
+            Some(&ContentIndexState::Indexed)
+        );
+        assert_eq!(upserts[0].content_index_state, ContentIndexState::Indexed);
+        assert!(content_index.search("needle", None, 10).unwrap().is_empty());
+        assert!(content_index
+            .search("haystack", None, 10)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            content_index.search("replacement", None, 10).unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn content_delta_removes_directory_scope_on_path_boundaries() {
+        let workspace = tempfile::tempdir().unwrap();
+        let removed = workspace.path().join("docs");
+        let kept = workspace.path().join("docs-extra");
+        fs::create_dir_all(removed.join("nested")).unwrap();
+        fs::create_dir_all(&kept).unwrap();
+        let first = removed.join("first.txt");
+        let second = removed.join("nested/second.txt");
+        let survivor = kept.join("survivor.txt");
+        for path in [&first, &second, &survivor] {
+            fs::write(path, "directory needle").unwrap();
+        }
+        let options = ContentIndexOptions {
+            index_dir: workspace.path().join("tantivy-content"),
+            max_file_bytes: DEFAULT_MAX_CONTENT_BYTES,
+        };
+        let mut entries = vec![entry(&first), entry(&second), entry(&survivor)];
+        let mut content_index = ContentIndex::build(&mut entries, options.clone()).unwrap();
+
+        let outcome = content_index.apply_content_delta(&mut [], &[removed], &options);
+
+        assert!(outcome.failures.is_empty());
+        let hits = content_index.search("needle", None, 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, survivor.to_string_lossy());
+    }
+
+    #[test]
+    fn content_delta_records_read_failure_per_entry_without_top_level_error() {
+        let workspace = tempfile::tempdir().unwrap();
+        let file = workspace.path().join("unreadable.txt");
+        fs::write(&file, "stale needle").unwrap();
+        let options = ContentIndexOptions {
+            index_dir: workspace.path().join("tantivy-content"),
+            max_file_bytes: DEFAULT_MAX_CONTENT_BYTES,
+        };
+        let mut original_entries = vec![entry(&file)];
+        let mut content_index =
+            ContentIndex::build(&mut original_entries, options.clone()).unwrap();
+        fs::remove_file(&file).unwrap();
+        let mut upserts = vec![entry(&file)];
+
+        let outcome = content_index.apply_content_delta(&mut upserts, &[], &options);
+
+        assert_eq!(
+            upserts[0].content_index_state,
+            ContentIndexState::ReadFailed
+        );
+        assert_eq!(
+            outcome
+                .updated_states
+                .get(&file.to_string_lossy().to_string()),
+            Some(&ContentIndexState::ReadFailed)
+        );
+        assert_eq!(outcome.failures.len(), 1);
+        assert_eq!(outcome.failures[0].root, file.to_string_lossy());
+        assert!(content_index.search("needle", None, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn live_reader_sees_old_or_new_content_around_atomic_delta_commit() {
+        struct BlockingExtractor {
+            started: mpsc::SyncSender<()>,
+            release: Mutex<mpsc::Receiver<()>>,
+        }
+
+        impl TextExtractor for BlockingExtractor {
+            fn extract(&self, path: &Path, _max_bytes: u64) -> ContentExtractionResult {
+                self.started.send(()).unwrap();
+                self.release.lock().unwrap().recv().unwrap();
+                ContentExtractionResult::Text(fs::read_to_string(path).unwrap())
+            }
+        }
+
+        let workspace = tempfile::tempdir().unwrap();
+        let file = workspace.path().join("live.txt");
+        fs::write(&file, "old needle").unwrap();
+        let options = ContentIndexOptions {
+            index_dir: workspace.path().join("tantivy-content"),
+            max_file_bytes: DEFAULT_MAX_CONTENT_BYTES,
+        };
+        let mut entries = vec![entry(&file)];
+        let reader = ContentIndex::build(&mut entries, options.clone()).unwrap();
+        fs::write(&file, "new haystack").unwrap();
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let extractor = BlockingExtractor {
+            started: started_tx,
+            release: Mutex::new(release_rx),
+        };
+
+        std::thread::scope(|scope| {
+            let mut updater = reader.clone();
+            let mut upserts = vec![entry(&file)];
+            let update = scope.spawn(move || {
+                updater.apply_content_delta_with_extractor(&mut upserts, &[], &options, &extractor)
+            });
+            started_rx.recv().unwrap();
+            for _ in 0..50 {
+                assert_eq!(reader.search("needle", None, 10).unwrap().len(), 1);
+                assert!(reader.search("haystack", None, 10).unwrap().is_empty());
+            }
+            release_tx.send(()).unwrap();
+            assert!(update.join().unwrap().failures.is_empty());
+        });
+
+        assert!(reader.search("needle", None, 10).unwrap().is_empty());
+        assert_eq!(reader.search("haystack", None, 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn reserved_delta_turns_preserve_publish_order_when_workers_start_in_reverse() {
+        struct FixedExtractor(&'static str);
+
+        impl TextExtractor for FixedExtractor {
+            fn extract(&self, _path: &Path, _max_bytes: u64) -> ContentExtractionResult {
+                ContentExtractionResult::Text(self.0.to_owned())
+            }
+        }
+
+        let workspace = tempfile::tempdir().unwrap();
+        let file = workspace.path().join("ordered.txt");
+        fs::write(&file, "filesystem content is not used").unwrap();
+        let options = ContentIndexOptions {
+            index_dir: workspace.path().join("tantivy-content"),
+            max_file_bytes: DEFAULT_MAX_CONTENT_BYTES,
+        };
+        let index = ContentIndex::build(&mut [], options.clone()).unwrap();
+        let first_turn = index.reserve_delta_turn();
+        let second_turn = index.reserve_delta_turn();
+        let mut first_index = index.clone();
+        let mut second_index = index.clone();
+        let first_entry = entry(&file);
+        let second_entry = first_entry.clone();
+        let second_options = options.clone();
+        let (second_started_tx, second_started_rx) = mpsc::sync_channel(1);
+
+        std::thread::scope(|scope| {
+            let second = scope.spawn(move || {
+                second_started_tx.send(()).unwrap();
+                second_index.apply_content_delta_in_turn_with_extractor(
+                    second_turn,
+                    &mut [second_entry],
+                    &[],
+                    &second_options,
+                    &FixedExtractor("second beta"),
+                )
+            });
+            second_started_rx.recv().unwrap();
+            let first = scope.spawn(move || {
+                first_index.apply_content_delta_in_turn_with_extractor(
+                    first_turn,
+                    &mut [first_entry],
+                    &[],
+                    &options,
+                    &FixedExtractor("first alpha"),
+                )
+            });
+            assert!(first.join().unwrap().failures.is_empty());
+            assert!(second.join().unwrap().failures.is_empty());
+        });
+
+        assert!(index.search("alpha", None, 10).unwrap().is_empty());
+        assert_eq!(index.search("beta", None, 10).unwrap().len(), 1);
     }
 
     fn entry(path: &std::path::Path) -> IndexedEntry {
