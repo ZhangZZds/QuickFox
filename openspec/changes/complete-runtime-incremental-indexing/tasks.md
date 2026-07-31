@@ -40,8 +40,8 @@
 - [x] 6.1 将 coordinator 接入 `QuickFoxRuntime`，在 baseline/manifest 准备完成后启动 watcher 并把批次提交到 layered view
 - [x] 6.2 让自动增量配置默认开启；关闭时停止 watcher 但保留搜索，重新开启时先执行 root 校准
 - [x] 6.3 区分 watcher 开关变化与索引语义变化，后者触发带原因的后台全量重建
-- [ ] 6.4 扩展 `IndexStatus` 和 Tauri contract，暴露自动增量状态、pending/dirty 数、最近批次摘要和 degradation code，不暴露完整路径
-- [ ] 6.5 更新前端设置页的开关与基础状态文案，并验证索引状态事件继续走防抖、不会制造查询风暴
+- [x] 6.4 扩展 `IndexStatus` 和 Tauri contract，暴露自动增量状态、pending/dirty 数、最近批次摘要和 degradation code，不暴露完整路径
+- [x] 6.5 更新前端设置页的开关与基础状态文案，并验证索引状态事件继续走防抖、不会制造查询风暴
 - [ ] 6.6 将 name/path 增量与内容索引更新解耦，验证内容更新失败不回滚已成功的 name/path batch
 
 ## 7. 性能、事件风暴与恢复验证
