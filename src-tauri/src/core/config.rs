@@ -135,6 +135,33 @@ pub struct IndexConfig {
     pub watcher_enabled: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexConfigChange {
+    None,
+    WatcherOnly,
+    IndexSemantics,
+}
+
+pub fn classify_index_config_change(
+    before: &IndexConfig,
+    after: &IndexConfig,
+) -> IndexConfigChange {
+    let semantics_changed = before.include_dirs != after.include_dirs
+        || before.exclude_dirs != after.exclude_dirs
+        || before.exclude_patterns != after.exclude_patterns
+        || before.performance_mode != after.performance_mode
+        || before.respect_project_ignores != after.respect_project_ignores
+        || before.content_include_dirs != after.content_include_dirs
+        || before.content_max_file_bytes != after.content_max_file_bytes;
+    if semantics_changed {
+        IndexConfigChange::IndexSemantics
+    } else if before.watcher_enabled != after.watcher_enabled {
+        IndexConfigChange::WatcherOnly
+    } else {
+        IndexConfigChange::None
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum IndexPerformanceMode {
@@ -451,6 +478,52 @@ limit = 20
         assert!(config.index.respect_project_ignores);
         assert_eq!(config.index.content_max_file_bytes, 2 * 1024 * 1024);
         assert!(config.index.watcher_enabled);
+    }
+
+    #[test]
+    fn watcher_toggle_does_not_change_index_semantics() {
+        let before = QuickFoxConfig::default_with_index_dirs(vec!["/home/frank".to_owned()]);
+        let mut after = before.clone();
+        after.index.watcher_enabled = false;
+
+        assert_eq!(
+            classify_index_config_change(&before.index, &after.index),
+            IndexConfigChange::WatcherOnly
+        );
+    }
+
+    #[test]
+    fn identical_index_config_has_no_index_change() {
+        let config = QuickFoxConfig::default_with_index_dirs(vec!["/home/frank".to_owned()]);
+
+        assert_eq!(
+            classify_index_config_change(&config.index, &config.index),
+            IndexConfigChange::None
+        );
+    }
+
+    #[test]
+    fn every_index_semantic_field_requires_full_rebuild() {
+        type IndexConfigMutation = Box<dyn Fn(&mut IndexConfig)>;
+        let before = QuickFoxConfig::default_with_index_dirs(vec!["/home/frank".to_owned()]);
+        let mutations: Vec<IndexConfigMutation> = vec![
+            Box::new(|index| index.include_dirs.push("/srv".to_owned())),
+            Box::new(|index| index.exclude_dirs.push("/tmp".to_owned())),
+            Box::new(|index| index.exclude_patterns.push("dist".to_owned())),
+            Box::new(|index| index.performance_mode = IndexPerformanceMode::Complete),
+            Box::new(|index| index.respect_project_ignores = false),
+            Box::new(|index| index.content_include_dirs.push("/docs".to_owned())),
+            Box::new(|index| index.content_max_file_bytes += 1),
+        ];
+
+        for mutate in mutations {
+            let mut after = before.clone();
+            mutate(&mut after.index);
+            assert_eq!(
+                classify_index_config_change(&before.index, &after.index),
+                IndexConfigChange::IndexSemantics
+            );
+        }
     }
 
     #[test]

@@ -1,6 +1,9 @@
 //! Tauri-neutral runtime incremental indexing service.
 
-use crate::core::index_entry::{path_is_same_or_descendant_for_mode, PathComparisonMode};
+use crate::core::config::IndexConfigChange;
+use crate::core::index_entry::{
+    normalize_path_text_key, path_is_same_or_descendant_for_mode, PathComparisonMode,
+};
 use crate::core::index_entry::{IncrementalState, IndexDegradationCode, RuntimeIncrementalStatus};
 use crate::core::index_journal::IndexJournalRepository;
 use crate::core::index_update_coordinator::{
@@ -9,10 +12,12 @@ use crate::core::index_update_coordinator::{
 use crate::core::index_watcher::{RuntimeIndexWatcher, WatchEventInbox, WatcherFailure};
 use crate::core::layered_index::CommittedIndexDelta;
 use crate::core::targeted_index_scanner::{
-    TargetedIndexScanner, TargetedScanError, TargetedScanResult,
+    DirectoryFingerprint, DirectoryManifestReader, KnownDirectoryEntriesReader, KnownIndexedChild,
+    StdFileSystemProbe, TargetedIndexScanner, TargetedScanError, TargetedScanResult,
 };
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender, TryRecvError};
 use std::sync::Arc;
@@ -37,6 +42,52 @@ pub enum BaselineRefreshReason {
     DirtyRoots,
     WatcherFailure,
     CalibrationFailed,
+    ManifestUnavailable,
+    IndexConfigChanged,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrustedIncrementalState {
+    pub manifest_ready: bool,
+    pub dirty_roots: usize,
+}
+
+impl TrustedIncrementalState {
+    pub fn ready() -> Self {
+        Self {
+            manifest_ready: true,
+            dirty_roots: 0,
+        }
+    }
+
+    pub fn missing_manifest() -> Self {
+        Self {
+            manifest_ready: false,
+            dirty_roots: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshDecision {
+    FlushPendingThenCalibrateAllRoots,
+    FullRefresh(BaselineRefreshReason),
+}
+
+pub fn refresh_decision(
+    state: TrustedIncrementalState,
+    config_change: IndexConfigChange,
+) -> RefreshDecision {
+    if config_change == IndexConfigChange::IndexSemantics {
+        return RefreshDecision::FullRefresh(BaselineRefreshReason::IndexConfigChanged);
+    }
+    if !state.manifest_ready {
+        return RefreshDecision::FullRefresh(BaselineRefreshReason::ManifestUnavailable);
+    }
+    if state.dirty_roots > 0 {
+        return RefreshDecision::FullRefresh(BaselineRefreshReason::DirtyRoots);
+    }
+    RefreshDecision::FlushPendingThenCalibrateAllRoots
 }
 
 #[derive(Debug, Clone)]
@@ -52,6 +103,11 @@ pub struct RuntimeIndexingHandle {
     join: Option<JoinHandle<()>>,
     recovery_required: Arc<AtomicBool>,
     last_committed_generation: Arc<AtomicU64>,
+}
+
+#[derive(Clone)]
+pub struct RuntimeIndexingControl {
+    command: SyncSender<RuntimeIndexingCommand>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,10 +127,16 @@ enum RuntimeIndexingCommand {
     StopNow,
     Handoff,
     Fence(SyncSender<u64>),
+    FlushPendingThenCalibrateAllRoots(SyncSender<Result<u64, String>>),
     Resume,
 }
 
 impl RuntimeIndexingHandle {
+    pub fn control(&self) -> RuntimeIndexingControl {
+        RuntimeIndexingControl {
+            command: self.command.clone(),
+        }
+    }
     pub fn stop(mut self) {
         self.stop_and_join();
     }
@@ -103,6 +165,26 @@ impl RuntimeIndexingHandle {
             .map_err(|_| "runtime indexing worker is unavailable".to_owned())
     }
 
+    pub fn flush_pending_then_calibrate_all_roots(&mut self) -> Result<u64, String> {
+        self.control().flush_pending_then_calibrate_all_roots()
+    }
+}
+
+impl RuntimeIndexingControl {
+    pub fn flush_pending_then_calibrate_all_roots(&self) -> Result<u64, String> {
+        let (reply, response) = mpsc::sync_channel(1);
+        self.command
+            .send(RuntimeIndexingCommand::FlushPendingThenCalibrateAllRoots(
+                reply,
+            ))
+            .map_err(|_| "runtime indexing worker is unavailable".to_owned())?;
+        response.recv().map_err(|_| {
+            "runtime indexing worker stopped before manual calibration completed".to_owned()
+        })?
+    }
+}
+
+impl RuntimeIndexingHandle {
     fn finish_handoff(&mut self) -> RuntimeIndexingHandoff {
         if self.command.send(RuntimeIndexingCommand::Handoff).is_err() {
             self.recovery_required.store(true, Ordering::Release);
@@ -173,22 +255,165 @@ fn start_runtime_indexing_from_parts(
     )
 }
 
+#[cfg(test)]
+pub(crate) fn start_runtime_indexing_from_test_inbox(
+    inbox: WatchEventInbox,
+    scanner: TargetedIndexScanner,
+    journal: Box<dyn IndexJournalRepository + Send>,
+    options: RuntimeIndexingOptions,
+    publish: impl Fn(RuntimeIndexingEvent) + Send + 'static,
+) -> Result<RuntimeIndexingHandle, String> {
+    start_runtime_indexing_from_parts(None, inbox, scanner, journal, options, publish)
+}
+
 trait RuntimeBatchScanner: Send {
     fn scan_batch_cancellable(
         &self,
         batch: crate::core::index_update_coordinator::CoordinatorBatch,
+        journal: &dyn IndexJournalRepository,
         is_cancelled: &dyn Fn() -> bool,
     ) -> Result<TargetedScanResult, TargetedScanError>;
+}
+
+struct JournalCalibrationReader<'a>(&'a dyn IndexJournalRepository);
+
+impl DirectoryManifestReader for JournalCalibrationReader<'_> {
+    fn directories_for_root(
+        &self,
+        root: &std::path::Path,
+    ) -> Result<Vec<DirectoryFingerprint>, String> {
+        self.0.directory_manifest_for_root(root)
+    }
+}
+
+impl KnownDirectoryEntriesReader for JournalCalibrationReader<'_> {
+    fn entries_for_directory(
+        &self,
+        root: &std::path::Path,
+        directory: &std::path::Path,
+    ) -> Result<Vec<KnownIndexedChild>, String> {
+        self.0.known_direct_indexed_children(root, directory)
+    }
 }
 
 impl RuntimeBatchScanner for TargetedIndexScanner {
     fn scan_batch_cancellable(
         &self,
         batch: crate::core::index_update_coordinator::CoordinatorBatch,
+        journal: &dyn IndexJournalRepository,
         is_cancelled: &dyn Fn() -> bool,
     ) -> Result<TargetedScanResult, TargetedScanError> {
-        TargetedIndexScanner::scan_batch_cancellable(self, batch, is_cancelled)
+        let dirty_roots = batch.dirty_roots.clone();
+        let mut result = TargetedIndexScanner::scan_batch_cancellable(self, batch, is_cancelled)?;
+        let reader = JournalCalibrationReader(journal);
+        for root in dirty_roots {
+            let calibration = self.calibrate_root_cancellable(
+                &StdFileSystemProbe,
+                &reader,
+                &reader,
+                &root,
+                is_cancelled,
+            )?;
+            merge_targeted_scan_result(&mut result, calibration);
+        }
+        Ok(result)
     }
+}
+
+fn merge_targeted_scan_result(target: &mut TargetedScanResult, source: TargetedScanResult) {
+    let _ = merge_targeted_scan_result_with_work(target, source);
+}
+
+fn merge_targeted_scan_result_with_work(
+    target: &mut TargetedScanResult,
+    source: TargetedScanResult,
+) -> usize {
+    let TargetedScanResult {
+        upserts: source_upserts,
+        removals: source_removals,
+        manifest_upserts: source_manifest_upserts,
+        manifest_removals: source_manifest_removals,
+        mut failures,
+    } = source;
+    let mut work = 0;
+    let mut entry_upserts: BTreeMap<String, _> = std::mem::take(&mut target.upserts)
+        .into_iter()
+        .map(|entry| (normalize_path_text_key(&entry.path), entry))
+        .collect();
+    let mut entry_removals: BTreeMap<String, _> = std::mem::take(&mut target.removals)
+        .into_iter()
+        .chain(source_removals)
+        .map(|path| (normalized_path_key(&path), path))
+        .collect();
+    collapse_descendant_removals(&mut entry_removals, &mut work);
+    entry_upserts.retain(|_, entry| {
+        !has_removal_ancestor(&entry_removals, Path::new(&entry.path), &mut work)
+    });
+    for upsert in source_upserts {
+        remove_ancestor_removals(&mut entry_removals, Path::new(&upsert.path), &mut work);
+        entry_upserts.insert(normalize_path_text_key(&upsert.path), upsert);
+    }
+
+    let mut manifest_upserts: BTreeMap<String, _> = std::mem::take(&mut target.manifest_upserts)
+        .into_iter()
+        .map(|row| (normalize_path_text_key(&row.path), row))
+        .collect();
+    let mut manifest_removals: BTreeMap<String, _> = std::mem::take(&mut target.manifest_removals)
+        .into_iter()
+        .chain(source_manifest_removals)
+        .map(|path| (normalized_path_key(&path), path))
+        .collect();
+    collapse_descendant_removals(&mut manifest_removals, &mut work);
+    manifest_upserts.retain(|_, row| {
+        !has_removal_ancestor(&manifest_removals, Path::new(&row.path), &mut work)
+    });
+    for upsert in source_manifest_upserts {
+        remove_ancestor_removals(&mut manifest_removals, Path::new(&upsert.path), &mut work);
+        manifest_upserts.insert(normalize_path_text_key(&upsert.path), upsert);
+    }
+
+    target.upserts = entry_upserts.into_values().collect();
+    target.removals = entry_removals.into_values().collect();
+    target.manifest_upserts = manifest_upserts.into_values().collect();
+    target.manifest_removals = manifest_removals.into_values().collect();
+    target.failures.append(&mut failures);
+    work
+}
+
+fn normalized_path_key(path: &Path) -> String {
+    normalize_path_text_key(&path.to_string_lossy())
+}
+
+fn has_removal_ancestor(
+    removals: &BTreeMap<String, PathBuf>,
+    path: &Path,
+    work: &mut usize,
+) -> bool {
+    path.ancestors().any(|ancestor| {
+        *work = work.saturating_add(1);
+        removals.contains_key(&normalized_path_key(ancestor))
+    })
+}
+
+fn remove_ancestor_removals(
+    removals: &mut BTreeMap<String, PathBuf>,
+    path: &Path,
+    work: &mut usize,
+) {
+    for ancestor in path.ancestors() {
+        *work = work.saturating_add(1);
+        removals.remove(&normalized_path_key(ancestor));
+    }
+}
+
+fn collapse_descendant_removals(removals: &mut BTreeMap<String, PathBuf>, work: &mut usize) {
+    let keys: BTreeSet<_> = removals.keys().cloned().collect();
+    removals.retain(|_, path| {
+        !path.ancestors().skip(1).any(|ancestor| {
+            *work = work.saturating_add(1);
+            keys.contains(&normalized_path_key(ancestor))
+        })
+    });
 }
 
 fn start_runtime_indexing_with_scanner(
@@ -277,6 +502,10 @@ impl RuntimeIndexingService {
                         return;
                     }
                 }
+                Ok(RuntimeIndexingCommand::FlushPendingThenCalibrateAllRoots(reply)) => {
+                    let result = self.flush_pending_then_calibrate_all_roots();
+                    let _ = reply.send(result);
+                }
                 Ok(RuntimeIndexingCommand::Resume) => {}
                 Ok(RuntimeIndexingCommand::StopNow) | Err(TryRecvError::Disconnected) => return,
                 Err(TryRecvError::Empty) => {}
@@ -338,6 +567,12 @@ impl RuntimeIndexingService {
                 Ok(RuntimeIndexingCommand::Fence(reply)) => {
                     let _ = reply.send(self.last_committed_generation.load(Ordering::Acquire));
                 }
+                Ok(RuntimeIndexingCommand::FlushPendingThenCalibrateAllRoots(reply)) => {
+                    let _ = reply.send(Err(
+                        "runtime indexing worker is fenced for a configuration transition"
+                            .to_owned(),
+                    ));
+                }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
         }
@@ -354,6 +589,30 @@ impl RuntimeIndexingService {
             };
             self.accept_event(event, Instant::now());
         }
+    }
+
+    fn flush_pending_then_calibrate_all_roots(&mut self) -> Result<u64, String> {
+        self.finish_fence();
+        if self.recovery_required.load(Ordering::Acquire) {
+            return Err("pending runtime indexing state requires full refresh".to_owned());
+        }
+        self.status.state = IncrementalState::Calibrating;
+        self.status.dirty_roots = self.roots.len();
+        self.publish_status();
+        let now = Instant::now();
+        for root in &self.roots {
+            self.coordinator.mark_dirty_root(root.clone(), now);
+        }
+        self.commit_ready_batch();
+        if self.recovery_required.load(Ordering::Acquire) {
+            return Err("manual root calibration requires full refresh".to_owned());
+        }
+        self.degraded_roots.clear();
+        self.status.state = IncrementalState::Watching;
+        self.status.dirty_roots = 0;
+        self.status.degradation_code = None;
+        self.publish_status();
+        Ok(self.last_committed_generation.load(Ordering::Acquire))
     }
 
     fn accept_event(&mut self, event: crate::core::index_watcher::IndexWatchEvent, now: Instant) {
@@ -404,7 +663,7 @@ impl RuntimeIndexingService {
             .changed_paths
             .len()
             .saturating_add(batch.removed_paths.len());
-        if entry_count == 0 {
+        if entry_count == 0 && dirty_roots.is_empty() {
             self.status.pending_events = 0;
             self.status.dirty_roots = dirty_root_count;
             self.publish_status();
@@ -412,24 +671,29 @@ impl RuntimeIndexingService {
         }
 
         let started = Instant::now();
-        let scanned = match self
-            .scanner
-            .scan_batch_cancellable(batch, &|| self.shutdown.is_requested())
-        {
-            Ok(scanned) => scanned,
-            Err(TargetedScanError::Cancelled) => return,
-            Err(TargetedScanError::Io(_)) => {
-                self.degraded_roots.extend(self.roots.iter().cloned());
-                self.publish_calibration_failure(self.degraded_roots.len());
-                return;
-            }
-        };
+        let scanned =
+            match self
+                .scanner
+                .scan_batch_cancellable(batch, self.journal.as_ref(), &|| {
+                    self.shutdown.is_requested()
+                }) {
+                Ok(scanned) => scanned,
+                Err(TargetedScanError::Cancelled) => return,
+                Err(TargetedScanError::Io(_)) => {
+                    self.degraded_roots.extend(self.roots.iter().cloned());
+                    self.publish_calibration_failure(self.degraded_roots.len());
+                    return;
+                }
+            };
         let failed_roots = self.failed_configured_roots(&scanned.failures);
         let failed_root_count = failed_roots.len();
         self.degraded_roots.extend(failed_roots.iter().cloned());
         dirty_roots.extend(failed_roots);
-        let has_successful_delta = !scanned.upserts.is_empty() || !scanned.removals.is_empty();
-        if !has_successful_delta {
+        let has_durable_changes = !scanned.upserts.is_empty()
+            || !scanned.removals.is_empty()
+            || !scanned.manifest_upserts.is_empty()
+            || !scanned.manifest_removals.is_empty();
+        if !has_durable_changes {
             if failed_root_count > 0 {
                 self.publish_calibration_failure(dirty_roots.len());
             } else {
@@ -585,6 +849,42 @@ mod tests {
     use std::time::Duration;
     use tempfile::TempDir;
 
+    #[test]
+    fn manual_refresh_uses_manifest_calibration_when_state_is_trusted() {
+        assert_eq!(
+            refresh_decision(TrustedIncrementalState::ready(), IndexConfigChange::None),
+            RefreshDecision::FlushPendingThenCalibrateAllRoots
+        );
+    }
+
+    #[test]
+    fn missing_dirty_or_semantic_state_uses_full_refresh_with_reason() {
+        assert_eq!(
+            refresh_decision(
+                TrustedIncrementalState::missing_manifest(),
+                IndexConfigChange::None
+            ),
+            RefreshDecision::FullRefresh(BaselineRefreshReason::ManifestUnavailable)
+        );
+        assert_eq!(
+            refresh_decision(
+                TrustedIncrementalState {
+                    manifest_ready: true,
+                    dirty_roots: 1,
+                },
+                IndexConfigChange::None
+            ),
+            RefreshDecision::FullRefresh(BaselineRefreshReason::DirtyRoots)
+        );
+        assert_eq!(
+            refresh_decision(
+                TrustedIncrementalState::ready(),
+                IndexConfigChange::IndexSemantics
+            ),
+            RefreshDecision::FullRefresh(BaselineRefreshReason::IndexConfigChanged)
+        );
+    }
+
     struct FixedScanner(Mutex<VecDeque<Result<TargetedScanResult, TargetedScanError>>>);
 
     impl FixedScanner {
@@ -609,6 +909,7 @@ mod tests {
         fn scan_batch_cancellable(
             &self,
             _batch: crate::core::index_update_coordinator::CoordinatorBatch,
+            _journal: &dyn IndexJournalRepository,
             _is_cancelled: &dyn Fn() -> bool,
         ) -> Result<TargetedScanResult, TargetedScanError> {
             self.0.lock().unwrap().pop_front().expect("scripted scan")
@@ -825,6 +1126,169 @@ mod tests {
             .search("new")
             .iter()
             .any(|result| result.title == "new.md"));
+    }
+
+    #[test]
+    fn manual_calibration_flushes_pending_events_and_scans_every_root() {
+        let root = tempfile::tempdir().unwrap();
+        let discovered = root.path().join("manual.md");
+        fs::write(&discovered, "manual").unwrap();
+        let scanner = FixedScanner::returning(TargetedScanResult {
+            upserts: vec![IndexedEntry::from_path_metadata(
+                &discovered,
+                root.path(),
+                IndexedEntryKind::File,
+            )],
+            ..TargetedScanResult::default()
+        });
+        let (_sender, handle, events, database_path) = start_fixed_scanner(&root, scanner);
+
+        let generation = handle
+            .control()
+            .flush_pending_then_calibrate_all_roots()
+            .expect("manual calibration succeeds");
+        handle.stop();
+
+        assert_eq!(generation, 1);
+        assert!(events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            RuntimeIndexingEvent::DeltaCommitted(delta)
+                if delta.upserts.iter().any(|entry| entry.path == discovered.to_string_lossy())
+        )));
+        assert_eq!(
+            SqliteStorage::open(database_path)
+                .unwrap()
+                .highest_committed_generation()
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn dirty_root_calibration_folds_same_queued_path_without_duplicate_journal_rows() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("same.md");
+        fs::write(&path, "old").unwrap();
+        let queued = IndexedEntry::from_path_metadata(&path, root.path(), IndexedEntryKind::File);
+        fs::write(&path, "new calibration value").unwrap();
+        let calibrated =
+            IndexedEntry::from_path_metadata(&path, root.path(), IndexedEntryKind::File);
+        let root_text = root.path().to_string_lossy().into_owned();
+        let fingerprint = DirectoryFingerprint {
+            path: root_text.clone(),
+            parent: None,
+            root: root_text,
+            modified_ms: Some(2),
+        };
+        let mut merged = TargetedScanResult {
+            upserts: vec![queued],
+            removals: vec![path.clone()],
+            manifest_upserts: vec![DirectoryFingerprint {
+                modified_ms: Some(1),
+                ..fingerprint.clone()
+            }],
+            manifest_removals: vec![PathBuf::from(&fingerprint.path)],
+            failures: Vec::new(),
+        };
+
+        merge_targeted_scan_result(
+            &mut merged,
+            TargetedScanResult {
+                upserts: vec![calibrated.clone()],
+                manifest_upserts: vec![fingerprint.clone()],
+                ..TargetedScanResult::default()
+            },
+        );
+
+        assert_eq!(merged.upserts, vec![calibrated]);
+        assert!(merged.removals.is_empty());
+        assert_eq!(merged.manifest_upserts, vec![fingerprint]);
+        assert!(merged.manifest_removals.is_empty());
+        let storage = SqliteStorage::open(root.path().join("folded.sqlite")).unwrap();
+        let baseline_id = storage.save_completed_index_batch(1, &[]).unwrap();
+        storage
+            .activate_baseline_with_manifest_and_clear_incremental_state(
+                baseline_id,
+                0,
+                &merged.manifest_upserts,
+            )
+            .unwrap();
+        storage
+            .commit_incremental_batch(
+                &CommittedIndexDelta {
+                    generation: 1,
+                    upserts: merged.upserts,
+                    removals: merged.removals,
+                },
+                &merged.manifest_upserts,
+                &merged.manifest_removals,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn dirty_root_large_merge_uses_bounded_ancestor_work() {
+        let count = 10_000;
+        let mut target = TargetedScanResult {
+            upserts: (0..count)
+                .map(|index| {
+                    IndexedEntry::legacy(
+                        format!("/tmp/root/file-{index}.md"),
+                        format!("file-{index}.md"),
+                        IndexedEntryKind::File,
+                    )
+                })
+                .collect(),
+            ..TargetedScanResult::default()
+        };
+        let source = TargetedScanResult {
+            upserts: (0..count)
+                .map(|index| {
+                    IndexedEntry::legacy(
+                        format!("/tmp/root/file-{index}.md"),
+                        format!("file-{index}.md"),
+                        IndexedEntryKind::File,
+                    )
+                })
+                .collect(),
+            ..TargetedScanResult::default()
+        };
+
+        let ancestor_work = merge_targeted_scan_result_with_work(&mut target, source);
+
+        assert_eq!(target.upserts.len(), count);
+        assert!(ancestor_work <= count * 10);
+    }
+
+    #[test]
+    fn manual_calibration_persists_manifest_only_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let root_text = root.path().to_string_lossy().into_owned();
+        let scanner = FixedScanner::returning(TargetedScanResult {
+            manifest_upserts: vec![DirectoryFingerprint {
+                path: root_text.clone(),
+                parent: None,
+                root: root_text,
+                modified_ms: Some(42),
+            }],
+            ..TargetedScanResult::default()
+        });
+        let (_sender, mut handle, _events, database_path) = start_fixed_scanner(&root, scanner);
+
+        let generation = handle
+            .flush_pending_then_calibrate_all_roots()
+            .expect("manifest-only calibration succeeds");
+        handle.stop();
+
+        assert_eq!(generation, 1);
+        assert_eq!(
+            SqliteStorage::open(database_path)
+                .unwrap()
+                .directory_manifest_for_root(root.path())
+                .unwrap()[0]
+                .modified_ms,
+            Some(42)
+        );
     }
 
     #[test]
@@ -1283,6 +1747,7 @@ mod tests {
             fn scan_batch_cancellable(
                 &self,
                 _batch: crate::core::index_update_coordinator::CoordinatorBatch,
+                _journal: &dyn IndexJournalRepository,
                 is_cancelled: &dyn Fn() -> bool,
             ) -> Result<TargetedScanResult, TargetedScanError> {
                 self.entered.store(true, Ordering::Release);
@@ -1606,6 +2071,7 @@ mod tests {
             fn scan_batch_cancellable(
                 &self,
                 _batch: crate::core::index_update_coordinator::CoordinatorBatch,
+                _journal: &dyn IndexJournalRepository,
                 _is_cancelled: &dyn Fn() -> bool,
             ) -> Result<TargetedScanResult, TargetedScanError> {
                 panic!("injected handoff worker panic")
