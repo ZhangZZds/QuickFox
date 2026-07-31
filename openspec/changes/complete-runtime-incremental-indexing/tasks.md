@@ -46,10 +46,10 @@
 
 ## 7. 性能、事件风暴与恢复验证
 
-- [ ] 7.1 增加 2,000,000 baseline 加 10,000 overlay/tombstone 的 ignored release benchmark，验证查询 P95 小于等于 50ms
-- [ ] 7.2 增加增量 batch benchmark，输出条目数、提交耗时、分层数量、查询延迟和估算内存
-- [ ] 7.3 增加事件风暴测试，证明 channel 不超过 8192、root 会标 dirty 且最近可用搜索视图保持可用
-- [ ] 7.4 增加旧快照迁移、重复 journal 重放、损坏 journal、权限失败、取消和 baseline refresh 失败的集成测试
+- [x] 7.1 增加 2,000,000 baseline 加 10,000 overlay/tombstone 的 ignored release benchmark，验证查询 P95 小于等于 50ms
+- [x] 7.2 增加增量 batch benchmark，输出条目数、提交耗时、分层数量、查询延迟和估算内存
+- [x] 7.3 增加事件风暴测试，证明 channel 不超过 8192、root 会标 dirty 且最近可用搜索视图保持可用
+- [x] 7.4 增加旧快照迁移、重复 journal 重放、损坏 journal、权限失败、取消和 baseline refresh 失败的集成测试
 - [ ] 7.5 更新 macOS 与 Windows 手工 QA，记录普通变化耗时、批量 Git checkout、休眠唤醒、root 断开和 watcher 失败恢复
 
 ## 8. 文档、验证与交付
