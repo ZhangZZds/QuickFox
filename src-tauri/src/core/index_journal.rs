@@ -642,6 +642,43 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_recovery_retry_replays_committed_journal_idempotently() {
+        let path = temp_db_path("sqlite-idempotent-recovery-retry");
+        let storage = SqliteStorage::open(path.clone()).unwrap();
+        let baseline_id = storage
+            .save_completed_index_batch(10, &[entry("/root/baseline.md")])
+            .unwrap();
+        storage.activate_baseline(baseline_id, 0).unwrap();
+        storage
+            .commit_incremental_batch(
+                &delta(
+                    1,
+                    entry("/root/current.md"),
+                    vec![PathBuf::from("/root/baseline.md")],
+                ),
+                &[],
+                &[],
+            )
+            .unwrap();
+
+        let first = recover_layered_index(&storage);
+        let second = recover_layered_index(&storage);
+
+        assert_eq!(
+            first.index.materialized_entries(),
+            second.index.materialized_entries()
+        );
+        assert_eq!(search_titles(&first.index, "current"), vec!["current.md"]);
+        assert!(search_titles(&first.index, "baseline").is_empty());
+        assert_eq!(first.index.generation(), 1);
+        assert_eq!(second.index.generation(), 1);
+        assert_eq!(storage.committed_index_deltas_after(0).unwrap().len(), 1);
+
+        drop(storage);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn malformed_journal_returns_recovery_failure_without_deleting_baseline() {
         let path = temp_db_path("malformed-recovery");
         let storage = SqliteStorage::open(path.clone()).unwrap();

@@ -6360,6 +6360,7 @@ mod tests {
     use super::*;
     use crate::core::index_watcher::IndexWatchEvent;
     use crate::core::layered_index::CommittedIndexDelta;
+    use crate::core::search::{QueryRequest, SearchMode};
     use std::cell::Cell;
     use std::fs;
     use std::sync::Arc;
@@ -7370,6 +7371,77 @@ mod tests {
         }
         assert!(finish_current_index_refresh(&state, &identity));
         assert!(!finish_current_index_refresh(&state, &identity));
+    }
+
+    #[test]
+    fn baseline_persistence_failure_keeps_existing_overlay_and_tombstone_view() {
+        let root = PathBuf::from("/tmp/runtime-persistence-view");
+        let kept = IndexedEntry::legacy(
+            root.join("kept.md").to_string_lossy(),
+            "kept.md",
+            crate::core::index::IndexedEntryKind::File,
+        );
+        let removed_path = root.join("removed.md");
+        let removed = IndexedEntry::legacy(
+            removed_path.to_string_lossy(),
+            "removed.md",
+            crate::core::index::IndexedEntryKind::File,
+        );
+        let overlay = IndexedEntry::legacy(
+            root.join("overlay.md").to_string_lossy(),
+            "overlay.md",
+            crate::core::index::IndexedEntryKind::File,
+        );
+        let mut index = LayeredSearchIndex::from_baseline(vec![kept, removed]);
+        index.apply_delta(CommittedIndexDelta {
+            generation: 1,
+            upserts: vec![overlay],
+            removals: vec![removed_path],
+        });
+        let mut runtime =
+            build_runtime_from_snapshot(QuickFoxConfig::default_with_index_dirs(Vec::new()), None);
+        runtime.index = index;
+        runtime.index_lifecycle = IndexLifecycle::from_ready(2, 1);
+        let refresh_generation = runtime.index_lifecycle.start_refresh(true);
+        let state = QuickFoxAppState {
+            runtime: Mutex::new(runtime),
+            index_refresh_fence: Mutex::new(()),
+            window_state: Mutex::new(LauncherWindowState::default()),
+            global_hotkey_status: Mutex::new(pending_global_hotkey_status()),
+        };
+
+        let application = apply_baseline_persistence_outcome(
+            &state,
+            refresh_generation,
+            1,
+            BaselinePersistenceOutcome::Failed("injected persistence failure".to_owned()),
+            2,
+        )
+        .expect("current persistence failure applies");
+
+        assert!(!application.completed);
+        let runtime = state.runtime.lock().unwrap();
+        assert_eq!(runtime.index.generation(), 1);
+        assert_eq!(runtime.index.overlay_entry_count(), 1);
+        assert_eq!(runtime.index.tombstone_entry_count(), 1);
+        assert_eq!(
+            runtime
+                .index
+                .search(&QueryRequest::new("kept", SearchMode::Normal), 20)
+                .len(),
+            1
+        );
+        assert_eq!(
+            runtime
+                .index
+                .search(&QueryRequest::new("overlay", SearchMode::Normal), 20)
+                .len(),
+            1
+        );
+        assert!(runtime
+            .index
+            .search(&QueryRequest::new("removed", SearchMode::Normal), 20)
+            .is_empty());
     }
 
     #[test]

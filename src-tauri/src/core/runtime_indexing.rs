@@ -854,6 +854,17 @@ mod tests {
     use std::time::Duration;
     use tempfile::TempDir;
 
+    fn wait_until(description: &str, condition: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !condition() {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {description}"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     #[test]
     fn manual_refresh_uses_manifest_calibration_when_state_is_trusted() {
         assert_eq!(
@@ -1036,8 +1047,16 @@ mod tests {
             );
         }
 
-        fn advance(&self, duration: Duration) {
-            thread::sleep(duration);
+        fn wait_until_processed(&self) {
+            wait_until("runtime event processing", || {
+                self.events.lock().unwrap().iter().any(|event| {
+                    matches!(
+                        event,
+                        RuntimeIndexingEvent::DeltaCommitted(_)
+                            | RuntimeIndexingEvent::BaselineRefreshRequired { .. }
+                    )
+                })
+            });
         }
 
         fn take_published_delta(&self) -> Option<CommittedIndexDelta> {
@@ -1122,7 +1141,7 @@ mod tests {
         let path = harness.create_file("new.md");
 
         harness.push(IndexWatchEvent::Create(path));
-        harness.advance(Duration::from_millis(100));
+        harness.wait_until_processed();
 
         let published = harness.take_published_delta().expect("delta published");
         assert_eq!(published.upserts[0].name, "new.md");
@@ -1165,7 +1184,17 @@ mod tests {
         )
         .unwrap();
 
-        thread::sleep(Duration::from_millis(100));
+        wait_until("watcher failure status", || {
+            events.lock().unwrap().iter().any(|event| {
+                matches!(
+                    event,
+                    RuntimeIndexingEvent::Status(RuntimeIncrementalStatus {
+                        degradation_code: Some(IndexDegradationCode::WatcherRuntimeFailed),
+                        ..
+                    })
+                )
+            })
+        });
         handle.stop();
 
         let statuses: Vec<_> = events
@@ -1352,7 +1381,7 @@ mod tests {
         let path = harness.create_file("visible.md");
 
         harness.push(IndexWatchEvent::Create(path));
-        harness.advance(Duration::from_millis(100));
+        harness.wait_until_processed();
 
         assert_eq!(harness.journal_generations(), vec![1]);
         assert!(harness
@@ -1373,7 +1402,7 @@ mod tests {
         let failed_path = harness.create_file("failed.md");
 
         harness.push(IndexWatchEvent::Create(failed_path));
-        harness.advance(Duration::from_millis(100));
+        harness.wait_until_processed();
 
         assert!(harness.committed_deltas().is_empty());
         assert!(harness.statuses().iter().any(|status| {
@@ -1443,7 +1472,7 @@ mod tests {
         let harness = RuntimeIndexingHarness::new_with_apply(false);
         let path = harness.create_file("recover-after-crash.md");
         harness.push(IndexWatchEvent::Create(path));
-        harness.advance(Duration::from_millis(100));
+        harness.wait_until_processed();
         assert!(harness.search("recover-after-crash").is_empty());
         harness.stop();
 
@@ -1463,7 +1492,7 @@ mod tests {
         let harness = RuntimeIndexingHarness::new_with_apply(false);
         let path = harness.create_file("handoff.md");
         harness.push(IndexWatchEvent::Create(path));
-        harness.advance(Duration::from_millis(100));
+        harness.wait_until_processed();
         let queued_delta = harness
             .take_published_delta()
             .expect("worker committed delta");
@@ -1513,7 +1542,7 @@ mod tests {
         let harness = RuntimeIndexingHarness::new();
         let path = harness.create_file("idempotent.md");
         harness.push(IndexWatchEvent::Create(path));
-        harness.advance(Duration::from_millis(100));
+        harness.wait_until_processed();
         assert_eq!(harness.search("idempotent").len(), 1);
         harness.stop();
 
@@ -1594,7 +1623,16 @@ mod tests {
             sender.try_send(IndexWatchEvent::Write(accepted)),
             crate::core::index_watcher::WatchSendOutcome::Queued
         );
-        thread::sleep(Duration::from_millis(100));
+        wait_until("partial scan fallback", || {
+            events.lock().unwrap().iter().any(|event| {
+                matches!(
+                    event,
+                    RuntimeIndexingEvent::BaselineRefreshRequired {
+                        reason: BaselineRefreshReason::CalibrationFailed
+                    }
+                )
+            })
+        });
         handle.stop();
         let events = events.lock().unwrap();
 
@@ -1640,15 +1678,16 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let old_path = root.path().join("old.md");
         fs::write(&old_path, "old").unwrap();
-        let mut old_view = LayeredSearchIndex::default();
-        old_view.replace_baseline(
-            vec![IndexedEntry::from_path_metadata(
-                &old_path,
-                root.path(),
-                IndexedEntryKind::File,
-            )],
-            0,
-        );
+        let old_entry =
+            IndexedEntry::from_path_metadata(&old_path, root.path(), IndexedEntryKind::File);
+        let database_path = root.path().join("permission-failure.sqlite");
+        let storage = SqliteStorage::open(database_path.clone()).unwrap();
+        let baseline_id = storage
+            .save_completed_index_batch(1, std::slice::from_ref(&old_entry))
+            .unwrap();
+        storage
+            .activate_baseline_and_clear_incremental_state(baseline_id, 0)
+            .unwrap();
         let scanner = FixedScanner::returning(TargetedScanResult {
             failures: vec![IndexFailure {
                 root: root.path().join("locked").to_string_lossy().into_owned(),
@@ -1656,13 +1695,47 @@ mod tests {
             }],
             ..TargetedScanResult::default()
         });
-        let (sender, handle, events, database_path) = start_fixed_scanner(&root, scanner);
+        let roots = vec![root.path().to_path_buf()];
+        let (sender, inbox) = WatchEventInbox::bounded(roots.clone(), 4);
+        let view = Arc::new(Mutex::new(LayeredSearchIndex::from_baseline(vec![
+            old_entry,
+        ])));
+        let published_view = Arc::clone(&view);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let published_events = Arc::clone(&events);
+        let handle = start_runtime_indexing_with_scanner(
+            None,
+            inbox,
+            Box::new(scanner),
+            Box::new(storage),
+            RuntimeIndexingOptions {
+                roots,
+                policy: CoordinatorPolicy::new(Duration::ZERO, Duration::ZERO),
+                initial_generation: 0,
+            },
+            move |event| {
+                if let RuntimeIndexingEvent::DeltaCommitted(delta) = &event {
+                    published_view.lock().unwrap().apply_delta(delta.clone());
+                }
+                published_events.lock().unwrap().push(event);
+            },
+        )
+        .unwrap();
 
         assert_eq!(
             sender.try_send(IndexWatchEvent::Write(root.path().join("locked"))),
             crate::core::index_watcher::WatchSendOutcome::Queued
         );
-        thread::sleep(Duration::from_millis(100));
+        wait_until("permission failure fallback", || {
+            events.lock().unwrap().iter().any(|event| {
+                matches!(
+                    event,
+                    RuntimeIndexingEvent::BaselineRefreshRequired {
+                        reason: BaselineRefreshReason::CalibrationFailed
+                    }
+                )
+            })
+        });
         handle.stop();
 
         let events = events.lock().unwrap();
@@ -1694,10 +1767,10 @@ mod tests {
             .committed_index_deltas_after(0)
             .unwrap()
             .is_empty());
-        assert_eq!(old_view.generation(), 0);
+        let view = view.lock().unwrap();
+        assert_eq!(view.generation(), 0);
         assert_eq!(
-            old_view
-                .search_files(&QueryRequest::new("old", SearchMode::Normal), 20)
+            view.search_files(&QueryRequest::new("old", SearchMode::Normal), 20)
                 .len(),
             1
         );
@@ -1716,12 +1789,28 @@ mod tests {
         let scanner = FixedScanner::returning_many([failure_result(), failure_result()]);
         let (sender, handle, events, _database_path) = start_fixed_scanner(&root, scanner);
 
-        for name in ["first", "second"] {
+        for (expected_failures, name) in ["first", "second"].into_iter().enumerate() {
             assert_eq!(
                 sender.try_send(IndexWatchEvent::Write(root.path().join(name))),
                 crate::core::index_watcher::WatchSendOutcome::Queued
             );
-            thread::sleep(Duration::from_millis(75));
+            wait_until("scripted scan failure", || {
+                events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|event| {
+                        matches!(
+                            event,
+                            RuntimeIndexingEvent::Status(RuntimeIncrementalStatus {
+                                degradation_code: Some(IndexDegradationCode::CalibrationFailed),
+                                ..
+                            })
+                        )
+                    })
+                    .count()
+                    > expected_failures
+            });
         }
         handle.stop();
         let events = events.lock().unwrap();
@@ -1766,7 +1855,16 @@ mod tests {
             sender.try_send(IndexWatchEvent::Write(root.path().join("locked"))),
             crate::core::index_watcher::WatchSendOutcome::Queued
         );
-        thread::sleep(Duration::from_millis(100));
+        wait_until("scan io fallback", || {
+            events.lock().unwrap().iter().any(|event| {
+                matches!(
+                    event,
+                    RuntimeIndexingEvent::BaselineRefreshRequired {
+                        reason: BaselineRefreshReason::CalibrationFailed
+                    }
+                )
+            })
+        });
         handle.stop();
         let events = events.lock().unwrap();
 
@@ -1821,7 +1919,7 @@ mod tests {
             entered: Arc::clone(&entered),
             cancelled: Arc::clone(&cancelled),
         };
-        let (sender, handle, _events, _database_path) = start_fixed_scanner(&root, scanner);
+        let (sender, handle, events, database_path) = start_fixed_scanner(&root, scanner);
         assert_eq!(
             sender.try_send(IndexWatchEvent::Write(root.path().join("busy"))),
             crate::core::index_watcher::WatchSendOutcome::Queued
@@ -1837,6 +1935,16 @@ mod tests {
 
         assert!(cancelled.load(Ordering::Acquire));
         assert!(stop_started.elapsed() <= Duration::from_millis(250));
+        assert!(events
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|event| !matches!(event, RuntimeIndexingEvent::DeltaCommitted(_))));
+        assert!(SqliteStorage::open(database_path)
+            .unwrap()
+            .committed_index_deltas_after(0)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -1877,7 +1985,16 @@ mod tests {
             move |event| published.lock().unwrap().push(event),
         )
         .unwrap();
-        thread::sleep(Duration::from_millis(100));
+        wait_until("watcher channel overflow fallback", || {
+            events.lock().unwrap().iter().any(|event| {
+                matches!(
+                    event,
+                    RuntimeIndexingEvent::BaselineRefreshRequired {
+                        reason: BaselineRefreshReason::DirtyRoots
+                    }
+                )
+            })
+        });
         handle.stop();
         let events = events.lock().unwrap();
 
@@ -1931,7 +2048,16 @@ mod tests {
         )
         .unwrap();
 
-        thread::sleep(Duration::from_millis(250));
+        wait_until("coordinator capacity fallback", || {
+            events.lock().unwrap().iter().any(|event| {
+                matches!(
+                    event,
+                    RuntimeIndexingEvent::BaselineRefreshRequired {
+                        reason: BaselineRefreshReason::DirtyRoots
+                    }
+                )
+            })
+        });
         handle.stop();
         let events = events.lock().unwrap();
         assert_eq!(
@@ -1993,7 +2119,17 @@ mod tests {
                 index = index.wrapping_add(1);
             }
         });
-        thread::sleep(Duration::from_millis(75));
+        wait_until("continuous producer status", || {
+            events.lock().unwrap().iter().any(|event| {
+                matches!(
+                    event,
+                    RuntimeIndexingEvent::Status(RuntimeIncrementalStatus {
+                        pending_events: 1..,
+                        ..
+                    })
+                )
+            })
+        });
 
         let started = Instant::now();
         handle.stop();
@@ -2009,6 +2145,107 @@ mod tests {
             RuntimeIndexingEvent::Status(status) => status.pending_events <= 8_192,
             _ => true,
         }));
+    }
+
+    #[test]
+    fn watcher_channel_event_storm_is_bounded_marks_dirty_and_keeps_old_view_searchable() {
+        let root = tempfile::tempdir().unwrap();
+        let old_path = root.path().join("last-known-good.md");
+        fs::write(&old_path, "last known good").unwrap();
+        let old_entry =
+            IndexedEntry::from_path_metadata(&old_path, root.path(), IndexedEntryKind::File);
+        let database_path = root.path().join("watcher-storm.sqlite");
+        let storage = SqliteStorage::open(database_path).unwrap();
+        let baseline_id = storage
+            .save_completed_index_batch(1, std::slice::from_ref(&old_entry))
+            .unwrap();
+        storage
+            .activate_baseline_and_clear_incremental_state(baseline_id, 0)
+            .unwrap();
+        let roots = vec![root.path().to_path_buf()];
+        let (sender, inbox) = WatchEventInbox::bounded(roots.clone(), 8_192);
+        for index in 0..8_192 {
+            assert_eq!(
+                sender.try_send(IndexWatchEvent::Write(
+                    root.path().join(format!("storm-{index}.md")),
+                )),
+                crate::core::index_watcher::WatchSendOutcome::Queued
+            );
+        }
+        assert_eq!(
+            sender.try_send(IndexWatchEvent::Write(root.path().join("storm-8192.md"))),
+            crate::core::index_watcher::WatchSendOutcome::Overflowed
+        );
+
+        let view = Arc::new(Mutex::new(LayeredSearchIndex::from_baseline(vec![
+            old_entry,
+        ])));
+        let published_view = Arc::clone(&view);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let published_events = Arc::clone(&events);
+        let handle = start_runtime_indexing_with_scanner(
+            None,
+            inbox,
+            Box::new(FixedScanner::returning(TargetedScanResult::default())),
+            Box::new(storage),
+            RuntimeIndexingOptions {
+                roots,
+                policy: CoordinatorPolicy::new(Duration::from_secs(60), Duration::from_secs(60)),
+                initial_generation: 0,
+            },
+            move |event| {
+                if let RuntimeIndexingEvent::DeltaCommitted(delta) = &event {
+                    published_view.lock().unwrap().apply_delta(delta.clone());
+                }
+                published_events.lock().unwrap().push(event);
+            },
+        )
+        .unwrap();
+
+        wait_until("8193-event watcher fallback", || {
+            events.lock().unwrap().iter().any(|event| {
+                matches!(
+                    event,
+                    RuntimeIndexingEvent::Status(RuntimeIncrementalStatus {
+                        dirty_roots: 1,
+                        degradation_code: Some(IndexDegradationCode::ChannelOverflow),
+                        ..
+                    })
+                )
+            })
+        });
+        handle.stop();
+
+        let events = events.lock().unwrap();
+        assert!(events.iter().all(|event| match event {
+            RuntimeIndexingEvent::Status(status) => status.pending_events <= 8_192,
+            _ => true,
+        }));
+        let status = events
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeIndexingEvent::Status(status)
+                    if status.degradation_code == Some(IndexDegradationCode::ChannelOverflow) =>
+                {
+                    Some(status)
+                }
+                _ => None,
+            })
+            .next_back()
+            .unwrap();
+        let old_view_results = view
+            .lock()
+            .unwrap()
+            .search_files(
+                &QueryRequest::new("last-known-good", SearchMode::Normal),
+                20,
+            )
+            .len();
+        println!(
+            "QUICKFOX_EVENT_STORM events=8193 channel_capacity=8192 pending_events={} dirty_roots={} old_view_results={}",
+            status.pending_events, status.dirty_roots, old_view_results
+        );
+        assert_eq!(old_view_results, 1);
     }
 
     #[test]

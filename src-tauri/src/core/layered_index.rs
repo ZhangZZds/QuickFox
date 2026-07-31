@@ -434,10 +434,21 @@ impl LayeredSearchIndex {
         self.visible_entry_count
     }
 
+    pub fn baseline_entry_count(&self) -> usize {
+        self.baseline.entries().len()
+    }
+
+    pub fn overlay_entry_count(&self) -> usize {
+        self.overlay_entries.len()
+    }
+
+    pub fn tombstone_entry_count(&self) -> usize {
+        self.tombstones.len()
+    }
+
     pub fn delta_entry_count(&self) -> usize {
-        self.overlay_entries
-            .len()
-            .saturating_add(self.tombstones.len())
+        self.overlay_entry_count()
+            .saturating_add(self.tombstone_entry_count())
     }
 
     pub fn estimated_delta_bytes(&self) -> usize {
@@ -728,7 +739,9 @@ mod tests {
     use crate::core::index::{IndexedEntry, IndexedEntryKind, SearchIndex};
     use crate::core::index_watcher::IndexUpdateBatch;
     use crate::core::search::{HistoryScores, QueryRequest, Ranker, SearchMode};
+    use crate::core::storage::SqliteStorage;
     use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
 
     #[test]
     fn overlay_replaces_baseline_by_normalized_path_without_duplicates() {
@@ -1057,6 +1070,176 @@ mod tests {
         assert_eq!(index.delta_entry_count(), 0);
         assert_eq!(index.entry_count(), 1);
         assert_eq!(index.search(&request("compacted"), 20).len(), 1);
+    }
+
+    #[test]
+    fn layered_counts_report_baseline_overlay_and_tombstones_separately() {
+        let root = PathBuf::from("/tmp/root");
+        let mut index = LayeredSearchIndex::from_baseline(vec![
+            entry(root.join("kept.md"), &root, IndexedEntryKind::File),
+            entry(root.join("removed.md"), &root, IndexedEntryKind::File),
+        ]);
+        index.apply_delta(CommittedIndexDelta {
+            generation: 1,
+            upserts: vec![entry(
+                root.join("created.md"),
+                &root,
+                IndexedEntryKind::File,
+            )],
+            removals: vec![root.join("removed.md")],
+        });
+
+        assert_eq!(index.baseline_entry_count(), 2);
+        assert_eq!(index.overlay_entry_count(), 1);
+        assert_eq!(index.tombstone_entry_count(), 1);
+    }
+
+    #[test]
+    fn p95_duration_uses_the_nearest_rank_without_averaging_tail_samples() {
+        let samples: Vec<_> = (1..=20).map(Duration::from_millis).collect();
+
+        assert_eq!(p95_duration(&samples), Duration::from_millis(19));
+    }
+
+    #[test]
+    fn ci_scale_layered_benchmark_fixture_covers_create_overwrite_and_subtree_delete() {
+        let mut index =
+            LayeredSearchIndex::from_baseline(synthetic_layered_benchmark_entries(20_000));
+        let baseline_build_id = index.baseline_compact_build_id();
+
+        index.apply_delta(synthetic_layered_benchmark_delta(20_000, 1_000));
+
+        assert_eq!(index.baseline_compact_build_id(), baseline_build_id);
+        assert_eq!(index.overlay_entry_count(), 500);
+        assert_eq!(index.tombstone_entry_count(), 500);
+        for (_, query, expected) in layered_benchmark_queries() {
+            assert_benchmark_results(expected, &index.search(&query, 20));
+        }
+    }
+
+    #[test]
+    #[ignore = "2,000,000 baseline plus 10,000 runtime delta release threshold"]
+    fn two_million_baseline_with_runtime_delta_stays_within_latency_budget() {
+        const BASELINE_ENTRIES: usize = 2_000_000;
+        const DELTA_ENTRIES: usize = 10_000;
+        const QUERY_ROUNDS: usize = 20;
+
+        let baseline = synthetic_layered_benchmark_entries(BASELINE_ENTRIES);
+        let mut index = LayeredSearchIndex::from_baseline(baseline);
+        let baseline_build_id = index.baseline_compact_build_id();
+        index.apply_delta(synthetic_layered_benchmark_delta(
+            BASELINE_ENTRIES,
+            DELTA_ENTRIES,
+        ));
+
+        assert_eq!(index.baseline_compact_build_id(), baseline_build_id);
+        assert_eq!(index.baseline_entry_count(), BASELINE_ENTRIES);
+        assert_eq!(index.overlay_entry_count(), DELTA_ENTRIES / 2);
+        assert_eq!(index.tombstone_entry_count(), DELTA_ENTRIES / 2);
+        assert_eq!(index.delta_entry_count(), DELTA_ENTRIES);
+
+        let queries = layered_benchmark_queries();
+        for (_, query, _) in &queries {
+            for _ in 0..3 {
+                let _ = index.search(query, 20);
+            }
+        }
+
+        for (name, query, expected) in queries {
+            let mut samples = Vec::with_capacity(QUERY_ROUNDS);
+            let mut result_count = 0;
+            for _ in 0..QUERY_ROUNDS {
+                let started = Instant::now();
+                let results = index.search(&query, 20);
+                samples.push(started.elapsed());
+                result_count = results.len();
+                assert_benchmark_results(expected, &results);
+            }
+            let p95 = p95_duration(&samples);
+            println!(
+                "QUICKFOX_LAYERED_INDEX scale={} delta={} query={} rounds={} p95_us={} results={} baseline={} overlay={} tombstones={} delta_bytes={}",
+                BASELINE_ENTRIES,
+                DELTA_ENTRIES,
+                name,
+                QUERY_ROUNDS,
+                p95.as_micros(),
+                result_count,
+                index.baseline_entry_count(),
+                index.overlay_entry_count(),
+                index.tombstone_entry_count(),
+                index.estimated_delta_bytes(),
+            );
+            assert!(
+                p95 <= Duration::from_millis(50),
+                "layered query {name} P95 {p95:?} exceeded 50ms"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "release benchmark for a durable 10,000-entry incremental batch"]
+    fn incremental_batch_benchmark_reports_commit_layers_query_p95_and_memory() {
+        const BASELINE_ENTRIES: usize = 100_000;
+        const DELTA_ENTRIES: usize = 10_000;
+        const QUERY_ROUNDS: usize = 20;
+
+        let mut index = LayeredSearchIndex::from_baseline(synthetic_layered_benchmark_entries(
+            BASELINE_ENTRIES,
+        ));
+        let delta = synthetic_layered_benchmark_delta(BASELINE_ENTRIES, DELTA_ENTRIES);
+        let database = tempfile::tempdir().unwrap();
+        let storage =
+            SqliteStorage::open(database.path().join("incremental-batch.sqlite")).unwrap();
+        let baseline_id = storage.save_completed_index_batch(1, &[]).unwrap();
+        storage
+            .activate_baseline_and_clear_incremental_state(baseline_id, 0)
+            .unwrap();
+
+        let commit_started = Instant::now();
+        storage.commit_incremental_batch(&delta, &[], &[]).unwrap();
+        let journal_commit = commit_started.elapsed();
+        let apply_started = Instant::now();
+        index.apply_delta(delta);
+        let layer_apply = apply_started.elapsed();
+        let batch_commit = commit_started.elapsed();
+
+        let queries = layered_benchmark_queries();
+        for (_, query, _) in &queries {
+            for _ in 0..3 {
+                let _ = index.search(query, 20);
+            }
+        }
+        let mut query_samples = Vec::with_capacity(queries.len() * QUERY_ROUNDS);
+        let mut total_results = 0_usize;
+        for (_, query, expected) in &queries {
+            for _ in 0..QUERY_ROUNDS {
+                let started = Instant::now();
+                let results = index.search(query, 20);
+                query_samples.push(started.elapsed());
+                total_results = total_results.saturating_add(results.len());
+                assert_benchmark_results(*expected, &results);
+            }
+        }
+        let query_p95 = p95_duration(&query_samples);
+
+        println!(
+            "QUICKFOX_INCREMENTAL_BATCH entries={} commit_us={} journal_commit_us={} layer_apply_us={} baseline={} overlay={} tombstones={} query_rounds={} query_latency_p95_us={} results={} estimated_delta_bytes={}",
+            DELTA_ENTRIES,
+            batch_commit.as_micros(),
+            journal_commit.as_micros(),
+            layer_apply.as_micros(),
+            index.baseline_entry_count(),
+            index.overlay_entry_count(),
+            index.tombstone_entry_count(),
+            QUERY_ROUNDS,
+            query_p95.as_micros(),
+            total_results,
+            index.estimated_delta_bytes(),
+        );
+
+        assert_eq!(index.delta_entry_count(), DELTA_ENTRIES);
+        assert_eq!(storage.committed_index_deltas_after(0).unwrap().len(), 1);
+        assert!(query_p95 <= Duration::from_millis(50));
     }
 
     #[test]
@@ -1445,5 +1628,149 @@ mod tests {
 
     fn result_ids(results: &[crate::core::search::SearchResult]) -> Vec<&str> {
         results.iter().map(|result| result.id.as_str()).collect()
+    }
+
+    #[derive(Clone, Copy)]
+    enum BenchmarkExpectation {
+        ContainsTitle(&'static str),
+        Empty,
+    }
+
+    fn synthetic_layered_benchmark_entries(entry_count: usize) -> Vec<IndexedEntry> {
+        (0..entry_count)
+            .map(synthetic_layered_benchmark_entry)
+            .collect()
+    }
+
+    fn synthetic_layered_benchmark_entry(index: usize) -> IndexedEntry {
+        if index == 0 {
+            let mut entry = IndexedEntry::legacy(
+                "/benchmark/group-0000",
+                "group-0000",
+                IndexedEntryKind::Directory,
+            );
+            entry.root = "/benchmark".to_owned();
+            entry.depth = 1;
+            return entry;
+        }
+        let group = index / 1_000;
+        let name = if index == 42 {
+            "baseline-deleted-target.md".to_owned()
+        } else {
+            format!("entry-{index:07}.md")
+        };
+        let path = format!("/benchmark/group-{group:04}/{name}");
+        let mut entry = IndexedEntry::legacy(path, name, IndexedEntryKind::File);
+        entry.extension = Some("md".to_owned());
+        entry.root = "/benchmark".to_owned();
+        entry.depth = 2;
+        entry
+    }
+
+    fn synthetic_layered_benchmark_delta(
+        baseline_entries: usize,
+        delta_entries: usize,
+    ) -> CommittedIndexDelta {
+        assert!(baseline_entries >= 10_000);
+        assert_eq!(delta_entries % 2, 0);
+        let overlay_count = delta_entries / 2;
+        let tombstone_count = delta_entries / 2;
+        let mut upserts = Vec::with_capacity(overlay_count);
+        for index in 0..overlay_count {
+            if index == 0 {
+                upserts.push(benchmark_named_entry(
+                    "/benchmark/runtime/runtime-delta-target.md",
+                    "runtime-delta-target.md",
+                ));
+            } else if index == 1 {
+                let mut replacement = synthetic_layered_benchmark_entry(baseline_entries / 2);
+                replacement.name = "runtime-overwrite-target.md".to_owned();
+                replacement.search_text = crate::core::index_entry::build_search_text(
+                    &replacement.name,
+                    &replacement.path,
+                );
+                upserts.push(replacement);
+            } else {
+                upserts.push(benchmark_named_entry(
+                    &format!("/benchmark/runtime/runtime-new-{index:05}.md"),
+                    &format!("runtime-new-{index:05}.md"),
+                ));
+            }
+        }
+
+        let mut removals = Vec::with_capacity(tombstone_count);
+        removals.push(PathBuf::from("/benchmark/group-0000"));
+        removals.extend(
+            (1..tombstone_count)
+                .map(|index| PathBuf::from(synthetic_layered_benchmark_entry(index + 1_000).path)),
+        );
+        CommittedIndexDelta {
+            generation: 1,
+            upserts,
+            removals,
+        }
+    }
+
+    fn benchmark_named_entry(path: &str, name: &str) -> IndexedEntry {
+        let mut entry = IndexedEntry::legacy(path, name, IndexedEntryKind::File);
+        entry.extension = Some("md".to_owned());
+        entry.root = "/benchmark".to_owned();
+        entry.depth = 2;
+        entry
+    }
+
+    fn layered_benchmark_queries() -> Vec<(&'static str, QueryRequest, BenchmarkExpectation)> {
+        vec![
+            (
+                "overlay-exact",
+                request("runtime-delta-target.md"),
+                BenchmarkExpectation::ContainsTitle("runtime-delta-target.md"),
+            ),
+            (
+                "overlay-prefix",
+                request("runtime-delta-tar"),
+                BenchmarkExpectation::ContainsTitle("runtime-delta-target.md"),
+            ),
+            (
+                "overlay-field-filtered",
+                request("type:md runtime-delta-target"),
+                BenchmarkExpectation::ContainsTitle("runtime-delta-target.md"),
+            ),
+            (
+                "baseline-overwrite",
+                request("runtime-overwrite-target"),
+                BenchmarkExpectation::ContainsTitle("runtime-overwrite-target.md"),
+            ),
+            (
+                "subtree-tombstone",
+                request("baseline-deleted-target"),
+                BenchmarkExpectation::Empty,
+            ),
+            (
+                "low-hit",
+                request("needle-not-present-987654321"),
+                BenchmarkExpectation::Empty,
+            ),
+        ]
+    }
+
+    fn assert_benchmark_results(
+        expected: BenchmarkExpectation,
+        results: &[crate::core::search::SearchResult],
+    ) {
+        match expected {
+            BenchmarkExpectation::ContainsTitle(title) => {
+                assert!(results.iter().any(|result| result.title == title));
+            }
+            BenchmarkExpectation::Empty => assert!(results.is_empty()),
+        }
+    }
+
+    fn p95_duration(samples: &[Duration]) -> Duration {
+        assert!(!samples.is_empty());
+        let mut sorted = samples.to_vec();
+        sorted.sort_unstable();
+        let rank = sorted.len().saturating_mul(95).div_ceil(100);
+        sorted[rank.saturating_sub(1)]
     }
 }

@@ -2623,6 +2623,14 @@ mod tests {
         let snapshot = storage.latest_index_snapshot().unwrap().unwrap();
         assert_eq!(snapshot.entries.len(), 1);
         assert_eq!(snapshot.entries[0].path, "/root/legacy.md");
+        let recovery = crate::core::index_journal::recover_layered_index(&storage);
+        let results = recovery
+            .index
+            .search(&QueryParser::new(Default::default()).parse("legacy"), 20);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "legacy.md");
+        assert!(recovery.baseline_available());
+        assert!(recovery.needs_manifest_rebuild());
 
         drop(storage);
         let _ = fs::remove_file(path);
