@@ -44,6 +44,32 @@
 - 增量刷新后新增/删除文件能反映到搜索结果
 - 存在旧索引快照时，重启后能先使用旧索引搜索，同时后台更新索引
 
+## 运行期增量索引（发布阻塞清单）
+
+使用发布构建，在一个可随时恢复的测试 root 中准备精确文件名，并打开设置页索引状态。每项都记录操作时间、进入/离开结果时间、`pendingEvents`/`dirtyRoots`、degradation code；涉及状态变化时保存截图。10 秒从 watcher 交付事件开始计时。
+
+- [ ] create：新建文件后 10 秒内可按 name/path 搜索，baseline build identity 不因小批次改变
+- [ ] write：修改名称未变文件后，name/path 批次成功；符合正文范围时 `content:` 随后独立更新
+- [ ] rename：旧名称离开、新名称进入，结果中不同时出现旧/新路径重复项，10 秒硬上限满足
+- [ ] delete：删除文件后 tombstone 在 10 秒内隐藏结果
+- [ ] delete subtree：删除目录后该目录及后代均消失，邻近同前缀目录不受影响
+- [ ] 1000-file Git checkout：执行创建/覆盖/删除混合 checkout，窗口与输入持续响应，旧查询不覆盖新输入
+- [ ] checkout 收敛：pending 归零后抽查创建、覆盖、rename/delete，overflow 时状态可见且 dirty-root 校准恢复一致
+- [ ] sleep/wake：有 baseline 时休眠并在唤醒前后制造变化；QuickFox 保持响应，watcher 重启/校准可观察并最终收敛
+- [ ] root 断开：断开外接卷或使测试 root 暂时不可达，最近 baseline 保持可搜索，状态不误报 Ready
+- [ ] root 恢复：重连到原路径后校准恢复离线期间的新增/修改/删除
+- [ ] channel overflow：用受控夹具制造超过 8192 的事件压力，状态显示 `channelOverflow`/dirty root，内存队列不无限增长
+- [ ] watcher failure：模拟初始化/运行失败，状态显示结构化 code 和恢复动作；手动增量或后台刷新仍可用
+- [ ] 10 秒硬上限：持续写入超过 5 秒使静默窗口不能结束，首事件后不超过 10 秒仍提交中间批次
+- [ ] UI 响应：事件风暴、校准和后台 full refresh 期间输入、窗口和非文件 Provider 保持响应
+- [ ] 状态截图：保存 Watching、Calibrating/dirty、Degraded/fallback 和恢复后状态截图；截图遮盖用户名与完整项目路径
+- [ ] 内容反馈：正文准备中、非法查询和 reader 不可用分别显示可操作反馈；非法语法不触发 runtime degraded
+- [ ] 开关恢复：关闭 watcher 后 baseline/搜索/手动刷新仍可用，重新开启先校准再进入 Watching
+- [ ] 配置两阶段切换：修改 include/exclude 语义时旧 view 持续可用；candidate 失败不会提交新配置
+- [ ] 正文版本目录：新版本发布时旧 reader 可完成查询，最后 reader 释放后旧版本才回收；GC 不处理 symlink/未标记目录
+
+结果写入 `docs/runtime-incremental-indexing-manual-qa-results-2026-07-31.md` 或更新到发布日期对应的新记录。任一普通变化超过 10 秒、UI 无响应、状态静默丢失或恢复后不一致都属于发布阻塞。
+
 ## 历史与设置
 
 - 设置页按“索引”“网页搜索”“历史”“命令安全”“外观”分区

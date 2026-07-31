@@ -74,6 +74,36 @@ cargo test --release --manifest-path src-tauri/Cargo.toml `
 
 记录 `QUICKFOX_LARGE_INDEX_THRESHOLD` 输出、任务管理器内存截图、`agents.md` 输入录屏和结果截图。若无法在当轮执行，应在 issue 或 QA 记录中明确标注为待验收，不得将其等同于已通过。
 
+## 运行期增量索引（发布阻塞清单）
+
+使用 Windows 发布构建和本地 NTFS 测试目录，至少覆盖 `C:\` 与 `D:\`。每项记录 watcher 交付后的可见耗时、pending/dirty、degradation code、QuickFox RSS，并保存状态/任务管理器截图；截图遮盖用户名与个人路径。
+
+- [ ] C: create：新建文件 10 秒内进入 name/path 结果
+- [ ] C: write：覆盖文件后 name/path 批次成功，正文符合范围时随后独立更新
+- [ ] C: rename：旧路径消失、新路径出现，不产生重复结果，满足 10 秒硬上限
+- [ ] C: delete：删除文件和删除子树均由 tombstone 在 10 秒内隐藏，邻近同前缀目录不受影响
+- [ ] D: create/write/rename/delete：在独立 NTFS 卷重复普通变化并记录各项耗时
+- [ ] 同盘跨目录 rename：在 C:、D: 内分别跨已监听目录移动文件/目录，最终状态以旧 tombstone + 新 targeted scan 收敛
+- [ ] 跨盘 C:→D: move：按平台实际事件序列验证旧 C: 路径删除、新 D: 路径进入，不能同时显示重复项
+- [ ] 1000-file Git checkout：创建/覆盖/删除混合 checkout 期间窗口、输入和非文件 Provider 保持响应
+- [ ] checkout 收敛：pending 归零后抽查最终文件系统；overflow/channel 满可观察，dirty-root 校准恢复一致
+- [ ] sleep/wake：唤醒后 watcher 状态可观察，离线变化最终通过校准恢复
+- [ ] D: drive disconnect：断开/卸载 D: 时最近 baseline 继续服务，root 保持 dirty/Degraded，不把全盘条目误删
+- [ ] D: reconnect：恢复原盘符后自动或手动校准收敛；盘符改变时按配置语义变更重新保存
+- [ ] watcher 初始化失败：模拟无权限/不可监听 root，显示 `watcherInitializationFailed` 和恢复动作
+- [ ] watcher 运行失败：运行中断开 backend/root，显示结构化失败且最近 baseline 可用
+- [ ] channel overflow：受控制造超过 8192 的事件压力，队列有界并显示 `channelOverflow`/dirty root
+- [ ] 10 秒硬上限：持续写入阻止 5 秒静默时，首事件后不超过 10 秒仍有批次进入可搜索视图
+- [ ] UI/状态截图：保存 Watching、Calibrating、Degraded/full refresh fallback、恢复后状态和任务管理器 RSS
+- [ ] 真实内存：记录空闲 baseline、1000-file 风暴、校准、full refresh、2M ready 各阶段 RSS/peak，超过 500MB 目标或 800MB 硬上限时阻塞发布
+- [ ] 正文反馈/队列：准备中、非法查询、reader 失败反馈明确；容量 8 的正文队列满不回滚 name/path
+- [ ] 开关与配置 fence：关闭监听不删搜索；重新开启先校准；include/exclude candidate 失败保留旧配置/view
+- [ ] NTFS junction：索引 root 内放置指向 root 外的 junction，扫描/校准/删除不得越界索引或把外部目标误删
+- [ ] junction rename/delete：重命名或删除 junction 本身后只更新 junction 路径语义，外部真实目录及文件保持不变
+- [ ] 正文 GC junction/symlink 安全：伪造受管名称但不满足真实目录/marker/锁条件的条目不得被回收
+
+结果写入 `docs/runtime-incremental-indexing-manual-qa-results-2026-07-31.md` 或发布日期对应记录。Windows 真实桌面、NTFS C:/D、junction 和任务管理器数据缺失时不得声明该能力完成。
+
 ## 命令执行
 
 - `>` 查询能进入命令预览
