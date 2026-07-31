@@ -52,7 +52,7 @@ export function refreshIndex() {
 }
 
 export function indexStatus() {
-  return invoke("index_status");
+  return invoke<IndexStatusPayload>("index_status").then(normalizeIndexStatus);
 }
 
 export function appPaths() {
@@ -118,7 +118,9 @@ export function listenGlobalHotkeyStatus(handler: (status: GlobalHotkeyStatus) =
 }
 
 export function listenIndexStatus(handler: (status: IndexStatus) => void) {
-  return safeListen<IndexStatus>("quickfox://index-status", (event) => handler(event.payload));
+  return safeListen<IndexStatusPayload>("quickfox://index-status", (event) =>
+    handler(normalizeIndexStatus(event.payload)),
+  );
 }
 
 function safeListen<T>(
@@ -170,6 +172,38 @@ export type QuickFoxConfig = {
   };
 };
 
+export type IndexDegradationCode =
+  | "watcherInitializationFailed"
+  | "watcherRuntimeFailed"
+  | "watcherOverflow"
+  | "channelOverflow"
+  | "journalWriteFailed"
+  | "journalReplayFailed"
+  | "calibrationFailed"
+  | "fullRefreshFallback";
+
+export type RuntimeIncrementalStatus = {
+  enabled: boolean;
+  state: "disabled" | "preparing" | "watching" | "degraded" | "calibrating";
+  pendingEvents: number;
+  dirtyRoots: number;
+  lastBatchEntries: number;
+  lastBatchDurationMs: number;
+  degradationCode?: IndexDegradationCode | null;
+};
+
+export function defaultRuntimeIncrementalStatus(): RuntimeIncrementalStatus {
+  return {
+    enabled: true,
+    state: "preparing",
+    pendingEvents: 0,
+    dirtyRoots: 0,
+    lastBatchEntries: 0,
+    lastBatchDurationMs: 0,
+    degradationCode: null,
+  };
+}
+
 export type IndexStatus = {
   kind: "unbuilt" | "building" | "ready" | "refreshing" | "failed";
   availability?: "unavailable" | "quickAvailable" | "completing" | "contentIndexing" | "complete";
@@ -183,7 +217,29 @@ export type IndexStatus = {
   accepted?: number;
   skipped?: number;
   failures?: number;
+  incremental: RuntimeIncrementalStatus;
 };
+
+type IndexStatusPayload = Omit<IndexStatus, "incremental"> & {
+  incremental?: Partial<RuntimeIncrementalStatus> | null;
+};
+
+function normalizeIndexStatus(status: IndexStatusPayload): IndexStatus {
+  const defaults = defaultRuntimeIncrementalStatus();
+  const incremental = status.incremental;
+  return {
+    ...status,
+    incremental: {
+      enabled: incremental?.enabled ?? defaults.enabled,
+      state: incremental?.state ?? defaults.state,
+      pendingEvents: incremental?.pendingEvents ?? defaults.pendingEvents,
+      dirtyRoots: incremental?.dirtyRoots ?? defaults.dirtyRoots,
+      lastBatchEntries: incremental?.lastBatchEntries ?? defaults.lastBatchEntries,
+      lastBatchDurationMs: incremental?.lastBatchDurationMs ?? defaults.lastBatchDurationMs,
+      degradationCode: incremental?.degradationCode ?? defaults.degradationCode,
+    },
+  };
+}
 
 export type AppPaths = {
   configFilePath?: string | null;

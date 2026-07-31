@@ -699,22 +699,45 @@ mod tests {
     }
 
     #[test]
-    fn runtime_incremental_status_serializes_structured_degradation_without_paths() {
-        let status = RuntimeIncrementalStatus {
+    fn index_status_serializes_incremental_summary_without_paths() {
+        let mut status = IndexLifecycle::from_ready(20, 100).status().clone();
+        status.incremental = RuntimeIncrementalStatus {
             enabled: true,
             state: IncrementalState::Degraded,
-            pending_events: 7,
-            dirty_roots: 2,
-            last_batch_entries: 3,
-            last_batch_duration_ms: 11,
-            degradation_code: Some(IndexDegradationCode::ChannelOverflow),
+            pending_events: 12,
+            dirty_roots: 1,
+            last_batch_entries: 8,
+            last_batch_duration_ms: 42,
+            degradation_code: Some(IndexDegradationCode::WatcherOverflow),
         };
 
-        let json = serde_json::to_string(&status).unwrap();
+        let json = serde_json::to_value(status).unwrap();
 
-        assert!(json.contains("\"state\":\"degraded\""));
-        assert!(json.contains("\"degradationCode\":\"channelOverflow\""));
-        assert!(!json.contains("/private/root"));
+        assert_eq!(json["incremental"]["enabled"], true);
+        assert_eq!(json["incremental"]["state"], "degraded");
+        assert_eq!(json["incremental"]["pendingEvents"], 12);
+        assert_eq!(json["incremental"]["dirtyRoots"], 1);
+        assert_eq!(json["incremental"]["lastBatchEntries"], 8);
+        assert_eq!(json["incremental"]["lastBatchDurationMs"], 42);
+        assert_eq!(json["incremental"]["degradationCode"], "watcherOverflow");
+        let serialized = json.to_string();
+        assert!(!serialized.contains("/private/root"));
+        assert!(!serialized.contains("watcher backend disconnected"));
+    }
+
+    #[test]
+    fn index_status_deserializes_legacy_payload_with_default_incremental_status() {
+        let status: IndexStatus = serde_json::from_value(serde_json::json!({
+            "kind": "ready",
+            "availability": "complete",
+            "entryCount": 3,
+            "message": null,
+            "generation": 1,
+            "completedAtMs": 100
+        }))
+        .unwrap();
+
+        assert_eq!(status.incremental, RuntimeIncrementalStatus::default());
     }
 
     fn temp_dir(label: &str) -> std::path::PathBuf {

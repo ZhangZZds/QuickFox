@@ -24,6 +24,7 @@ import {
   type GlobalHotkeyStatus,
   type IndexStatus,
   type QuickFoxConfig,
+  type RuntimeIncrementalStatus,
   type SearchSnippet,
   saveConfig,
   search as searchResults,
@@ -377,6 +378,15 @@ export function App({
     message: null,
     generation: 0,
     completedAtMs: null,
+    incremental: {
+      enabled: true,
+      state: "preparing",
+      pendingEvents: 0,
+      dirtyRoots: 0,
+      lastBatchEntries: 0,
+      lastBatchDurationMs: 0,
+      degradationCode: null,
+    },
   });
   const [indexSearchRevision, setIndexSearchRevision] = useState(0);
   const [currentAppPaths, setCurrentAppPaths] = useState<AppPaths>({
@@ -398,6 +408,7 @@ export function App({
   const resultRefs = useRef<Array<HTMLLIElement | null>>([]);
   const historyRefs = useRef<Array<HTMLLIElement | null>>([]);
   const settingsContentRef = useRef<HTMLDivElement | null>(null);
+  const lastSearchQueryRef = useRef(query);
   const hotkeyShiftPressAtRef = useRef<number | null>(null);
   const webSearchEnginesRef = useRef(config.web_search.engines);
   webSearchEnginesRef.current = config.web_search.engines;
@@ -488,6 +499,8 @@ export function App({
   }, []);
 
   useEffect(() => {
+    const queryChanged = lastSearchQueryRef.current !== query;
+    lastSearchQueryRef.current = query;
     if (!query.trim() || isCommandQuery) {
       setResults([]);
       return;
@@ -508,7 +521,7 @@ export function App({
         });
     };
 
-    if (shouldSearchImmediately(query, webSearchEnginesRef.current)) {
+    if (queryChanged && shouldSearchImmediately(query, webSearchEnginesRef.current)) {
       runSearch();
       return () => {
         cancelled = true;
@@ -1093,6 +1106,9 @@ export function App({
                         }
                       />
                       <span>运行期文件监听</span>
+                      <small aria-live="polite" role="status">
+                        {incrementalStatusText(currentIndexStatus.incremental)}
+                      </small>
                     </label>
                     <p className="settings-help-text">
                       字段查询示例：type:pdf、name:test、dir:**/workspace、content:"hello world"。
@@ -1814,6 +1830,39 @@ function IndexStatusSummary({ status }: { status: IndexStatus }) {
       </div>
     </section>
   );
+}
+
+function incrementalStatusText(status?: RuntimeIncrementalStatus) {
+  if (!status) return "自动增量正在准备";
+  if (!status.enabled || status.state === "disabled") return "自动增量已关闭";
+  if (status.state === "watching") return "自动增量运行中";
+  if (status.state === "calibrating") {
+    return `正在校准 ${status.dirtyRoots} 个索引目录`;
+  }
+  if (status.state === "degraded") {
+    switch (status.degradationCode) {
+      case "watcherInitializationFailed":
+        return "自动增量监听启动失败，可手动刷新索引";
+      case "watcherRuntimeFailed":
+        return "自动增量监听已中断，正在恢复索引";
+      case "watcherOverflow":
+      case "channelOverflow":
+        return status.dirtyRoots > 0
+          ? `自动增量已降级，正在校准 ${status.dirtyRoots} 个索引目录`
+          : "文件变化过多，正在恢复索引";
+      case "journalWriteFailed":
+        return "增量索引保存失败，正在恢复索引";
+      case "journalReplayFailed":
+        return "增量索引恢复失败，需要完整刷新索引";
+      case "calibrationFailed":
+        return "自动增量校准失败，需要完整刷新索引";
+      case "fullRefreshFallback":
+        return "自动增量不可用，需要完整刷新索引";
+      default:
+        return "自动增量已降级，正在恢复索引";
+    }
+  }
+  return "自动增量正在准备";
 }
 
 function IndexAuxiliaryDetails({

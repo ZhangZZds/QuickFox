@@ -640,13 +640,18 @@ impl RuntimeIndexingService {
             self.degraded_roots.insert(root.clone());
             self.coordinator.mark_dirty_root(root, now);
         }
+        let previous_status = self.status.clone();
         self.status.state = IncrementalState::Degraded;
         self.status.degradation_code = failure
             .as_ref()
             .map(|_| IndexDegradationCode::WatcherRuntimeFailed)
             .or(degradation)
             .or(Some(IndexDegradationCode::WatcherOverflow));
-        self.update_pending_status();
+        self.status.pending_events = self.coordinator.pending_event_count();
+        self.status.dirty_roots = self.degraded_roots.len();
+        if self.status != previous_status {
+            self.publish_status();
+        }
         self.request_baseline_refresh(if failure.is_some() {
             BaselineRefreshReason::WatcherFailure
         } else {
@@ -1126,6 +1131,56 @@ mod tests {
             .search("new")
             .iter()
             .any(|result| result.title == "new.md"));
+    }
+
+    #[test]
+    fn watcher_failure_transition_publishes_when_pending_and_dirty_counts_are_unchanged() {
+        let root = tempfile::tempdir().unwrap();
+        let database_path = root.path().join("status-transition.sqlite");
+        let storage = SqliteStorage::open(database_path).unwrap();
+        let baseline_id = storage.save_completed_index_batch(1, &[]).unwrap();
+        storage
+            .activate_baseline_and_clear_incremental_state(baseline_id, 0)
+            .unwrap();
+        let roots = vec![root.path().to_path_buf()];
+        let (sender, inbox) = WatchEventInbox::bounded(roots.clone(), 4);
+        sender.record_failure(crate::core::index_watcher::WatcherFailure::new(
+            root.path().to_path_buf(),
+            "backend disconnected",
+        ));
+        assert_eq!(inbox.take_dirty_roots().len(), 1);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let published = Arc::clone(&events);
+        let handle = start_runtime_indexing_with_scanner(
+            None,
+            inbox,
+            Box::new(FixedScanner::returning(TargetedScanResult::default())),
+            Box::new(storage),
+            RuntimeIndexingOptions {
+                roots,
+                policy: CoordinatorPolicy::new(Duration::ZERO, Duration::ZERO),
+                initial_generation: 0,
+            },
+            move |event| published.lock().unwrap().push(event),
+        )
+        .unwrap();
+
+        thread::sleep(Duration::from_millis(100));
+        handle.stop();
+
+        let statuses: Vec<_> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeIndexingEvent::Status(status) => Some(status.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(statuses.iter().any(|status| {
+            status.state == IncrementalState::Degraded
+                && status.degradation_code == Some(IndexDegradationCode::WatcherRuntimeFailed)
+        }));
     }
 
     #[test]

@@ -19,6 +19,8 @@ import {
   saveConfig,
   search,
   type QuickFoxConfig,
+  type IndexStatus,
+  type RuntimeIncrementalStatus,
   type SearchResult,
 } from "./tauriClient";
 
@@ -252,6 +254,27 @@ const appConfig: QuickFoxConfig = {
   },
 };
 
+function indexStatusWithIncremental(overrides: Partial<RuntimeIncrementalStatus>): IndexStatus {
+  return {
+    kind: "ready",
+    availability: "complete",
+    entryCount: 20,
+    message: null,
+    generation: 1,
+    completedAtMs: 100,
+    incremental: {
+      enabled: true,
+      state: "watching",
+      pendingEvents: 0,
+      dirtyRoots: 0,
+      lastBatchEntries: 0,
+      lastBatchDurationMs: 0,
+      degradationCode: null,
+      ...overrides,
+    },
+  };
+}
+
 describe("App", () => {
   beforeEach(() => {
     vi.mocked(appPaths).mockReset();
@@ -286,6 +309,7 @@ describe("App", () => {
     vi.mocked(openSettingsWindow).mockResolvedValue("completed");
     vi.mocked(indexStatus).mockResolvedValue({
       kind: "ready",
+      incremental: indexStatusWithIncremental({}).incremental,
       entryCount: 12,
       message: null,
       generation: 1,
@@ -352,6 +376,7 @@ describe("App", () => {
   it("shows first-run index preparation feedback with recovery actions", async () => {
     vi.mocked(indexStatus).mockResolvedValueOnce({
       kind: "unbuilt",
+      incremental: indexStatusWithIncremental({}).incremental,
       entryCount: 0,
       message: null,
       generation: 0,
@@ -374,6 +399,7 @@ describe("App", () => {
   it("shows index-building feedback without hiding other search behavior", async () => {
     vi.mocked(indexStatus).mockResolvedValueOnce({
       kind: "building",
+      incremental: indexStatusWithIncremental({}).incremental,
       entryCount: 0,
       message: null,
       generation: 2,
@@ -394,6 +420,7 @@ describe("App", () => {
   it("shows failed index feedback with retry and settings recovery actions", async () => {
     vi.mocked(indexStatus).mockResolvedValueOnce({
       kind: "failed",
+      incremental: indexStatusWithIncremental({}).incremental,
       entryCount: 0,
       message: "权限不足，无法扫描目录",
       generation: 3,
@@ -421,6 +448,7 @@ describe("App", () => {
     vi.mocked(indexStatus)
       .mockResolvedValueOnce({
         kind: "failed",
+        incremental: indexStatusWithIncremental({}).incremental,
         entryCount: 0,
         message: "权限不足，无法扫描目录",
         generation: 3,
@@ -428,6 +456,7 @@ describe("App", () => {
       })
       .mockResolvedValueOnce({
         kind: "ready",
+        incremental: indexStatusWithIncremental({}).incremental,
         entryCount: 18,
         message: "索引完成",
         generation: 4,
@@ -461,6 +490,7 @@ describe("App", () => {
       | undefined;
     vi.mocked(indexStatus).mockResolvedValueOnce({
       kind: "building",
+      incremental: indexStatusWithIncremental({}).incremental,
       entryCount: 0,
       message: null,
       generation: 2,
@@ -511,9 +541,139 @@ describe("App", () => {
     }
   });
 
+  it("coalesces incremental status bursts through the existing search debounce", async () => {
+    vi.useFakeTimers();
+    let indexStatusHandler: ((status: IndexStatus) => void) | undefined;
+    vi.mocked(indexStatus).mockResolvedValueOnce(indexStatusWithIncremental({}));
+    vi.mocked(listenIndexStatus).mockImplementation(async (handler) => {
+      indexStatusHandler = handler;
+      return () => undefined;
+    });
+    vi.mocked(search).mockResolvedValue([]);
+
+    try {
+      render(<App />);
+      await act(async () => {
+        await Promise.resolve();
+      });
+      fireEvent.change(screen.getByLabelText("搜索文件、目录、计算器、网页搜索或命令"), {
+        target: { value: "agents" },
+      });
+      await act(async () => vi.advanceTimersByTimeAsync(80));
+      expect(search).toHaveBeenCalledTimes(1);
+
+      await act(async () => {
+        indexStatusHandler?.(indexStatusWithIncremental({ pendingEvents: 4 }));
+        indexStatusHandler?.(
+          indexStatusWithIncremental({
+            state: "degraded",
+            dirtyRoots: 1,
+            degradationCode: "watcherOverflow",
+          }),
+        );
+        indexStatusHandler?.(indexStatusWithIncremental({ pendingEvents: 2 }));
+      });
+      await act(async () => vi.advanceTimersByTimeAsync(79));
+      expect(search).toHaveBeenCalledTimes(1);
+      await act(async () => vi.advanceTimersByTimeAsync(1));
+      expect(search).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("debounces status-triggered refreshes for an otherwise immediate web query", async () => {
+    vi.useFakeTimers();
+    let indexStatusHandler: ((status: IndexStatus) => void) | undefined;
+    vi.mocked(indexStatus).mockResolvedValueOnce(indexStatusWithIncremental({}));
+    vi.mocked(listenIndexStatus).mockImplementation(async (handler) => {
+      indexStatusHandler = handler;
+      return () => undefined;
+    });
+    vi.mocked(search).mockResolvedValue([]);
+
+    try {
+      render(<App />);
+      await act(async () => {
+        await Promise.resolve();
+      });
+      fireEvent.change(screen.getByLabelText("搜索文件、目录、计算器、网页搜索或命令"), {
+        target: { value: "g agents" },
+      });
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(search).toHaveBeenCalledTimes(1);
+
+      await act(async () => {
+        indexStatusHandler?.(indexStatusWithIncremental({ pendingEvents: 4 }));
+      });
+      await act(async () => vi.advanceTimersByTimeAsync(20));
+      await act(async () => {
+        indexStatusHandler?.(
+          indexStatusWithIncremental({
+            state: "degraded",
+            dirtyRoots: 1,
+            degradationCode: "watcherOverflow",
+          }),
+        );
+      });
+      await act(async () => vi.advanceTimersByTimeAsync(20));
+      await act(async () => {
+        indexStatusHandler?.(indexStatusWithIncremental({ pendingEvents: 2 }));
+      });
+
+      expect(search).toHaveBeenCalledTimes(1);
+      await act(async () => vi.advanceTimersByTimeAsync(79));
+      expect(search).toHaveBeenCalledTimes(1);
+      await act(async () => vi.advanceTimersByTimeAsync(1));
+      expect(search).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("shows compact automatic incremental degradation beside the watcher switch", async () => {
+    vi.mocked(appPaths).mockResolvedValueOnce({
+      configFilePath: null,
+      indexSnapshotPath: null,
+    });
+    vi.mocked(indexStatus).mockResolvedValueOnce(
+      indexStatusWithIncremental({
+        state: "degraded",
+        dirtyRoots: 1,
+        degradationCode: "watcherOverflow",
+      }),
+    );
+
+    render(<App initialView="settings" />);
+
+    const watcher = await screen.findByLabelText("运行期文件监听");
+    expect(watcher).toBeChecked();
+    const summary = screen.getByText("自动增量已降级，正在校准 1 个索引目录");
+    expect(summary.textContent).not.toMatch(/\/Users\//);
+    expect(screen.queryByText("watcherOverflow")).not.toBeInTheDocument();
+  });
+
+  it("describes full-refresh degradation without claiming zero-root calibration", async () => {
+    vi.mocked(indexStatus).mockResolvedValueOnce(
+      indexStatusWithIncremental({
+        state: "degraded",
+        dirtyRoots: 0,
+        degradationCode: "fullRefreshFallback",
+      }),
+    );
+
+    render(<App initialView="settings" />);
+
+    expect(await screen.findByText("自动增量不可用，需要完整刷新索引")).toBeInTheDocument();
+    expect(screen.queryByText(/校准 0 个索引目录/)).not.toBeInTheDocument();
+  });
+
   it("keeps web search results visible when the file index is unavailable", async () => {
     vi.mocked(indexStatus).mockResolvedValueOnce({
       kind: "unbuilt",
+      incremental: indexStatusWithIncremental({}).incremental,
       entryCount: 0,
       message: null,
       generation: 0,
@@ -533,6 +693,7 @@ describe("App", () => {
   it("keeps calculator results visible when the file index is unavailable", async () => {
     vi.mocked(indexStatus).mockResolvedValueOnce({
       kind: "unbuilt",
+      incremental: indexStatusWithIncremental({}).incremental,
       entryCount: 0,
       message: null,
       generation: 0,
@@ -552,6 +713,7 @@ describe("App", () => {
   it("keeps command results visible when the file index is unavailable", async () => {
     vi.mocked(indexStatus).mockResolvedValueOnce({
       kind: "building",
+      incremental: indexStatusWithIncremental({}).incremental,
       entryCount: 0,
       message: null,
       generation: 2,
@@ -577,6 +739,7 @@ describe("App", () => {
   it("shows lightweight index progress when file results are still empty", async () => {
     vi.mocked(indexStatus).mockResolvedValueOnce({
       kind: "building",
+      incremental: indexStatusWithIncremental({}).incremental,
       entryCount: 0,
       message: null,
       generation: 2,
@@ -607,6 +770,7 @@ describe("App", () => {
   it("shows partial availability while background completion is running", async () => {
     vi.mocked(indexStatus).mockResolvedValueOnce({
       kind: "building",
+      incremental: indexStatusWithIncremental({}).incremental,
       availability: "completing",
       entryCount: 90,
       message: null,
@@ -1267,6 +1431,7 @@ describe("App", () => {
   it("opens the settings window from launcher recovery instead of rendering settings in-place", async () => {
     vi.mocked(indexStatus).mockResolvedValueOnce({
       kind: "failed",
+      incremental: indexStatusWithIncremental({}).incremental,
       entryCount: 0,
       message: "权限不足，无法扫描目录",
       generation: 3,
@@ -1559,6 +1724,7 @@ describe("App", () => {
   it("shows complete index status details in settings", async () => {
     vi.mocked(indexStatus).mockResolvedValueOnce({
       kind: "ready",
+      incremental: indexStatusWithIncremental({}).incremental,
       entryCount: 240,
       message: "索引完成",
       generation: 7,
@@ -1577,6 +1743,7 @@ describe("App", () => {
   it("shows index mode and completion progress details in settings", async () => {
     vi.mocked(indexStatus).mockResolvedValueOnce({
       kind: "building",
+      incremental: indexStatusWithIncremental({}).incremental,
       availability: "completing",
       entryCount: 90,
       message: null,

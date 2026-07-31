@@ -21,6 +21,7 @@ import {
   refreshIndex,
   saveConfig,
   search,
+  defaultRuntimeIncrementalStatus,
 } from "./tauriClient";
 
 vi.mock("@tauri-apps/api/core", () => ({
@@ -63,7 +64,12 @@ describe("tauriClient", () => {
 
   it("calls refresh, config, and history commands with stable names", async () => {
     const config = { query: { regex_prefix: "re:" } };
-    invokeMock.mockResolvedValue(undefined);
+    invokeMock.mockResolvedValue({
+      kind: "ready",
+      entryCount: 0,
+      generation: 0,
+      completedAtMs: null,
+    });
 
     await refreshIndex();
     await indexStatus();
@@ -88,6 +94,47 @@ describe("tauriClient", () => {
     });
     expect(invokeMock).toHaveBeenNthCalledWith(9, "recent_input_history");
     expect(invokeMock).toHaveBeenNthCalledWith(10, "clear_input_history");
+  });
+
+  it("fills incremental status defaults for legacy index status responses", async () => {
+    invokeMock.mockResolvedValueOnce({
+      kind: "ready",
+      entryCount: 12,
+      message: null,
+      generation: 3,
+      completedAtMs: 100,
+    });
+
+    await expect(indexStatus()).resolves.toMatchObject({
+      incremental: defaultRuntimeIncrementalStatus(),
+    });
+  });
+
+  it("keeps unknown path and backend error fields out of the incremental contract", async () => {
+    invokeMock.mockResolvedValueOnce({
+      kind: "ready",
+      entryCount: 12,
+      generation: 3,
+      completedAtMs: 100,
+      incremental: {
+        enabled: true,
+        state: "degraded",
+        dirtyRoots: 1,
+        rootPath: "/Users/private/Documents",
+        backendError: "watcher backend disconnected",
+      },
+    });
+
+    const status = await indexStatus();
+    const serialized = JSON.stringify(status.incremental);
+
+    expect(serialized).not.toContain("/Users/private");
+    expect(serialized).not.toContain("watcher backend disconnected");
+    expect(status.incremental).toEqual({
+      ...defaultRuntimeIncrementalStatus(),
+      state: "degraded",
+      dirtyRoots: 1,
+    });
   });
 
   it("reports the current Tauri window label when it is available", () => {
@@ -148,6 +195,28 @@ describe("tauriClient", () => {
     await listenIndexStatus(handler);
 
     expect(listenMock).toHaveBeenCalledWith("quickfox://index-status", expect.any(Function));
+  });
+
+  it("normalizes legacy index status events before notifying the app", async () => {
+    const handler = vi.fn();
+    listenMock.mockResolvedValueOnce(vi.fn());
+    await listenIndexStatus(handler);
+    const listener = listenMock.mock.calls[0]?.[1] as (event: {
+      payload: Record<string, unknown>;
+    }) => void;
+
+    listener({
+      payload: {
+        kind: "ready",
+        entryCount: 12,
+        generation: 3,
+        completedAtMs: 100,
+      },
+    });
+
+    expect(handler).toHaveBeenCalledWith(
+      expect.objectContaining({ incremental: defaultRuntimeIncrementalStatus() }),
+    );
   });
 
   it("returns a noop unlisten when Tauri event listen is unavailable", async () => {

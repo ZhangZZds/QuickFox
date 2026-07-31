@@ -5018,7 +5018,7 @@ fn apply_runtime_indexing_event(
             {
                 return None;
             }
-            runtime.incremental_status = if runtime.index_refresh.watcher_calibration_required
+            let incremental_status = if runtime.index_refresh.watcher_calibration_required
                 && incremental_status.state == IncrementalState::Watching
             {
                 RuntimeIncrementalStatus {
@@ -5028,6 +5028,10 @@ fn apply_runtime_indexing_event(
             } else {
                 incremental_status
             };
+            if runtime.incremental_status == incremental_status {
+                return None;
+            }
+            runtime.incremental_status = incremental_status;
             Some(RuntimeIndexingEventApplication {
                 status: runtime.index_status(),
                 request_refresh: false,
@@ -7651,6 +7655,51 @@ mod tests {
             IncrementalState::Preparing
         );
         assert!(runtime.manifest_ready);
+    }
+
+    #[test]
+    fn duplicate_runtime_status_is_suppressed_without_losing_transitions() {
+        let config = QuickFoxConfig::default_with_index_dirs(vec!["/tmp".to_owned()]);
+        let service = RuntimeServiceIdentity {
+            epoch: 1,
+            config_revision: 0,
+        };
+        let mut runtime = build_runtime_from_snapshot(config, None);
+        runtime.index_refresh.active_service = Some(service);
+        runtime.incremental_status = RuntimeIncrementalStatus {
+            state: IncrementalState::Watching,
+            ..RuntimeIncrementalStatus::default()
+        };
+        let watching = runtime.incremental_status.clone();
+
+        assert!(apply_runtime_indexing_event(
+            &mut runtime,
+            &service,
+            RuntimeIndexingEvent::Status(watching.clone()),
+        )
+        .is_none());
+
+        let degraded = RuntimeIncrementalStatus {
+            state: IncrementalState::Degraded,
+            dirty_roots: 1,
+            degradation_code: Some(IndexDegradationCode::WatcherOverflow),
+            ..watching.clone()
+        };
+        assert!(apply_runtime_indexing_event(
+            &mut runtime,
+            &service,
+            RuntimeIndexingEvent::Status(degraded),
+        )
+        .is_some());
+        assert_eq!(runtime.incremental_status.state, IncrementalState::Degraded);
+
+        assert!(apply_runtime_indexing_event(
+            &mut runtime,
+            &service,
+            RuntimeIndexingEvent::Status(watching),
+        )
+        .is_some());
+        assert_eq!(runtime.incremental_status.state, IncrementalState::Watching);
     }
 
     #[test]
