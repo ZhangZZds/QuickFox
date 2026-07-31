@@ -23,6 +23,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(test)]
 static SEARCH_INDEX_CLONE_COUNT: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+std::thread_local! {
+    static MATERIALIZED_ENTRY_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static MATERIALIZED_SNAPSHOT_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct IndexScanner;
@@ -122,8 +127,15 @@ impl Clone for SearchIndex {
 
 impl SearchIndex {
     pub fn from_entries(entries: Vec<IndexedEntry>) -> Self {
-        let compact_candidates = CompactCandidateIndex::from_entries(entries);
-        Self {
+        Self::try_from_entries(entries)
+            .expect("known-size SearchIndex build exceeded compact u32 limits")
+    }
+
+    pub fn try_from_entries(
+        entries: Vec<IndexedEntry>,
+    ) -> Result<Self, crate::core::compact_index::CompactIndexBuildError> {
+        let compact_candidates = CompactCandidateIndex::try_from_entries(entries)?;
+        Ok(Self {
             content_entry_index_by_path: None,
             compact_candidates,
             content_index: None,
@@ -131,7 +143,23 @@ impl SearchIndex {
             content_entry_lookup_probe_count: AtomicUsize::new(0),
             #[cfg(test)]
             content_visibility_entry_scan_count: AtomicUsize::new(0),
-        }
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_from_entries_with_arena_limit(
+        entries: Vec<IndexedEntry>,
+        arena_limit: usize,
+    ) -> Result<Self, crate::core::compact_index::CompactIndexBuildError> {
+        let compact_candidates =
+            CompactCandidateIndex::try_from_entries_with_arena_limit(entries, arena_limit)?;
+        Ok(Self {
+            content_entry_index_by_path: None,
+            compact_candidates,
+            content_index: None,
+            content_entry_lookup_probe_count: AtomicUsize::new(0),
+            content_visibility_entry_scan_count: AtomicUsize::new(0),
+        })
     }
 
     pub fn from_entries_with_content_index(
@@ -143,8 +171,31 @@ impl SearchIndex {
         index
     }
 
+    pub fn try_from_entries_with_content_index(
+        entries: Vec<IndexedEntry>,
+        content_index: ContentIndex,
+    ) -> Result<Self, crate::core::compact_index::CompactIndexBuildError> {
+        let mut index = Self::try_from_entries(entries)?;
+        index.attach_content_index(content_index);
+        Ok(index)
+    }
+
     pub fn materialized_entries(&self) -> Vec<IndexedEntry> {
+        #[cfg(test)]
+        MATERIALIZED_SNAPSHOT_COUNT.set(MATERIALIZED_SNAPSHOT_COUNT.get().saturating_add(1));
+        #[cfg(test)]
+        MATERIALIZED_ENTRY_COUNT.set(
+            MATERIALIZED_ENTRY_COUNT
+                .get()
+                .saturating_add(self.entry_count()),
+        );
         self.compact_candidates.materialized_entries()
+    }
+
+    fn materialize_entry(&self, id: crate::core::compact_index::EntryId) -> Option<IndexedEntry> {
+        #[cfg(test)]
+        MATERIALIZED_ENTRY_COUNT.set(MATERIALIZED_ENTRY_COUNT.get().saturating_add(1));
+        self.compact_candidates.materialize(id)
     }
 
     pub fn entry_count(&self) -> usize {
@@ -153,6 +204,22 @@ impl SearchIndex {
 
     pub fn is_empty(&self) -> bool {
         self.compact_candidates.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_materialization_counts() {
+        MATERIALIZED_ENTRY_COUNT.set(0);
+        MATERIALIZED_SNAPSHOT_COUNT.set(0);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn materialized_entry_count() -> usize {
+        MATERIALIZED_ENTRY_COUNT.get()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn materialized_snapshot_count() -> usize {
+        MATERIALIZED_SNAPSHOT_COUNT.get()
     }
 
     pub fn memory_estimate(&self) -> SearchIndexMemoryEstimate {
@@ -533,7 +600,7 @@ impl SearchIndex {
             ) {
                 continue;
             }
-            let Some(entry) = self.compact_candidates.materialize(id) else {
+            let Some(entry) = self.materialize_entry(id) else {
                 continue;
             };
             if !is_visible(&entry) {
@@ -595,17 +662,18 @@ impl SearchIndex {
             ContentSearchVisibility::AllVisible => None,
             ContentSearchVisibility::PathFilter(path_filter) => Some(path_filter),
             ContentSearchVisibility::EntryPredicate => {
-                let hidden_paths: HashSet<_> = self
-                    .materialized_entries()
-                    .into_iter()
-                    .filter(|entry| {
-                        #[cfg(test)]
-                        self.content_visibility_entry_scan_count
-                            .fetch_add(1, Ordering::Relaxed);
-                        !is_visible(entry)
-                    })
-                    .map(|entry| entry.path)
-                    .collect();
+                let mut hidden_paths = HashSet::new();
+                for id in self.compact_candidates.entry_ids() {
+                    let Some(entry) = self.materialize_entry(id) else {
+                        continue;
+                    };
+                    #[cfg(test)]
+                    self.content_visibility_entry_scan_count
+                        .fetch_add(1, Ordering::Relaxed);
+                    if !is_visible(&entry) {
+                        hidden_paths.insert(entry.path);
+                    }
+                }
                 if hidden_paths.is_empty() {
                     None
                 } else {
@@ -630,8 +698,9 @@ impl SearchIndex {
                     .as_ref()
                     .and_then(|lookup| lookup.get(&hit.path))
                     .and_then(|index| {
-                        self.compact_candidates
-                            .materialize(crate::core::compact_index::EntryId::from_usize(*index)?)
+                        self.materialize_entry(crate::core::compact_index::EntryId::from_usize(
+                            *index,
+                        )?)
                     })
                     .map(|entry| {
                         entry_to_result(&entry)
@@ -699,18 +768,25 @@ impl SearchIndex {
         };
 
         let mut results = Vec::new();
-        for (index, entry) in self.materialized_entries().into_iter().enumerate() {
+        for (index, id) in self.compact_candidates.entry_ids().enumerate() {
             if index % 1024 == 0 && is_cancelled() {
                 return None;
             }
+            let Some(entry_ref) = self.compact_candidates.entry_ref(id) else {
+                continue;
+            };
+            if !regex.is_match(entry_ref.name()) && !regex.is_match(entry_ref.path()) {
+                continue;
+            }
+            let Some(entry) = self.materialize_entry(id) else {
+                continue;
+            };
             if !is_visible(&entry) {
                 continue;
             }
-            if regex.is_match(&entry.name) || regex.is_match(&entry.path) {
-                results.push(entry_to_result(&entry));
-                if results.len() >= limit {
-                    break;
-                }
+            results.push(entry_to_result(&entry));
+            if results.len() >= limit {
+                break;
             }
         }
         Some(results)
@@ -1807,6 +1883,40 @@ mod tests {
     }
 
     #[test]
+    fn regex_limit_materializes_only_the_matching_result() {
+        let index = SearchIndex::from_entries(vec![
+            file_entry("/tmp/match.md"),
+            file_entry("/tmp/later-1.md"),
+            file_entry("/tmp/later-2.md"),
+        ]);
+        let parser = crate::core::search::QueryParser::new(Default::default());
+        SearchIndex::reset_materialization_counts();
+
+        let results = index.search_with_limit(&parser.parse("re:^match"), 1);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(SearchIndex::materialized_snapshot_count(), 0);
+        assert_eq!(SearchIndex::materialized_entry_count(), 1);
+    }
+
+    #[test]
+    fn cancelled_regex_does_not_materialize_the_index_snapshot() {
+        let index = SearchIndex::from_entries(
+            (0..128)
+                .map(|number| file_entry(&format!("/tmp/item-{number}.md")))
+                .collect(),
+        );
+        let parser = crate::core::search::QueryParser::new(Default::default());
+        SearchIndex::reset_materialization_counts();
+
+        let results = index.search_with_limit_cancellable(&parser.parse("re:item"), 10, || true);
+
+        assert!(results.is_none());
+        assert_eq!(SearchIndex::materialized_snapshot_count(), 0);
+        assert_eq!(SearchIndex::materialized_entry_count(), 0);
+    }
+
+    #[test]
     fn visibility_filter_precedes_content_only_query_limit() {
         let root = temp_dir("content-visibility");
         fs::create_dir_all(&root).unwrap();
@@ -1837,6 +1947,36 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].title, "visible.md");
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn content_visibility_predicate_streams_entries_without_a_snapshot_vec() {
+        let (_workspace, index) = large_visibility_content_fixture("stream-content-visibility");
+        let parser = crate::core::search::QueryParser::new(Default::default());
+        SearchIndex::reset_materialization_counts();
+
+        let results =
+            index.search_with_limit_visible(&parser.parse("content:needle"), 1, |entry| {
+                entry.name == "shared-visible.md"
+            });
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(SearchIndex::materialized_snapshot_count(), 0);
+        assert!(SearchIndex::materialized_entry_count() >= index.entry_count());
+    }
+
+    #[test]
+    fn fallible_search_index_build_propagates_compact_arena_errors() {
+        let error = SearchIndex::try_from_entries_with_arena_limit(
+            vec![file_entry("/workspace/QuickFox/AGENTS.md")],
+            8,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            crate::core::compact_index::CompactIndexBuildError::ArenaTooLarge { .. }
+        ));
     }
 
     #[test]

@@ -158,6 +158,13 @@ impl EntryTable {
     }
 
     pub fn try_from_entries(entries: Vec<IndexedEntry>) -> Result<Self, CompactIndexBuildError> {
+        Self::try_from_entries_with_arena_limit(entries, MISSING_RANGE_START as usize - 1)
+    }
+
+    fn try_from_entries_with_arena_limit(
+        entries: Vec<IndexedEntry>,
+        arena_limit: usize,
+    ) -> Result<Self, CompactIndexBuildError> {
         if entries.len() > u32::MAX as usize {
             return Err(CompactIndexBuildError::TooManyEntries {
                 count: entries.len(),
@@ -165,7 +172,7 @@ impl EntryTable {
         }
 
         let mut table = Self::default();
-        let mut arena = PackedArenaBuilder::default();
+        let mut arena = PackedArenaBuilder::with_limit(arena_limit);
         let mut ids = EntryIdAllocator::default();
 
         for entry in entries {
@@ -310,19 +317,28 @@ impl EntryTable {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct PackedArenaBuilder {
     arena: Vec<u8>,
     ranges_by_value: HashMap<String, PackedTextRange>,
+    arena_limit: usize,
 }
 
 impl PackedArenaBuilder {
+    fn with_limit(arena_limit: usize) -> Self {
+        Self {
+            arena: Vec::new(),
+            ranges_by_value: HashMap::new(),
+            arena_limit: arena_limit.min(MISSING_RANGE_START as usize - 1),
+        }
+    }
+
     fn store(&mut self, value: &str) -> Result<PackedTextRange, CompactIndexBuildError> {
         if let Some(range) = self.ranges_by_value.get(value) {
             return Ok(*range);
         }
         let requested_bytes = self.arena.len().saturating_add(value.len());
-        if requested_bytes >= MISSING_RANGE_START as usize {
+        if requested_bytes > self.arena_limit {
             return Err(CompactIndexBuildError::ArenaTooLarge { requested_bytes });
         }
         let range = PackedTextRange {
@@ -602,13 +618,25 @@ pub struct CompactCandidateMemoryStats {
 
 impl CompactCandidateIndex {
     pub fn from_entries(entries: Vec<IndexedEntry>) -> Self {
+        Self::try_from_entries(entries)
+            .expect("known-size compact candidate build exceeded u32 limits")
+    }
+
+    pub fn try_from_entries(entries: Vec<IndexedEntry>) -> Result<Self, CompactIndexBuildError> {
+        Self::try_from_entries_with_arena_limit(entries, MISSING_RANGE_START as usize - 1)
+    }
+
+    pub(crate) fn try_from_entries_with_arena_limit(
+        entries: Vec<IndexedEntry>,
+        arena_limit: usize,
+    ) -> Result<Self, CompactIndexBuildError> {
         #[cfg(test)]
         let build_id = COMPACT_INDEX_BUILD_COUNT
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1);
 
-        let table = EntryTable::from_entries(entries);
-        Self {
+        let table = EntryTable::try_from_entries_with_arena_limit(entries, arena_limit)?;
+        Ok(Self {
             name_tokens: NameTokenIndex::build(&table),
             prefixes: PrefixIndex::build(&table),
             name_trigrams: NameTrigramIndex::build(&table),
@@ -618,7 +646,7 @@ impl CompactCandidateIndex {
             table,
             #[cfg(test)]
             build_id,
-        }
+        })
     }
 
     #[cfg(test)]
@@ -742,6 +770,10 @@ impl CompactCandidateIndex {
             table: &self.table,
             entry,
         })
+    }
+
+    pub fn entry_ids(&self) -> impl Iterator<Item = EntryId> + '_ {
+        self.table.entries().iter().map(|entry| entry.id)
     }
 
     pub fn materialized_entries(&self) -> Vec<IndexedEntry> {
@@ -1118,6 +1150,24 @@ mod tests {
             table.search_text(table.get(EntryId(0)).unwrap()),
             custom_search_text
         );
+    }
+
+    #[test]
+    fn fallible_candidate_build_reports_an_arena_limit_without_panicking() {
+        let error = CompactCandidateIndex::try_from_entries_with_arena_limit(
+            vec![IndexedEntry::legacy(
+                "/workspace/QuickFox/AGENTS.md",
+                "AGENTS.md",
+                IndexedEntryKind::File,
+            )],
+            8,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            CompactIndexBuildError::ArenaTooLarge { .. }
+        ));
     }
 
     #[test]

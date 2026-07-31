@@ -5389,9 +5389,10 @@ fn build_runtime_from_recovery(
         };
     }
     let index_refresh = IndexRefreshControl::for_config(&config);
-    if should_build_content_index_for_config(&config, &recovery.index.materialized_entries()) {
+    let recovered_entries = recovery.index.materialized_entries();
+    if should_build_content_index_for_config(&config, &recovered_entries) {
         let generation = recovery.index.generation();
-        let mut entries = recovery.index.materialized_entries();
+        let mut entries = recovered_entries;
         for entry in &mut entries {
             entry.content_index_state = ContentIndexState::NotIndexed;
         }
@@ -5547,11 +5548,43 @@ fn build_search_index_for_config(
 
 fn build_search_index_with_content_for_config(
     config: &QuickFoxConfig,
+    entries: Vec<IndexedEntry>,
+) -> Result<SearchIndex, String> {
+    build_search_index_with_content_for_config_using(config, entries, |entries, content_index| {
+        match content_index {
+            Some(content_index) => {
+                SearchIndex::try_from_entries_with_content_index(entries, content_index)
+            }
+            None => SearchIndex::try_from_entries(entries),
+        }
+        .map_err(|error| format!("compact index arena build failed: {error:?}"))
+    })
+}
+
+#[cfg(test)]
+fn build_search_index_with_content_for_config_with_arena_limit(
+    config: &QuickFoxConfig,
+    entries: Vec<IndexedEntry>,
+    arena_limit: usize,
+) -> Result<SearchIndex, String> {
+    build_search_index_with_content_for_config_using(config, entries, |entries, content_index| {
+        let mut index = SearchIndex::try_from_entries_with_arena_limit(entries, arena_limit)
+            .map_err(|error| format!("compact index arena build failed: {error:?}"))?;
+        if let Some(content_index) = content_index {
+            index.attach_content_index(content_index);
+        }
+        Ok(index)
+    })
+}
+
+fn build_search_index_with_content_for_config_using(
+    config: &QuickFoxConfig,
     mut entries: Vec<IndexedEntry>,
+    build_index: impl FnOnce(Vec<IndexedEntry>, Option<ContentIndex>) -> Result<SearchIndex, String>,
 ) -> Result<SearchIndex, String> {
     let content_roots = content_index_roots(config);
     if content_roots.is_empty() {
-        return Ok(SearchIndex::from_entries(entries));
+        return build_index(entries, None);
     }
 
     let mut content_entries: Vec<_> = entries
@@ -5561,7 +5594,7 @@ fn build_search_index_with_content_for_config(
         .collect();
     ContentIndex::build(&mut content_entries, content_index_options(config))
         .map_err(|error| error.to_string())
-        .map(|content_index| {
+        .and_then(|content_index| {
             let states_by_path: std::collections::HashMap<_, _> = content_entries
                 .into_iter()
                 .map(|entry| (entry.path, entry.content_index_state))
@@ -5572,7 +5605,7 @@ fn build_search_index_with_content_for_config(
                     .cloned()
                     .unwrap_or(ContentIndexState::NotIndexed);
             }
-            SearchIndex::from_entries_with_content_index(entries, content_index)
+            build_index(entries, Some(content_index))
         })
 }
 
@@ -6573,6 +6606,52 @@ mod tests {
         assert_eq!(runtime.incremental_status.degradation_code, None);
         assert!(!runtime.manifest_ready);
         assert!(runtime.runtime_indexing.is_none());
+    }
+
+    #[test]
+    fn recovery_content_reset_materializes_the_baseline_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = SqliteStorage::open(temp.path().join("one-snapshot.sqlite")).unwrap();
+        let entry = IndexedEntry::from_path_metadata(
+            "/root/legacy.md",
+            "/root",
+            crate::core::index::IndexedEntryKind::File,
+        );
+        let baseline_id = storage
+            .save_completed_index_batch(10, std::slice::from_ref(&entry))
+            .unwrap();
+        storage.activate_baseline(baseline_id, 0).unwrap();
+        let recovery = recover_layered_index(&storage);
+        let mut config = QuickFoxConfig::default_with_index_dirs(vec!["/root".to_owned()]);
+        config.index.content_include_dirs = vec!["/root".to_owned()];
+        SearchIndex::reset_materialization_counts();
+
+        let runtime = build_runtime_from_recovery(config, recovery);
+
+        assert_eq!(runtime.index.entry_count(), 1);
+        assert_eq!(
+            SearchIndex::materialized_snapshot_count(),
+            2,
+            "one recovered snapshot plus one new baseline metadata snapshot"
+        );
+    }
+
+    #[test]
+    fn production_search_index_builder_returns_compact_arena_errors() {
+        let config = QuickFoxConfig::default_with_index_dirs(vec!["/root".to_owned()]);
+
+        let error = build_search_index_with_content_for_config_with_arena_limit(
+            &config,
+            vec![IndexedEntry::from_path_metadata(
+                "/root/AGENTS.md",
+                "/root",
+                IndexedEntryKind::File,
+            )],
+            8,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("arena"), "unexpected error: {error}");
     }
 
     #[test]
