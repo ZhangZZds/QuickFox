@@ -85,13 +85,17 @@ pub struct SearchIndexMemoryEstimate {
 }
 
 impl SearchIndexMemoryEstimate {
-    pub fn total_resident_bytes(&self) -> usize {
-        self.search_index_struct_bytes
-            .saturating_add(self.legacy_entry_bytes)
+    pub fn heap_allocated_bytes(&self) -> usize {
+        self.legacy_entry_bytes
             .saturating_add(self.duplicate_search_text_bytes)
             .saturating_add(self.compact_candidate_bytes)
             .saturating_add(self.path_lookup_bytes)
             .saturating_add(self.optional_cache_bytes)
+    }
+
+    pub fn total_resident_bytes(&self) -> usize {
+        self.search_index_struct_bytes
+            .saturating_add(self.heap_allocated_bytes())
     }
 }
 
@@ -172,8 +176,10 @@ impl SearchIndex {
             .content_entry_index_by_path
             .as_ref()
             .map(|lookup| {
-                std::mem::size_of::<HashMap<String, usize>>()
-                    .saturating_add(lookup.keys().map(String::capacity).sum())
+                lookup
+                    .keys()
+                    .map(String::capacity)
+                    .sum::<usize>()
                     .saturating_add(
                         lookup
                             .capacity()
@@ -189,7 +195,7 @@ impl SearchIndex {
             cached_search_text_bytes,
             legacy_entry_bytes: entry_struct_bytes.saturating_add(entry_string_bytes),
             duplicate_search_text_bytes,
-            compact_candidate_bytes: compact_stats.total_resident_bytes,
+            compact_candidate_bytes: compact_stats.heap_bytes,
             retained_build_interner_bytes: compact_stats.retained_build_interner_bytes,
             prefix_key_count: compact_stats.prefix_key_count,
             path_lookup_entry_count,
@@ -1685,6 +1691,22 @@ mod tests {
         let estimate = search_index.memory_estimate();
 
         assert_eq!(estimate.retained_build_interner_bytes, 0, "{estimate:#?}");
+    }
+
+    #[test]
+    fn search_index_memory_total_counts_compact_struct_inline_once() {
+        let fixture = SyntheticLargeIndexFixture::new(128);
+        let search_index = SearchIndex::from_entries(fixture.entries);
+        let estimate = search_index.memory_estimate();
+        let compact_stats = search_index.compact_candidates.memory_stats();
+
+        assert_eq!(estimate.compact_candidate_bytes, compact_stats.heap_bytes);
+        assert_eq!(
+            estimate.total_resident_bytes(),
+            estimate
+                .search_index_struct_bytes
+                .saturating_add(estimate.heap_allocated_bytes())
+        );
     }
 
     #[test]

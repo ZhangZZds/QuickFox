@@ -60,17 +60,19 @@ impl PathTombstones {
     }
 
     fn estimated_bytes(&self) -> usize {
-        std::mem::size_of::<Self>().saturating_add(
-            self.exact
-                .iter()
-                .chain(&self.directories)
-                .map(|path| {
-                    path.capacity()
-                        .saturating_add(std::mem::size_of::<String>())
-                        .saturating_add(std::mem::size_of::<usize>().saturating_mul(3))
-                })
-                .sum(),
-        )
+        std::mem::size_of::<Self>().saturating_add(self.estimated_heap_bytes())
+    }
+
+    fn estimated_heap_bytes(&self) -> usize {
+        self.exact
+            .iter()
+            .chain(&self.directories)
+            .map(|path| {
+                path.capacity()
+                    .saturating_add(std::mem::size_of::<String>())
+                    .saturating_add(std::mem::size_of::<usize>().saturating_mul(3))
+            })
+            .sum()
     }
 
     fn clear(&mut self) {
@@ -452,8 +454,51 @@ impl LayeredSearchIndex {
     }
 
     pub fn estimated_delta_bytes(&self) -> usize {
-        let overlay_bytes: usize = self
-            .overlay_entries
+        let overlay_bytes = std::mem::size_of::<BTreeMap<String, IndexedEntry>>()
+            .saturating_add(self.overlay_entries_heap_bytes());
+        let overlay_index = self.overlay.memory_estimate();
+        overlay_bytes
+            .saturating_add(
+                std::mem::size_of::<BTreeMap<String, u64>>()
+                    .saturating_add(self.overlay_generations_heap_bytes()),
+            )
+            .saturating_add(overlay_index.entry_struct_bytes)
+            .saturating_add(overlay_index.entry_string_bytes)
+            .saturating_add(overlay_index.cached_search_text_bytes)
+            .saturating_add(overlay_index.compact_candidate_bytes)
+            .saturating_add(overlay_index.path_lookup_bytes)
+            .saturating_add(self.tombstones.estimated_bytes())
+            .saturating_add(self.content_visibility.estimated_bytes())
+    }
+
+    pub fn estimated_total_resident_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(self.baseline.memory_estimate().heap_allocated_bytes())
+            .saturating_add(self.baseline_path_metadata_heap_bytes())
+            .saturating_add(self.overlay_entries_heap_bytes())
+            .saturating_add(self.overlay_generations_heap_bytes())
+            .saturating_add(self.overlay.memory_estimate().heap_allocated_bytes())
+            .saturating_add(self.tombstones.estimated_heap_bytes())
+            .saturating_add(self.content_visibility.estimated_bytes())
+    }
+
+    pub fn estimated_baseline_path_metadata_bytes(&self) -> usize {
+        self.baseline_path_metadata_heap_bytes()
+    }
+
+    fn baseline_path_metadata_heap_bytes(&self) -> usize {
+        self.baseline_by_path
+            .keys()
+            .map(|path| {
+                path.capacity()
+                    .saturating_add(std::mem::size_of::<(String, IndexedEntryKind)>())
+                    .saturating_add(std::mem::size_of::<usize>().saturating_mul(3))
+            })
+            .sum()
+    }
+
+    fn overlay_entries_heap_bytes(&self) -> usize {
+        self.overlay_entries
             .iter()
             .map(|(key, entry)| {
                 key.capacity()
@@ -462,43 +507,17 @@ impl LayeredSearchIndex {
                     .saturating_add(std::mem::size_of::<usize>().saturating_mul(3))
                     .saturating_add(indexed_entry_string_bytes(entry))
             })
-            .sum::<usize>()
-            .saturating_add(std::mem::size_of::<BTreeMap<String, IndexedEntry>>());
-        let overlay_index = self.overlay.memory_estimate();
-        overlay_bytes
-            .saturating_add(
-                self.overlay_generations
-                    .keys()
-                    .map(|path| {
-                        path.capacity()
-                            .saturating_add(std::mem::size_of::<(String, u64)>())
-                    })
-                    .sum::<usize>()
-                    .saturating_add(std::mem::size_of::<BTreeMap<String, u64>>()),
-            )
-            .saturating_add(overlay_index.total_resident_bytes())
-            .saturating_add(self.tombstones.estimated_bytes())
-            .saturating_add(self.content_visibility.estimated_bytes())
+            .sum()
     }
 
-    pub fn estimated_total_resident_bytes(&self) -> usize {
-        std::mem::size_of::<Self>()
-            .saturating_add(self.baseline.memory_estimate().total_resident_bytes())
-            .saturating_add(self.estimated_baseline_path_metadata_bytes())
-            .saturating_add(self.estimated_delta_bytes())
-    }
-
-    pub fn estimated_baseline_path_metadata_bytes(&self) -> usize {
-        let entries: usize = self
-            .baseline_by_path
+    fn overlay_generations_heap_bytes(&self) -> usize {
+        self.overlay_generations
             .keys()
             .map(|path| {
                 path.capacity()
-                    .saturating_add(std::mem::size_of::<(String, IndexedEntryKind)>())
-                    .saturating_add(std::mem::size_of::<usize>().saturating_mul(3))
+                    .saturating_add(std::mem::size_of::<(String, u64)>())
             })
-            .sum();
-        std::mem::size_of::<BTreeMap<String, IndexedEntryKind>>().saturating_add(entries)
+            .sum()
     }
 
     pub fn generation(&self) -> u64 {
@@ -743,6 +762,7 @@ mod tests {
     use crate::core::index_watcher::IndexUpdateBatch;
     use crate::core::search::{HistoryScores, QueryRequest, Ranker, SearchMode};
     use crate::core::storage::SqliteStorage;
+    use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
@@ -1459,6 +1479,43 @@ mod tests {
             "estimate={} lower_bound={obvious_duplicate_lower_bound}",
             index.estimated_delta_bytes()
         );
+    }
+
+    #[test]
+    fn delta_safety_estimate_keeps_the_existing_component_semantics() {
+        let index = LayeredSearchIndex::from_baseline(Vec::new());
+        let overlay_index = index.overlay.memory_estimate();
+        let expected = std::mem::size_of::<BTreeMap<String, IndexedEntry>>()
+            .saturating_add(std::mem::size_of::<BTreeMap<String, u64>>())
+            .saturating_add(overlay_index.entry_struct_bytes)
+            .saturating_add(overlay_index.entry_string_bytes)
+            .saturating_add(overlay_index.cached_search_text_bytes)
+            .saturating_add(overlay_index.compact_candidate_bytes)
+            .saturating_add(overlay_index.path_lookup_bytes)
+            .saturating_add(index.tombstones.estimated_bytes())
+            .saturating_add(index.content_visibility.estimated_bytes());
+
+        assert_eq!(index.estimated_delta_bytes(), expected);
+    }
+
+    #[test]
+    fn layered_memory_total_counts_inline_search_indexes_and_containers_once() {
+        let baseline = vec![entry(
+            PathBuf::from("/tmp/root/AGENTS.md"),
+            Path::new("/tmp/root"),
+            IndexedEntryKind::File,
+        )];
+        let index = LayeredSearchIndex::from_baseline(baseline);
+        let expected = std::mem::size_of::<LayeredSearchIndex>()
+            .saturating_add(index.baseline.memory_estimate().heap_allocated_bytes())
+            .saturating_add(index.baseline_path_metadata_heap_bytes())
+            .saturating_add(index.overlay_entries_heap_bytes())
+            .saturating_add(index.overlay_generations_heap_bytes())
+            .saturating_add(index.overlay.memory_estimate().heap_allocated_bytes())
+            .saturating_add(index.tombstones.estimated_heap_bytes())
+            .saturating_add(index.content_visibility.estimated_bytes());
+
+        assert_eq!(index.estimated_total_resident_bytes(), expected);
     }
 
     #[test]

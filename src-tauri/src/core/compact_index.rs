@@ -70,7 +70,16 @@ pub struct EntryTableMemoryEstimate {
     pub entry_struct_bytes: usize,
     pub string_pool_unique_values: usize,
     pub string_pool_bytes: usize,
+    pub string_pool_heap_bytes: usize,
     pub retained_build_interner_bytes: usize,
+}
+
+impl EntryTableMemoryEstimate {
+    pub fn total_resident_bytes(&self) -> usize {
+        std::mem::size_of::<EntryTable>()
+            .saturating_add(self.entry_struct_bytes)
+            .saturating_add(self.string_pool_heap_bytes)
+    }
 }
 
 impl EntryTable {
@@ -153,6 +162,7 @@ impl EntryTable {
                 .saturating_mul(std::mem::size_of::<CompactEntry>()),
             string_pool_unique_values: self.strings.len(),
             string_pool_bytes: self.strings.total_bytes(),
+            string_pool_heap_bytes: self.strings.estimated_heap_bytes(),
             retained_build_interner_bytes: self.strings.retained_interner_bytes(),
         }
     }
@@ -391,6 +401,7 @@ pub struct CompactCandidateMemoryStats {
     pub entry_count: usize,
     pub prefix_key_count: usize,
     pub retained_build_interner_bytes: usize,
+    pub heap_bytes: usize,
     pub total_resident_bytes: usize,
 }
 
@@ -520,19 +531,30 @@ impl CompactCandidateIndex {
     }
 
     pub fn estimated_bytes(&self) -> usize {
-        std::mem::size_of::<Self>()
-            .saturating_add(self.table.estimated_bytes())
-            .saturating_add(string_ids_map_bytes(&self.name_tokens.ids_by_token))
-            .saturating_add(string_ids_map_bytes(&self.prefixes.ids_by_prefix))
-            .saturating_add(string_ids_map_bytes(&self.name_trigrams.ids_by_trigram))
-            .saturating_add(string_ids_map_bytes(&self.extensions.ids_by_extension))
-            .saturating_add(string_ids_map_bytes(&self.path_segments.ids_by_segment))
-            .saturating_add(string_ids_map_bytes(&self.path_segments.ids_by_prefix))
-            .saturating_add(string_ids_map_bytes(&self.path_segments.ids_by_fuzzy_key))
-            .saturating_add(exact_path_map_bytes(&self.exact_paths.id_by_path))
+        std::mem::size_of::<Self>().saturating_add(self.estimated_heap_bytes())
+    }
+
+    fn estimated_heap_bytes(&self) -> usize {
+        self.table
+            .estimated_heap_bytes()
+            .saturating_add(string_ids_map_heap_bytes(&self.name_tokens.ids_by_token))
+            .saturating_add(string_ids_map_heap_bytes(&self.prefixes.ids_by_prefix))
+            .saturating_add(string_ids_map_heap_bytes(
+                &self.name_trigrams.ids_by_trigram,
+            ))
+            .saturating_add(string_ids_map_heap_bytes(&self.extensions.ids_by_extension))
+            .saturating_add(string_ids_map_heap_bytes(
+                &self.path_segments.ids_by_segment,
+            ))
+            .saturating_add(string_ids_map_heap_bytes(&self.path_segments.ids_by_prefix))
+            .saturating_add(string_ids_map_heap_bytes(
+                &self.path_segments.ids_by_fuzzy_key,
+            ))
+            .saturating_add(exact_path_map_heap_bytes(&self.exact_paths.id_by_path))
     }
 
     pub fn memory_stats(&self) -> CompactCandidateMemoryStats {
+        let heap_bytes = self.estimated_heap_bytes();
         CompactCandidateMemoryStats {
             entry_count: self.table.len(),
             prefix_key_count: self
@@ -541,20 +563,18 @@ impl CompactCandidateIndex {
                 .len()
                 .saturating_add(self.path_segments.ids_by_prefix.len()),
             retained_build_interner_bytes: self.table.strings.retained_interner_bytes(),
-            total_resident_bytes: self.estimated_bytes(),
+            heap_bytes,
+            total_resident_bytes: std::mem::size_of::<Self>().saturating_add(heap_bytes),
         }
     }
 }
 
 impl EntryTable {
-    fn estimated_bytes(&self) -> usize {
-        std::mem::size_of::<Self>()
-            .saturating_add(
-                self.entries
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<CompactEntry>()),
-            )
-            .saturating_add(self.strings.estimated_bytes())
+    fn estimated_heap_bytes(&self) -> usize {
+        self.entries
+            .capacity()
+            .saturating_mul(std::mem::size_of::<CompactEntry>())
+            .saturating_add(self.strings.estimated_heap_bytes())
     }
 }
 
@@ -595,15 +615,12 @@ impl StringPool {
         self.total_bytes
     }
 
-    fn estimated_bytes(&self) -> usize {
+    fn estimated_heap_bytes(&self) -> usize {
         let value_bytes: usize = self.values.iter().map(String::capacity).sum();
         let map_key_bytes: usize = self.ids_by_value.keys().map(String::capacity).sum();
-        std::mem::size_of::<Self>()
-            .saturating_add(
-                self.values
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<String>()),
-            )
+        self.values
+            .capacity()
+            .saturating_mul(std::mem::size_of::<String>())
             .saturating_add(value_bytes)
             .saturating_add(self.ids_by_value.capacity().saturating_mul(
                 std::mem::size_of::<String>().saturating_add(std::mem::size_of::<StringId>()),
@@ -622,7 +639,7 @@ impl StringPool {
     }
 }
 
-fn string_ids_map_bytes(map: &BTreeMap<String, Vec<EntryId>>) -> usize {
+fn string_ids_map_heap_bytes(map: &BTreeMap<String, Vec<EntryId>>) -> usize {
     let payload: usize = map
         .iter()
         .map(|(key, ids)| {
@@ -635,10 +652,10 @@ fn string_ids_map_bytes(map: &BTreeMap<String, Vec<EntryId>>) -> usize {
                 .saturating_add(std::mem::size_of::<usize>().saturating_mul(3))
         })
         .sum();
-    std::mem::size_of::<BTreeMap<String, Vec<EntryId>>>().saturating_add(payload)
+    payload
 }
 
-fn exact_path_map_bytes(map: &BTreeMap<String, EntryId>) -> usize {
+fn exact_path_map_heap_bytes(map: &BTreeMap<String, EntryId>) -> usize {
     let payload: usize = map
         .keys()
         .map(|key| {
@@ -647,7 +664,7 @@ fn exact_path_map_bytes(map: &BTreeMap<String, EntryId>) -> usize {
                 .saturating_add(std::mem::size_of::<usize>().saturating_mul(3))
         })
         .sum();
-    std::mem::size_of::<BTreeMap<String, EntryId>>().saturating_add(payload)
+    payload
 }
 
 fn intern_non_empty(pool: &mut StringPool, value: String) -> Option<StringId> {
@@ -966,6 +983,38 @@ mod tests {
         assert!(
             stats.prefix_key_count <= stats.entry_count.saturating_mul(2),
             "unbounded prefix storage: {stats:#?}"
+        );
+    }
+
+    #[test]
+    fn compact_memory_total_counts_the_inline_struct_once() {
+        let index = CompactCandidateIndex::from_entries(vec![IndexedEntry::legacy(
+            "D:\\workspace\\QuickFox\\AGENTS.md",
+            "AGENTS.md",
+            IndexedEntryKind::File,
+        )]);
+        let stats = index.memory_stats();
+
+        assert_eq!(
+            stats.total_resident_bytes,
+            std::mem::size_of::<CompactCandidateIndex>().saturating_add(stats.heap_bytes)
+        );
+    }
+
+    #[test]
+    fn entry_table_memory_total_counts_the_inline_string_pool_once() {
+        let table = EntryTable::from_entries(vec![IndexedEntry::legacy(
+            "D:\\workspace\\QuickFox\\AGENTS.md",
+            "AGENTS.md",
+            IndexedEntryKind::File,
+        )]);
+        let estimate = table.memory_estimate();
+
+        assert_eq!(
+            estimate.total_resident_bytes(),
+            std::mem::size_of::<EntryTable>()
+                .saturating_add(estimate.entry_struct_bytes)
+                .saturating_add(estimate.string_pool_heap_bytes)
         );
     }
 
