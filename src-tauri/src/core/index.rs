@@ -70,12 +70,29 @@ pub trait FileSearchIndex: Send + Sync {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SearchIndexMemoryEstimate {
     pub entry_count: usize,
+    pub search_index_struct_bytes: usize,
     pub entry_struct_bytes: usize,
     pub entry_string_bytes: usize,
     pub cached_search_text_bytes: usize,
+    pub legacy_entry_bytes: usize,
+    pub duplicate_search_text_bytes: usize,
     pub compact_candidate_bytes: usize,
+    pub retained_build_interner_bytes: usize,
+    pub prefix_key_count: usize,
     pub path_lookup_entry_count: usize,
     pub path_lookup_bytes: usize,
+    pub optional_cache_bytes: usize,
+}
+
+impl SearchIndexMemoryEstimate {
+    pub fn total_resident_bytes(&self) -> usize {
+        self.search_index_struct_bytes
+            .saturating_add(self.legacy_entry_bytes)
+            .saturating_add(self.duplicate_search_text_bytes)
+            .saturating_add(self.compact_candidate_bytes)
+            .saturating_add(self.path_lookup_bytes)
+            .saturating_add(self.optional_cache_bytes)
+    }
 }
 
 impl Clone for SearchIndex {
@@ -134,6 +151,18 @@ impl SearchIndex {
     }
 
     pub fn memory_estimate(&self) -> SearchIndexMemoryEstimate {
+        let compact_stats = self.compact_candidates.memory_stats();
+        let entry_struct_bytes = self
+            .entries
+            .capacity()
+            .saturating_mul(std::mem::size_of::<IndexedEntry>());
+        let entry_string_bytes = self.entries.iter().map(indexed_entry_string_bytes).sum();
+        let cached_search_text_bytes = self.search_texts.iter().map(String::capacity).sum();
+        let duplicate_search_text_bytes = self
+            .search_texts
+            .capacity()
+            .saturating_mul(std::mem::size_of::<String>())
+            .saturating_add(cached_search_text_bytes);
         let path_lookup_entry_count = self
             .content_entry_index_by_path
             .as_ref()
@@ -154,15 +183,22 @@ impl SearchIndex {
             .unwrap_or_default();
         SearchIndexMemoryEstimate {
             entry_count: self.entries.len(),
-            entry_struct_bytes: self
-                .entries
-                .capacity()
-                .saturating_mul(std::mem::size_of::<IndexedEntry>()),
-            entry_string_bytes: self.entries.iter().map(indexed_entry_string_bytes).sum(),
-            cached_search_text_bytes: self.search_texts.iter().map(String::capacity).sum(),
-            compact_candidate_bytes: self.compact_candidates.estimated_bytes(),
+            search_index_struct_bytes: std::mem::size_of::<Self>(),
+            entry_struct_bytes,
+            entry_string_bytes,
+            cached_search_text_bytes,
+            legacy_entry_bytes: entry_struct_bytes.saturating_add(entry_string_bytes),
+            duplicate_search_text_bytes,
+            compact_candidate_bytes: compact_stats.total_resident_bytes,
+            retained_build_interner_bytes: compact_stats.retained_build_interner_bytes,
+            prefix_key_count: compact_stats.prefix_key_count,
             path_lookup_entry_count,
             path_lookup_bytes,
+            optional_cache_bytes: self
+                .content_index
+                .as_ref()
+                .map(|index| index.memory_estimate().resident_cached_content_bytes)
+                .unwrap_or_default(),
         }
     }
 
@@ -1625,18 +1661,30 @@ mod tests {
     }
 
     #[test]
-    fn search_index_memory_estimate_reports_duplicate_search_text_storage() {
-        let fixture = SyntheticLargeIndexFixture::new(1_000);
+    fn search_index_memory_budget_excludes_legacy_entry_storage() {
+        let fixture = SyntheticLargeIndexFixture::new(128);
         let search_index = SearchIndex::from_entries(fixture.entries);
         let estimate = search_index.memory_estimate();
 
-        assert_eq!(estimate.entry_count, 1_000);
-        assert!(estimate.entry_string_bytes > 0);
-        assert!(estimate.cached_search_text_bytes > 0);
-        assert!(
-            estimate.cached_search_text_bytes >= estimate.entry_string_bytes / 4,
-            "cached search text should be visible in memory estimates: {estimate:?}"
-        );
+        assert_eq!(estimate.legacy_entry_bytes, 0, "{estimate:#?}");
+    }
+
+    #[test]
+    fn search_index_memory_budget_excludes_duplicate_search_text_storage() {
+        let fixture = SyntheticLargeIndexFixture::new(128);
+        let search_index = SearchIndex::from_entries(fixture.entries);
+        let estimate = search_index.memory_estimate();
+
+        assert_eq!(estimate.duplicate_search_text_bytes, 0, "{estimate:#?}");
+    }
+
+    #[test]
+    fn search_index_memory_budget_excludes_the_build_interner() {
+        let fixture = SyntheticLargeIndexFixture::new(128);
+        let search_index = SearchIndex::from_entries(fixture.entries);
+        let estimate = search_index.memory_estimate();
+
+        assert_eq!(estimate.retained_build_interner_bytes, 0, "{estimate:#?}");
     }
 
     #[test]
@@ -1983,6 +2031,20 @@ mod tests {
         let parser = crate::core::search::QueryParser::new(Default::default());
         let search_index = SearchIndex::from_entries(fixture.entries);
         let memory_estimate = search_index.memory_estimate();
+
+        println!(
+            "QUICKFOX_LARGE_INDEX_MEMORY scale={} total_resident_bytes={} estimate={memory_estimate:#?}",
+            scale,
+            memory_estimate.total_resident_bytes()
+        );
+        assert!(
+            memory_estimate.total_resident_bytes() < 500 * 1024 * 1024,
+            "2,000,000-entry resident estimate exceeds the 500 MiB target: {memory_estimate:#?}"
+        );
+        assert!(
+            memory_estimate.total_resident_bytes() < 800 * 1024 * 1024,
+            "2,000,000-entry resident estimate exceeds the 800 MiB hard limit: {memory_estimate:#?}"
+        );
 
         for query in large_index_benchmark_queries() {
             let started = Instant::now();

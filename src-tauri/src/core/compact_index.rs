@@ -70,6 +70,7 @@ pub struct EntryTableMemoryEstimate {
     pub entry_struct_bytes: usize,
     pub string_pool_unique_values: usize,
     pub string_pool_bytes: usize,
+    pub retained_build_interner_bytes: usize,
 }
 
 impl EntryTable {
@@ -148,10 +149,11 @@ impl EntryTable {
             entry_count: self.entries.len(),
             entry_struct_bytes: self
                 .entries
-                .len()
+                .capacity()
                 .saturating_mul(std::mem::size_of::<CompactEntry>()),
             string_pool_unique_values: self.strings.len(),
             string_pool_bytes: self.strings.total_bytes(),
+            retained_build_interner_bytes: self.strings.retained_interner_bytes(),
         }
     }
 
@@ -384,6 +386,14 @@ pub struct CandidateRetrieval {
     pub stats: CandidateRetrievalStats,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompactCandidateMemoryStats {
+    pub entry_count: usize,
+    pub prefix_key_count: usize,
+    pub retained_build_interner_bytes: usize,
+    pub total_resident_bytes: usize,
+}
+
 impl CompactCandidateIndex {
     pub fn from_entries(entries: Vec<IndexedEntry>) -> Self {
         #[cfg(test)]
@@ -521,6 +531,19 @@ impl CompactCandidateIndex {
             .saturating_add(string_ids_map_bytes(&self.path_segments.ids_by_fuzzy_key))
             .saturating_add(exact_path_map_bytes(&self.exact_paths.id_by_path))
     }
+
+    pub fn memory_stats(&self) -> CompactCandidateMemoryStats {
+        CompactCandidateMemoryStats {
+            entry_count: self.table.len(),
+            prefix_key_count: self
+                .prefixes
+                .ids_by_prefix
+                .len()
+                .saturating_add(self.path_segments.ids_by_prefix.len()),
+            retained_build_interner_bytes: self.table.strings.retained_interner_bytes(),
+            total_resident_bytes: self.estimated_bytes(),
+        }
+    }
 }
 
 impl EntryTable {
@@ -585,6 +608,16 @@ impl StringPool {
             .saturating_add(self.ids_by_value.capacity().saturating_mul(
                 std::mem::size_of::<String>().saturating_add(std::mem::size_of::<StringId>()),
             ))
+            .saturating_add(map_key_bytes)
+    }
+
+    fn retained_interner_bytes(&self) -> usize {
+        let map_key_bytes: usize = self.ids_by_value.keys().map(String::capacity).sum();
+        self.ids_by_value
+            .capacity()
+            .saturating_mul(
+                std::mem::size_of::<String>().saturating_add(std::mem::size_of::<StringId>()),
+            )
             .saturating_add(map_key_bytes)
     }
 }
@@ -901,6 +934,39 @@ mod tests {
         assert_eq!(estimate.string_pool_unique_values, table.string_pool_len());
         assert!(estimate.entry_struct_bytes >= std::mem::size_of::<CompactEntry>() * 2);
         assert!(estimate.string_pool_bytes > 0);
+    }
+
+    #[test]
+    fn entry_table_does_not_retain_its_build_interner() {
+        let table = EntryTable::from_entries(vec![IndexedEntry::legacy(
+            "D:\\workspace\\QuickFox\\AGENTS.md",
+            "AGENTS.md",
+            IndexedEntryKind::File,
+        )]);
+
+        assert_eq!(table.memory_estimate().retained_build_interner_bytes, 0);
+    }
+
+    #[test]
+    fn candidate_prefix_key_growth_is_bounded_per_entry() {
+        let index = CompactCandidateIndex::from_entries(vec![
+            IndexedEntry::legacy(
+                "D:\\workspace\\QuickFox\\docs\\AGENTS.md",
+                "AGENTS.md",
+                IndexedEntryKind::File,
+            ),
+            IndexedEntry::legacy(
+                "D:\\workspace\\QuickFox\\docs\\README.md",
+                "README.md",
+                IndexedEntryKind::File,
+            ),
+        ]);
+        let stats = index.memory_stats();
+
+        assert!(
+            stats.prefix_key_count <= stats.entry_count.saturating_mul(2),
+            "unbounded prefix storage: {stats:#?}"
+        );
     }
 
     #[test]

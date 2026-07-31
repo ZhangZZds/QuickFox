@@ -476,13 +476,16 @@ impl LayeredSearchIndex {
                     .sum::<usize>()
                     .saturating_add(std::mem::size_of::<BTreeMap<String, u64>>()),
             )
-            .saturating_add(overlay_index.entry_struct_bytes)
-            .saturating_add(overlay_index.entry_string_bytes)
-            .saturating_add(overlay_index.cached_search_text_bytes)
-            .saturating_add(overlay_index.compact_candidate_bytes)
-            .saturating_add(overlay_index.path_lookup_bytes)
+            .saturating_add(overlay_index.total_resident_bytes())
             .saturating_add(self.tombstones.estimated_bytes())
             .saturating_add(self.content_visibility.estimated_bytes())
+    }
+
+    pub fn estimated_total_resident_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(self.baseline.memory_estimate().total_resident_bytes())
+            .saturating_add(self.estimated_baseline_path_metadata_bytes())
+            .saturating_add(self.estimated_delta_bytes())
     }
 
     pub fn estimated_baseline_path_metadata_bytes(&self) -> usize {
@@ -1392,7 +1395,7 @@ mod tests {
     }
 
     #[test]
-    fn baseline_path_metadata_memory_is_reported_without_full_entry_copies() {
+    fn baseline_path_metadata_reuses_the_authoritative_compact_index() {
         let root = PathBuf::from("/tmp/root");
         let baseline: Vec<_> = (0..20_000)
             .map(|index| {
@@ -1403,20 +1406,29 @@ mod tests {
                 )
             })
             .collect();
-        let path_bytes: usize = baseline.iter().map(|entry| entry.path.len()).sum();
-        let full_entry_copy_lower_bound = path_bytes.saturating_add(
-            baseline
-                .len()
-                .saturating_mul(std::mem::size_of::<IndexedEntry>()),
-        );
         let index = LayeredSearchIndex::from_baseline(baseline);
 
-        let metadata_bytes = index.estimated_baseline_path_metadata_bytes();
-        let projected_two_million_bytes = metadata_bytes.saturating_mul(100);
+        assert_eq!(index.estimated_baseline_path_metadata_bytes(), 0);
+    }
 
-        assert!(metadata_bytes >= path_bytes);
-        assert!(metadata_bytes < full_entry_copy_lower_bound);
-        assert!(projected_two_million_bytes < 512 * 1024 * 1024);
+    #[test]
+    #[ignore = "2,000,000 baseline plus 10,000-entry delta resident memory budget"]
+    fn two_million_baseline_with_delta_stays_within_total_resident_memory_budget() {
+        const BASELINE_ENTRIES: usize = 2_000_000;
+        const DELTA_ENTRIES: usize = 10_000;
+        let mut index = LayeredSearchIndex::from_baseline(synthetic_layered_benchmark_entries(
+            BASELINE_ENTRIES,
+        ));
+        index.apply_delta(synthetic_layered_benchmark_delta(
+            BASELINE_ENTRIES,
+            DELTA_ENTRIES,
+        ));
+
+        let total_bytes = index.estimated_total_resident_bytes();
+        assert!(
+            total_bytes < 500 * 1024 * 1024,
+            "baseline + delta resident estimate is {total_bytes} bytes"
+        );
     }
 
     #[test]
