@@ -192,8 +192,8 @@ impl LayeredSearchIndex {
     }
 
     pub fn from_search_index(baseline: SearchIndex) -> Self {
-        let baseline_by_path: BTreeMap<_, _> = baseline
-            .entries()
+        let baseline_entries = baseline.materialized_entries();
+        let baseline_by_path: BTreeMap<_, _> = baseline_entries
             .iter()
             .map(|entry| (normalize_path_text_key(&entry.path), entry.kind.clone()))
             .collect();
@@ -350,7 +350,7 @@ impl LayeredSearchIndex {
 
     fn install_baseline(&mut self, baseline: SearchIndex, generation: u64) {
         self.baseline_by_path = baseline
-            .entries()
+            .materialized_entries()
             .iter()
             .map(|entry| (normalize_path_text_key(&entry.path), entry.kind.clone()))
             .collect();
@@ -366,9 +366,9 @@ impl LayeredSearchIndex {
 
     pub fn watched_roots(&self) -> Vec<PathBuf> {
         self.baseline
-            .entries()
-            .iter()
-            .chain(self.overlay_entries.values())
+            .materialized_entries()
+            .into_iter()
+            .chain(self.overlay_entries.values().cloned())
             .filter(|entry| !entry.root.is_empty())
             .map(|entry| PathBuf::from(&entry.root))
             .collect::<BTreeSet<_>>()
@@ -379,10 +379,9 @@ impl LayeredSearchIndex {
     pub fn materialized_entries(&self) -> Vec<IndexedEntry> {
         let mut entries: BTreeMap<String, IndexedEntry> = self
             .baseline
-            .entries()
-            .iter()
+            .materialized_entries()
+            .into_iter()
             .filter(|entry| self.baseline_entry_is_visible(entry))
-            .cloned()
             .map(|entry| (normalize_path_text_key(&entry.path), entry))
             .collect();
         entries.extend(self.overlay_entries.clone());
@@ -390,8 +389,8 @@ impl LayeredSearchIndex {
     }
 
     #[cfg(test)]
-    pub fn entries(&self) -> &[IndexedEntry] {
-        self.baseline.entries()
+    pub fn entries(&self) -> Vec<IndexedEntry> {
+        self.baseline.materialized_entries()
     }
 
     pub fn search(&self, query: &QueryRequest, candidate_budget: usize) -> Vec<SearchResult> {
@@ -437,7 +436,7 @@ impl LayeredSearchIndex {
     }
 
     pub fn baseline_entry_count(&self) -> usize {
-        self.baseline.entries().len()
+        self.baseline.entry_count()
     }
 
     pub fn overlay_entry_count(&self) -> usize {

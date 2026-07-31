@@ -6,7 +6,7 @@ use crate::core::content_index::{
     ContentIndex, ContentIndexOptions, ContentPathFilter, ContentSearchError, ContentSearchHit,
     PlainTextExtractor,
 };
-use crate::core::file_matcher::FileMatcher;
+use crate::core::file_matcher::{FileMatchCandidate, FileMatcher};
 use crate::core::file_query::FileQuery;
 pub use crate::core::index_entry::{
     ContentIndexState, IndexAvailability, IndexFailure, IndexLifecycle, IndexReport,
@@ -45,9 +45,7 @@ impl IndexScanner {
 
 #[derive(Debug, Default)]
 pub struct SearchIndex {
-    entries: Vec<IndexedEntry>,
     content_entry_index_by_path: Option<HashMap<String, usize>>,
-    search_texts: Vec<String>,
     compact_candidates: CompactCandidateIndex,
     content_index: Option<ContentIndex>,
     #[cfg(test)]
@@ -105,9 +103,7 @@ impl Clone for SearchIndex {
         SEARCH_INDEX_CLONE_COUNT.fetch_add(1, Ordering::Relaxed);
 
         Self {
-            entries: self.entries.clone(),
             content_entry_index_by_path: self.content_entry_index_by_path.clone(),
-            search_texts: self.search_texts.clone(),
             compact_candidates: self.compact_candidates.clone(),
             content_index: self.content_index.clone(),
             #[cfg(test)]
@@ -126,12 +122,9 @@ impl Clone for SearchIndex {
 
 impl SearchIndex {
     pub fn from_entries(entries: Vec<IndexedEntry>) -> Self {
-        let search_texts = entries.iter().map(searchable_text).collect();
-        let compact_candidates = CompactCandidateIndex::from_entries(entries.clone());
+        let compact_candidates = CompactCandidateIndex::from_entries(entries);
         Self {
-            entries,
             content_entry_index_by_path: None,
-            search_texts,
             compact_candidates,
             content_index: None,
             #[cfg(test)]
@@ -150,23 +143,24 @@ impl SearchIndex {
         index
     }
 
-    pub fn entries(&self) -> &[IndexedEntry] {
-        &self.entries
+    pub fn materialized_entries(&self) -> Vec<IndexedEntry> {
+        self.compact_candidates.materialized_entries()
+    }
+
+    pub fn entry_count(&self) -> usize {
+        self.compact_candidates.entry_count()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.compact_candidates.is_empty()
     }
 
     pub fn memory_estimate(&self) -> SearchIndexMemoryEstimate {
         let compact_stats = self.compact_candidates.memory_stats();
-        let entry_struct_bytes = self
-            .entries
-            .capacity()
-            .saturating_mul(std::mem::size_of::<IndexedEntry>());
-        let entry_string_bytes = self.entries.iter().map(indexed_entry_string_bytes).sum();
-        let cached_search_text_bytes = self.search_texts.iter().map(String::capacity).sum();
-        let duplicate_search_text_bytes = self
-            .search_texts
-            .capacity()
-            .saturating_mul(std::mem::size_of::<String>())
-            .saturating_add(cached_search_text_bytes);
+        let entry_struct_bytes = 0;
+        let entry_string_bytes = 0;
+        let cached_search_text_bytes = 0;
+        let duplicate_search_text_bytes = 0;
         let path_lookup_entry_count = self
             .content_entry_index_by_path
             .as_ref()
@@ -188,7 +182,7 @@ impl SearchIndex {
             })
             .unwrap_or_default();
         SearchIndexMemoryEstimate {
-            entry_count: self.entries.len(),
+            entry_count: self.compact_candidates.entry_count(),
             search_index_struct_bytes: std::mem::size_of::<Self>(),
             entry_struct_bytes,
             entry_string_bytes,
@@ -226,7 +220,7 @@ impl SearchIndex {
         self.content_entry_index_by_path = self
             .content_index
             .as_ref()
-            .map(|_| build_content_entry_path_lookup(&self.entries));
+            .map(|_| build_content_entry_path_lookup(&self.materialized_entries()));
     }
 
     #[cfg(test)]
@@ -308,9 +302,8 @@ impl SearchIndex {
     ) -> Result<IndexReport, std::io::Error> {
         let report = scanner.scan(options)?;
         let previous_by_path: std::collections::HashMap<_, _> = self
-            .entries
-            .iter()
-            .cloned()
+            .materialized_entries()
+            .into_iter()
             .map(|entry| (entry.path.clone(), entry))
             .collect();
 
@@ -357,7 +350,8 @@ impl SearchIndex {
             .map(|entry| entry.path.clone())
             .collect();
 
-        self.entries.retain(|entry| {
+        let mut entries = self.materialized_entries();
+        entries.retain(|entry| {
             !path_is_affected(&entry.path, &removed_paths) && !changed_paths.contains(&entry.path)
         });
 
@@ -372,14 +366,13 @@ impl SearchIndex {
             }
         }
 
-        self.entries.extend(changed_entries);
-        self.entries.sort_by(|left, right| {
+        entries.extend(changed_entries);
+        entries.sort_by(|left, right| {
             left.path
                 .cmp(&right.path)
                 .then_with(|| left.name.cmp(&right.name))
         });
-        self.search_texts = self.entries.iter().map(searchable_text).collect();
-        self.compact_candidates = CompactCandidateIndex::from_entries(self.entries.clone());
+        self.compact_candidates = CompactCandidateIndex::from_entries(entries);
         self.rebuild_content_entry_lookup();
     }
 
@@ -472,9 +465,7 @@ impl SearchIndex {
     }
 
     fn replace_entries(&mut self, entries: Vec<IndexedEntry>) {
-        self.search_texts = entries.iter().map(searchable_text).collect();
-        self.compact_candidates = CompactCandidateIndex::from_entries(entries.clone());
-        self.entries = entries;
+        self.compact_candidates = CompactCandidateIndex::from_entries(entries);
         self.detach_content_index();
     }
 
@@ -526,26 +517,36 @@ impl SearchIndex {
             if candidate_index % 1024 == 0 && is_cancelled() {
                 return None;
             }
-            let index = id.as_usize();
-            let Some(entry) = self.entries.get(index) else {
+            let Some(entry_ref) = self.compact_candidates.entry_ref(id) else {
                 continue;
             };
-            if !is_visible(entry) {
+            if !matcher.matches_candidate(
+                &parsed_query,
+                FileMatchCandidate {
+                    path: entry_ref.path(),
+                    name: entry_ref.name(),
+                    parent: entry_ref.parent(),
+                    extension: entry_ref.extension(),
+                    search_text: entry_ref.match_search_text(),
+                    has_custom_search_text: entry_ref.has_custom_search_text(),
+                },
+            ) {
                 continue;
             }
-            let Some(search_text) = self.search_texts.get(index) else {
+            let Some(entry) = self.compact_candidates.materialize(id) else {
                 continue;
             };
-            if matcher.matches_with_search_text(&parsed_query, entry, search_text) {
-                candidates.push(entry);
-                if !parsed_query.has_content_query() && candidates.len() >= limit {
-                    break;
-                }
+            if !is_visible(&entry) {
+                continue;
+            }
+            candidates.push(entry);
+            if !parsed_query.has_content_query() && candidates.len() >= limit {
+                break;
             }
         }
 
         if !parsed_query.has_content_query() {
-            return Some(candidates.into_iter().map(entry_to_result).collect());
+            return Some(candidates.iter().map(entry_to_result).collect());
         }
 
         let candidate_paths = Arc::new(candidates.iter().map(|entry| entry.path.clone()).collect());
@@ -565,7 +566,7 @@ impl SearchIndex {
             .into_iter()
             .filter_map(|entry| {
                 hit_by_path.get(&entry.path).map(|hit| {
-                    entry_to_result(entry)
+                    entry_to_result(&entry)
                         .with_snippet(hit.snippet.clone())
                         .with_score(content_score(hit).saturating_add(10_000))
                 })
@@ -595,15 +596,15 @@ impl SearchIndex {
             ContentSearchVisibility::PathFilter(path_filter) => Some(path_filter),
             ContentSearchVisibility::EntryPredicate => {
                 let hidden_paths: HashSet<_> = self
-                    .entries
-                    .iter()
+                    .materialized_entries()
+                    .into_iter()
                     .filter(|entry| {
                         #[cfg(test)]
                         self.content_visibility_entry_scan_count
                             .fetch_add(1, Ordering::Relaxed);
                         !is_visible(entry)
                     })
-                    .map(|entry| entry.path.clone())
+                    .map(|entry| entry.path)
                     .collect();
                 if hidden_paths.is_empty() {
                     None
@@ -628,9 +629,12 @@ impl SearchIndex {
                 self.content_entry_index_by_path
                     .as_ref()
                     .and_then(|lookup| lookup.get(&hit.path))
-                    .and_then(|index| self.entries.get(*index))
+                    .and_then(|index| {
+                        self.compact_candidates
+                            .materialize(crate::core::compact_index::EntryId::from_usize(*index)?)
+                    })
                     .map(|entry| {
-                        entry_to_result(entry)
+                        entry_to_result(&entry)
                             .with_snippet(hit.snippet)
                             .with_score(score)
                     })
@@ -695,15 +699,15 @@ impl SearchIndex {
         };
 
         let mut results = Vec::new();
-        for (index, entry) in self.entries.iter().enumerate() {
+        for (index, entry) in self.materialized_entries().into_iter().enumerate() {
             if index % 1024 == 0 && is_cancelled() {
                 return None;
             }
-            if !is_visible(entry) {
+            if !is_visible(&entry) {
                 continue;
             }
             if regex.is_match(&entry.name) || regex.is_match(&entry.path) {
-                results.push(entry_to_result(entry));
+                results.push(entry_to_result(&entry));
                 if results.len() >= limit {
                     break;
                 }
@@ -719,7 +723,7 @@ impl FileSearchIndex for SearchIndex {
     }
 
     fn indexed_entry_count(&self) -> usize {
-        self.entries.len()
+        self.entry_count()
     }
 }
 
@@ -753,14 +757,6 @@ fn content_search_error_feedback(error: ContentSearchError) -> SearchResult {
     .with_score(100)
 }
 
-fn searchable_text(entry: &IndexedEntry) -> String {
-    if entry.search_text.is_empty() {
-        crate::core::index_entry::build_search_text(&entry.name, &entry.path)
-    } else {
-        entry.search_text.clone()
-    }
-}
-
 fn build_content_entry_path_lookup(entries: &[IndexedEntry]) -> HashMap<String, usize> {
     entries
         .iter()
@@ -768,19 +764,6 @@ fn build_content_entry_path_lookup(entries: &[IndexedEntry]) -> HashMap<String, 
         .filter(|(_, entry)| entry.content_index_state == ContentIndexState::Indexed)
         .map(|(index, entry)| (entry.path.clone(), index))
         .collect()
-}
-
-fn indexed_entry_string_bytes(entry: &IndexedEntry) -> usize {
-    entry.path.capacity()
-        + entry.name.capacity()
-        + entry.parent.capacity()
-        + entry
-            .extension
-            .as_ref()
-            .map(String::capacity)
-            .unwrap_or_default()
-        + entry.root.capacity()
-        + entry.search_text.capacity()
 }
 
 fn snapshot_metadata_matches(previous: &IndexedEntry, scanned: &IndexedEntry) -> bool {
@@ -1032,7 +1015,10 @@ mod tests {
             )
             .unwrap();
         assert!(first_report.failures.is_empty());
-        assert!(index.entries().iter().any(|entry| entry.name == "old.md"));
+        assert!(index
+            .materialized_entries()
+            .iter()
+            .any(|entry| entry.name == "old.md"));
 
         fs::remove_file(root.join("old.md")).unwrap();
         fs::write(root.join("new.md"), "").unwrap();
@@ -1050,8 +1036,14 @@ mod tests {
 
         assert_eq!(second_report.failures.len(), 1);
         assert_eq!(second_report.failures[0].root, missing.to_string_lossy());
-        assert!(index.entries().iter().any(|entry| entry.name == "new.md"));
-        assert!(!index.entries().iter().any(|entry| entry.name == "old.md"));
+        assert!(index
+            .materialized_entries()
+            .iter()
+            .any(|entry| entry.name == "new.md"));
+        assert!(!index
+            .materialized_entries()
+            .iter()
+            .any(|entry| entry.name == "old.md"));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -1092,13 +1084,13 @@ mod tests {
             .unwrap();
 
         let names: Vec<_> = index
-            .entries()
-            .iter()
-            .map(|entry| entry.name.as_str())
+            .materialized_entries()
+            .into_iter()
+            .map(|entry| entry.name)
             .collect();
-        assert!(names.contains(&"keep.md"));
-        assert!(names.contains(&"new.md"));
-        assert!(!names.contains(&"old.md"));
+        assert!(names.contains(&"keep.md".to_owned()));
+        assert!(names.contains(&"new.md".to_owned()));
+        assert!(!names.contains(&"old.md".to_owned()));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -1123,13 +1115,14 @@ mod tests {
                 },
             )
             .unwrap();
-        let entry = index
-            .entries
+        let mut entries = index.materialized_entries();
+        let entry = entries
             .iter_mut()
             .find(|entry| entry.name == "keep.md")
             .unwrap();
         entry.search_text = "snapshot-only-search-text".to_owned();
         entry.content_index_state = ContentIndexState::Indexed;
+        index.replace_entries(entries);
 
         index
             .refresh_incremental_with_scanner(
@@ -1143,8 +1136,8 @@ mod tests {
             )
             .unwrap();
 
-        let refreshed = index
-            .entries()
+        let refreshed_entries = index.materialized_entries();
+        let refreshed = refreshed_entries
             .iter()
             .find(|entry| entry.name == "keep.md")
             .unwrap();
@@ -1183,11 +1176,14 @@ mod tests {
         index.apply_update_batch(&batch, vec![changed_entry, added_entry]);
 
         let names: Vec<_> = index
-            .entries()
-            .iter()
-            .map(|entry| entry.name.as_str())
+            .materialized_entries()
+            .into_iter()
+            .map(|entry| entry.name)
             .collect();
-        assert_eq!(names, vec!["added.md", "renamed-changed.md"]);
+        assert_eq!(
+            names,
+            vec!["added.md".to_owned(), "renamed-changed.md".to_owned()]
+        );
 
         let parser = crate::core::search::QueryParser::new(Default::default());
         let results = index.search(&parser.parse("renamed-changed"));
@@ -2086,7 +2082,7 @@ mod tests {
                 elapsed.as_micros(),
                 results.len(),
                 target_position,
-                search_index.entries().len(),
+                search_index.entry_count(),
                 memory_estimate.entry_struct_bytes,
                 memory_estimate.entry_string_bytes,
                 memory_estimate.cached_search_text_bytes

@@ -6,26 +6,29 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::core::file_query::FileQuery;
-use crate::core::index_entry::{IndexedEntry, IndexedEntryKind};
+use crate::core::index_entry::{
+    build_search_text, ContentIndexState, IndexedEntry, IndexedEntryKind,
+};
 
 #[cfg(test)]
 static COMPACT_INDEX_BUILD_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct StringId(usize);
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct EntryId(usize);
+pub struct EntryId(u32);
 
 impl EntryId {
     pub fn as_usize(self) -> usize {
-        self.0
+        self.0 as usize
+    }
+
+    pub fn from_usize(value: usize) -> Option<Self> {
+        u32::try_from(value).ok().map(Self)
     }
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct EntryIdAllocator {
-    next: usize,
+    next: u32,
 }
 
 impl EntryIdAllocator {
@@ -36,7 +39,7 @@ impl EntryIdAllocator {
     }
 
     pub fn len(&self) -> usize {
-        self.next
+        self.next as usize
     }
 
     pub fn is_empty(&self) -> bool {
@@ -44,24 +47,91 @@ impl EntryIdAllocator {
     }
 }
 
+const MISSING_RANGE_START: u32 = u32::MAX;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PackedTextRange {
+    start: u32,
+    len: u32,
+}
+
+impl PackedTextRange {
+    const MISSING: Self = Self {
+        start: MISSING_RANGE_START,
+        len: 0,
+    };
+
+    fn is_missing(self) -> bool {
+        self.start == MISSING_RANGE_START
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompactIndexBuildError {
+    TooManyEntries { count: usize },
+    ArenaTooLarge { requested_bytes: usize },
+    DepthTooLarge { depth: usize },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompactEntry {
     pub id: EntryId,
-    pub path: StringId,
-    pub name: StringId,
+    path: PackedTextRange,
+    name: PackedTextRange,
     pub kind: IndexedEntryKind,
-    pub parent: Option<StringId>,
-    pub extension: Option<StringId>,
-    pub depth: usize,
-    pub root: Option<StringId>,
+    parent: PackedTextRange,
+    extension: PackedTextRange,
+    pub depth: u32,
+    root: PackedTextRange,
     pub modified_ms: Option<i64>,
     pub size_bytes: Option<u64>,
+    search_text: PackedTextRange,
+    pub content_index_state: ContentIndexState,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct EntryTable {
     entries: Vec<CompactEntry>,
-    strings: StringPool,
+    arena: Vec<u8>,
+    unique_value_count: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CompactEntryRef<'a> {
+    table: &'a EntryTable,
+    entry: &'a CompactEntry,
+}
+
+impl CompactEntryRef<'_> {
+    pub fn path(&self) -> &str {
+        self.table.path(self.entry).unwrap_or_default()
+    }
+
+    pub fn name(&self) -> &str {
+        self.table.name(self.entry).unwrap_or_default()
+    }
+
+    pub fn parent(&self) -> &str {
+        self.table.parent(self.entry).unwrap_or_default()
+    }
+
+    pub fn extension(&self) -> Option<&str> {
+        self.table.extension(self.entry)
+    }
+
+    pub fn search_text(&self) -> std::borrow::Cow<'_, str> {
+        self.table.search_text(self.entry)
+    }
+
+    pub fn match_search_text(&self) -> &str {
+        self.table
+            .text(self.entry.search_text)
+            .unwrap_or_else(|| self.path())
+    }
+
+    pub fn has_custom_search_text(&self) -> bool {
+        !self.entry.search_text.is_missing()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,18 +154,41 @@ impl EntryTableMemoryEstimate {
 
 impl EntryTable {
     pub fn from_entries(entries: Vec<IndexedEntry>) -> Self {
+        Self::try_from_entries(entries).expect("compact entry table exceeds packed u32 limits")
+    }
+
+    pub fn try_from_entries(entries: Vec<IndexedEntry>) -> Result<Self, CompactIndexBuildError> {
+        if entries.len() > u32::MAX as usize {
+            return Err(CompactIndexBuildError::TooManyEntries {
+                count: entries.len(),
+            });
+        }
+
         let mut table = Self::default();
+        let mut arena = PackedArenaBuilder::default();
         let mut ids = EntryIdAllocator::default();
 
         for entry in entries {
             let id = ids.next_id();
-            let path = table.strings.intern(entry.path);
-            let name = table.strings.intern(entry.name);
-            let parent = intern_non_empty(&mut table.strings, entry.parent);
-            let extension = entry
-                .extension
-                .and_then(|extension| intern_non_empty(&mut table.strings, extension));
-            let root = intern_non_empty(&mut table.strings, entry.root);
+            let depth = u32::try_from(entry.depth)
+                .map_err(|_| CompactIndexBuildError::DepthTooLarge { depth: entry.depth })?;
+            let path = arena.store(&entry.path)?;
+            let name = arena.store_path_slice_or_value(path, &entry.path, &entry.name)?;
+            let parent = arena.store_optional_path_slice(path, &entry.path, &entry.parent)?;
+            let extension = match entry.extension.as_deref() {
+                Some(extension) if !extension.is_empty() => {
+                    arena.store_path_slice_or_value(path, &entry.path, extension)?
+                }
+                _ => PackedTextRange::MISSING,
+            };
+            let root = arena.store_optional_path_slice(path, &entry.path, &entry.root)?;
+            let standard_search_text = build_search_text(&entry.name, &entry.path);
+            let search_text =
+                if entry.search_text.is_empty() || entry.search_text == standard_search_text {
+                    PackedTextRange::MISSING
+                } else {
+                    arena.store(&entry.search_text)?
+                };
             table.entries.push(CompactEntry {
                 id,
                 path,
@@ -103,14 +196,18 @@ impl EntryTable {
                 kind: entry.kind,
                 parent,
                 extension,
-                depth: entry.depth,
+                depth,
                 root,
                 modified_ms: entry.modified_ms,
                 size_bytes: entry.size_bytes,
+                search_text,
+                content_index_state: entry.content_index_state,
             });
         }
 
-        table
+        table.unique_value_count = arena.unique_value_count();
+        table.arena = arena.finish();
+        Ok(table)
     }
 
     pub fn get(&self, id: EntryId) -> Option<&CompactEntry> {
@@ -126,23 +223,60 @@ impl EntryTable {
     }
 
     pub fn path(&self, entry: &CompactEntry) -> Option<&str> {
-        self.strings.get(entry.path)
+        self.text(entry.path)
     }
 
     pub fn name(&self, entry: &CompactEntry) -> Option<&str> {
-        self.strings.get(entry.name)
+        self.text(entry.name)
     }
 
     pub fn parent(&self, entry: &CompactEntry) -> Option<&str> {
-        entry.parent.and_then(|id| self.strings.get(id))
+        self.text(entry.parent)
     }
 
     pub fn extension(&self, entry: &CompactEntry) -> Option<&str> {
-        entry.extension.and_then(|id| self.strings.get(id))
+        self.text(entry.extension)
     }
 
     pub fn root(&self, entry: &CompactEntry) -> Option<&str> {
-        entry.root.and_then(|id| self.strings.get(id))
+        self.text(entry.root)
+    }
+
+    pub fn search_text<'a>(&'a self, entry: &'a CompactEntry) -> std::borrow::Cow<'a, str> {
+        self.text(entry.search_text)
+            .map(std::borrow::Cow::Borrowed)
+            .unwrap_or_else(|| {
+                std::borrow::Cow::Owned(build_search_text(
+                    self.name(entry).unwrap_or_default(),
+                    self.path(entry).unwrap_or_default(),
+                ))
+            })
+    }
+
+    pub fn materialize(&self, id: EntryId) -> Option<IndexedEntry> {
+        let entry = self.get(id)?;
+        Some(IndexedEntry {
+            path: self.path(entry)?.to_owned(),
+            name: self.name(entry)?.to_owned(),
+            kind: entry.kind.clone(),
+            parent: self.parent(entry).unwrap_or_default().to_owned(),
+            extension: self.extension(entry).map(str::to_owned),
+            depth: entry.depth as usize,
+            root: self.root(entry).unwrap_or_default().to_owned(),
+            modified_ms: entry.modified_ms,
+            size_bytes: entry.size_bytes,
+            search_text: self.search_text(entry).into_owned(),
+            content_index_state: entry.content_index_state.clone(),
+        })
+    }
+
+    fn text(&self, range: PackedTextRange) -> Option<&str> {
+        if range.is_missing() {
+            return None;
+        }
+        let start = range.start as usize;
+        let end = start.checked_add(range.len as usize)?;
+        std::str::from_utf8(self.arena.get(start..end)?).ok()
     }
 
     pub fn path_by_id(&self, id: EntryId) -> Option<&str> {
@@ -150,7 +284,7 @@ impl EntryTable {
     }
 
     pub fn string_pool_len(&self) -> usize {
-        self.strings.len()
+        self.unique_value_count
     }
 
     pub fn memory_estimate(&self) -> EntryTableMemoryEstimate {
@@ -160,10 +294,10 @@ impl EntryTable {
                 .entries
                 .capacity()
                 .saturating_mul(std::mem::size_of::<CompactEntry>()),
-            string_pool_unique_values: self.strings.len(),
-            string_pool_bytes: self.strings.total_bytes(),
-            string_pool_heap_bytes: self.strings.estimated_heap_bytes(),
-            retained_build_interner_bytes: self.strings.retained_interner_bytes(),
+            string_pool_unique_values: self.unique_value_count,
+            string_pool_bytes: self.arena.len(),
+            string_pool_heap_bytes: self.arena.capacity(),
+            retained_build_interner_bytes: 0,
         }
     }
 
@@ -173,6 +307,67 @@ impl EntryTable {
 
     pub fn all_ids(&self) -> Vec<EntryId> {
         self.entries.iter().map(|entry| entry.id).collect()
+    }
+}
+
+#[derive(Debug, Default)]
+struct PackedArenaBuilder {
+    arena: Vec<u8>,
+    ranges_by_value: HashMap<String, PackedTextRange>,
+}
+
+impl PackedArenaBuilder {
+    fn store(&mut self, value: &str) -> Result<PackedTextRange, CompactIndexBuildError> {
+        if let Some(range) = self.ranges_by_value.get(value) {
+            return Ok(*range);
+        }
+        let requested_bytes = self.arena.len().saturating_add(value.len());
+        if requested_bytes >= MISSING_RANGE_START as usize {
+            return Err(CompactIndexBuildError::ArenaTooLarge { requested_bytes });
+        }
+        let range = PackedTextRange {
+            start: self.arena.len() as u32,
+            len: value.len() as u32,
+        };
+        self.arena.extend_from_slice(value.as_bytes());
+        self.ranges_by_value.insert(value.to_owned(), range);
+        Ok(range)
+    }
+
+    fn store_path_slice_or_value(
+        &mut self,
+        path_range: PackedTextRange,
+        path: &str,
+        value: &str,
+    ) -> Result<PackedTextRange, CompactIndexBuildError> {
+        if let Some(offset) = path.rfind(value) {
+            return Ok(PackedTextRange {
+                start: path_range.start.saturating_add(offset as u32),
+                len: value.len() as u32,
+            });
+        }
+        self.store(value)
+    }
+
+    fn store_optional_path_slice(
+        &mut self,
+        path_range: PackedTextRange,
+        path: &str,
+        value: &str,
+    ) -> Result<PackedTextRange, CompactIndexBuildError> {
+        if value.is_empty() {
+            Ok(PackedTextRange::MISSING)
+        } else {
+            self.store_path_slice_or_value(path_range, path, value)
+        }
+    }
+
+    fn unique_value_count(&self) -> usize {
+        self.ranges_by_value.len()
+    }
+
+    fn finish(self) -> Vec<u8> {
+        self.arena
     }
 }
 
@@ -530,6 +725,33 @@ impl CompactCandidateIndex {
             .collect()
     }
 
+    pub fn entry_count(&self) -> usize {
+        self.table.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.table.is_empty()
+    }
+
+    pub fn materialize(&self, id: EntryId) -> Option<IndexedEntry> {
+        self.table.materialize(id)
+    }
+
+    pub fn entry_ref(&self, id: EntryId) -> Option<CompactEntryRef<'_>> {
+        self.table.get(id).map(|entry| CompactEntryRef {
+            table: &self.table,
+            entry,
+        })
+    }
+
+    pub fn materialized_entries(&self) -> Vec<IndexedEntry> {
+        self.table
+            .entries()
+            .iter()
+            .filter_map(|entry| self.table.materialize(entry.id))
+            .collect()
+    }
+
     pub fn estimated_bytes(&self) -> usize {
         std::mem::size_of::<Self>().saturating_add(self.estimated_heap_bytes())
     }
@@ -562,7 +784,7 @@ impl CompactCandidateIndex {
                 .ids_by_prefix
                 .len()
                 .saturating_add(self.path_segments.ids_by_prefix.len()),
-            retained_build_interner_bytes: self.table.strings.retained_interner_bytes(),
+            retained_build_interner_bytes: 0,
             heap_bytes,
             total_resident_bytes: std::mem::size_of::<Self>().saturating_add(heap_bytes),
         }
@@ -574,68 +796,7 @@ impl EntryTable {
         self.entries
             .capacity()
             .saturating_mul(std::mem::size_of::<CompactEntry>())
-            .saturating_add(self.strings.estimated_heap_bytes())
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct StringPool {
-    values: Vec<String>,
-    ids_by_value: HashMap<String, StringId>,
-    total_bytes: usize,
-}
-
-impl StringPool {
-    pub fn intern(&mut self, value: impl AsRef<str>) -> StringId {
-        let value = value.as_ref();
-        if let Some(id) = self.ids_by_value.get(value) {
-            return *id;
-        }
-
-        let id = StringId(self.values.len());
-        self.total_bytes = self.total_bytes.saturating_add(value.len());
-        self.values.push(value.to_owned());
-        self.ids_by_value.insert(value.to_owned(), id);
-        id
-    }
-
-    pub fn get(&self, id: StringId) -> Option<&str> {
-        self.values.get(id.0).map(String::as_str)
-    }
-
-    pub fn len(&self) -> usize {
-        self.values.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.values.is_empty()
-    }
-
-    pub fn total_bytes(&self) -> usize {
-        self.total_bytes
-    }
-
-    fn estimated_heap_bytes(&self) -> usize {
-        let value_bytes: usize = self.values.iter().map(String::capacity).sum();
-        let map_key_bytes: usize = self.ids_by_value.keys().map(String::capacity).sum();
-        self.values
-            .capacity()
-            .saturating_mul(std::mem::size_of::<String>())
-            .saturating_add(value_bytes)
-            .saturating_add(self.ids_by_value.capacity().saturating_mul(
-                std::mem::size_of::<String>().saturating_add(std::mem::size_of::<StringId>()),
-            ))
-            .saturating_add(map_key_bytes)
-    }
-
-    fn retained_interner_bytes(&self) -> usize {
-        let map_key_bytes: usize = self.ids_by_value.keys().map(String::capacity).sum();
-        self.ids_by_value
-            .capacity()
-            .saturating_mul(
-                std::mem::size_of::<String>().saturating_add(std::mem::size_of::<StringId>()),
-            )
-            .saturating_add(map_key_bytes)
+            .saturating_add(self.arena.capacity())
     }
 }
 
@@ -665,10 +826,6 @@ fn exact_path_map_heap_bytes(map: &BTreeMap<String, EntryId>) -> usize {
         })
         .sum();
     payload
-}
-
-fn intern_non_empty(pool: &mut StringPool, value: String) -> Option<StringId> {
-    (!value.is_empty()).then(|| pool.intern(value))
 }
 
 fn entry_name_extension(name: &str) -> Option<String> {
@@ -830,32 +987,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn string_pool_deduplicates_values_and_returns_stable_ids() {
-        let mut pool = StringPool::default();
-
-        let first = pool.intern("D:\\workspace\\QuickFox\\AGENTS.md");
-        let duplicate = pool.intern("D:\\workspace\\QuickFox\\AGENTS.md");
-        let second = pool.intern("AGENTS.md");
-
-        assert_eq!(first, duplicate);
-        assert_ne!(first, second);
-        assert_eq!(pool.get(first), Some("D:\\workspace\\QuickFox\\AGENTS.md"));
-        assert_eq!(pool.get(second), Some("AGENTS.md"));
-        assert_eq!(pool.len(), 2);
-    }
-
-    #[test]
-    fn string_pool_tracks_total_bytes_once_per_unique_value() {
-        let mut pool = StringPool::default();
-
-        pool.intern("workspace");
-        pool.intern("workspace");
-        pool.intern("AGENTS.md");
-
-        assert_eq!(pool.total_bytes(), "workspace".len() + "AGENTS.md".len());
-    }
-
-    #[test]
     fn entry_id_allocator_returns_dense_stable_ids() {
         let mut allocator = EntryIdAllocator::default();
 
@@ -917,6 +1048,75 @@ mod tests {
         assert!(
             table.string_pool_len() < 10,
             "shared parent/root/extension strings should be deduplicated"
+        );
+    }
+
+    #[test]
+    fn packed_entry_table_round_trips_all_authoritative_entry_fields() {
+        let expected = IndexedEntry {
+            path: "D:\\workspace\\QuickFox\\AGENTS.md".to_owned(),
+            name: "AGENTS.md".to_owned(),
+            kind: IndexedEntryKind::File,
+            parent: "D:\\workspace\\QuickFox".to_owned(),
+            extension: Some("md".to_owned()),
+            depth: 3,
+            root: "D:\\".to_owned(),
+            modified_ms: Some(123),
+            size_bytes: Some(456),
+            search_text: "custom searchable alias".to_owned(),
+            content_index_state: crate::core::index_entry::ContentIndexState::Indexed,
+        };
+
+        let table = EntryTable::try_from_entries(vec![expected.clone()]).unwrap();
+
+        assert_eq!(table.materialize(EntryId(0)), Some(expected));
+    }
+
+    #[test]
+    fn packed_entry_table_reuses_path_slices_for_standard_fields() {
+        let path = "D:\\workspace\\QuickFox\\AGENTS.md";
+        let entry = IndexedEntry {
+            path: path.to_owned(),
+            name: "AGENTS.md".to_owned(),
+            kind: IndexedEntryKind::File,
+            parent: "D:\\workspace\\QuickFox".to_owned(),
+            extension: Some("md".to_owned()),
+            depth: 3,
+            root: "D:\\".to_owned(),
+            search_text: crate::core::index_entry::build_search_text("AGENTS.md", path),
+            ..IndexedEntry::legacy("", "", IndexedEntryKind::File)
+        };
+
+        let table = EntryTable::try_from_entries(vec![entry]).unwrap();
+
+        assert_eq!(table.memory_estimate().string_pool_bytes, path.len());
+    }
+
+    #[test]
+    fn packed_entry_table_stores_only_custom_search_text_as_an_exception() {
+        let path = "/workspace/QuickFox/AGENTS.md";
+        let custom_search_text = "agents documentation shortcut";
+        let entry = IndexedEntry {
+            path: path.to_owned(),
+            name: "AGENTS.md".to_owned(),
+            kind: IndexedEntryKind::File,
+            parent: "/workspace/QuickFox".to_owned(),
+            extension: Some("md".to_owned()),
+            depth: 3,
+            root: "/workspace".to_owned(),
+            search_text: custom_search_text.to_owned(),
+            ..IndexedEntry::legacy("", "", IndexedEntryKind::File)
+        };
+
+        let table = EntryTable::try_from_entries(vec![entry]).unwrap();
+
+        assert_eq!(
+            table.memory_estimate().string_pool_bytes,
+            path.len() + custom_search_text.len()
+        );
+        assert_eq!(
+            table.search_text(table.get(EntryId(0)).unwrap()),
+            custom_search_text
         );
     }
 

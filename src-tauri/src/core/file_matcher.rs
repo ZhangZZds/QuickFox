@@ -10,6 +10,16 @@ pub struct FileMatcher {
     name_path: StableNamePathMatcher,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct FileMatchCandidate<'a> {
+    pub path: &'a str,
+    pub name: &'a str,
+    pub parent: &'a str,
+    pub extension: Option<&'a str>,
+    pub search_text: &'a str,
+    pub has_custom_search_text: bool,
+}
+
 impl FileMatcher {
     pub fn matches(&self, query: &FileQuery, entry: &IndexedEntry) -> bool {
         let search_text = entry_search_text(entry);
@@ -22,29 +32,53 @@ impl FileMatcher {
         entry: &IndexedEntry,
         search_text: &str,
     ) -> bool {
-        self.matches_fields(query, entry)
+        let standard_search_text = build_search_text(&entry.name, &entry.path);
+        self.matches_candidate(
+            query,
+            FileMatchCandidate {
+                path: &entry.path,
+                name: &entry.name,
+                parent: &entry.parent,
+                extension: entry.extension.as_deref(),
+                search_text,
+                has_custom_search_text: !entry.search_text.is_empty()
+                    && search_text != standard_search_text,
+            },
+        )
+    }
+
+    pub fn matches_candidate(&self, query: &FileQuery, entry: FileMatchCandidate<'_>) -> bool {
+        query.type_filters.iter().all(|expected| {
+            entry_extension(entry.name, entry.extension)
+                .is_some_and(|actual| actual.eq_ignore_ascii_case(expected))
+        }) && query.name_filters.iter().all(|filter| {
+            entry
+                .name
+                .to_ascii_lowercase()
+                .contains(&filter.to_ascii_lowercase())
+        }) && query
+            .dir_filters
+            .iter()
+            .all(|filter| dir_filter_matches(filter, entry.path, entry.parent))
             && query
                 .ordinary_terms
                 .iter()
-                .all(|term| self.name_path.matches_term(term, entry, search_text))
+                .all(|term| matches_name_path_term(&self.name_path, term, entry))
     }
+}
 
-    fn matches_fields(&self, query: &FileQuery, entry: &IndexedEntry) -> bool {
-        query
-            .type_filters
-            .iter()
-            .all(|expected| entry_extension(entry).is_some_and(|actual| actual == *expected))
-            && query.name_filters.iter().all(|filter| {
-                entry
-                    .name
-                    .to_ascii_lowercase()
-                    .contains(&filter.to_ascii_lowercase())
-            })
-            && query
-                .dir_filters
-                .iter()
-                .all(|filter| dir_filter_matches(filter, entry))
-    }
+fn matches_name_path_term(
+    matcher: &StableNamePathMatcher,
+    term: &str,
+    entry: FileMatchCandidate<'_>,
+) -> bool {
+    matcher.matches_term_fields(
+        term,
+        entry.name,
+        entry.path,
+        entry.search_text,
+        entry.has_custom_search_text,
+    )
 }
 
 pub trait NamePathMatcher {
@@ -56,16 +90,35 @@ pub struct StableNamePathMatcher;
 
 impl NamePathMatcher for StableNamePathMatcher {
     fn matches_term(&self, term: &str, entry: &IndexedEntry, search_text: &str) -> bool {
+        self.matches_term_fields(
+            term,
+            &entry.name,
+            &entry.path,
+            search_text,
+            uses_custom_cached_text(entry, search_text),
+        )
+    }
+}
+
+impl StableNamePathMatcher {
+    fn matches_term_fields(
+        &self,
+        term: &str,
+        name: &str,
+        path: &str,
+        search_text: &str,
+        has_custom_search_text: bool,
+    ) -> bool {
         let term = term.trim().to_ascii_lowercase();
         if term.is_empty() {
             return true;
         }
 
-        if uses_custom_cached_text(entry, search_text) && search_text.contains(&term) {
+        if has_custom_search_text && search_text.contains(&term) {
             return true;
         }
 
-        let name = entry.name.to_ascii_lowercase();
+        let name = name.to_ascii_lowercase();
         if name.contains(&term) {
             return true;
         }
@@ -82,10 +135,10 @@ impl NamePathMatcher for StableNamePathMatcher {
         }
 
         if term.contains(['/', '\\']) {
-            return search_text.contains(&term);
+            return search_text.to_ascii_lowercase().contains(&term);
         }
 
-        path_segments(&entry.path).any(|segment| {
+        path_segments(path).any(|segment| {
             segment.starts_with(&term)
                 || segment.chars().next().zip(term.chars().next()).is_some_and(
                     |(segment_first, term_first)| {
@@ -123,21 +176,14 @@ fn uses_custom_cached_text(entry: &IndexedEntry, search_text: &str) -> bool {
     !entry.search_text.is_empty() && search_text != build_search_text(&entry.name, &entry.path)
 }
 
-fn entry_extension(entry: &IndexedEntry) -> Option<String> {
-    entry
-        .extension
-        .as_ref()
-        .map(|extension| extension.trim_start_matches('.').to_ascii_lowercase())
-        .or_else(|| {
-            entry
-                .name
-                .rsplit_once('.')
-                .map(|(_, extension)| extension.to_ascii_lowercase())
-        })
+fn entry_extension<'a>(name: &'a str, extension: Option<&'a str>) -> Option<&'a str> {
+    extension
+        .map(|extension| extension.trim_start_matches('.'))
+        .or_else(|| name.rsplit_once('.').map(|(_, extension)| extension))
 }
 
-fn dir_filter_matches(filter: &str, entry: &IndexedEntry) -> bool {
-    let directory = entry_directory(entry);
+fn dir_filter_matches(filter: &str, path: &str, parent: &str) -> bool {
+    let directory = entry_directory(path, parent);
     if has_glob_meta(filter) {
         return glob_matches(filter, &directory);
     }
@@ -147,14 +193,12 @@ fn dir_filter_matches(filter: &str, entry: &IndexedEntry) -> bool {
         .contains(&filter.to_ascii_lowercase())
 }
 
-fn entry_directory(entry: &IndexedEntry) -> String {
-    if !entry.parent.is_empty() {
-        return normalize_path(&entry.parent);
+fn entry_directory(path: &str, parent: &str) -> String {
+    if !parent.is_empty() {
+        return normalize_path(parent);
     }
 
-    entry
-        .path
-        .rsplit_once(['/', '\\'])
+    path.rsplit_once(['/', '\\'])
         .map(|(parent, _)| normalize_path(parent))
         .unwrap_or_default()
 }

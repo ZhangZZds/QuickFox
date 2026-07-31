@@ -1593,29 +1593,29 @@ fn transition_runtime_config_revision_with_hooks(
                 ));
             }
         };
+        let candidate_entries = candidate_search_index.materialized_entries();
         let final_manifest = baseline_manifest_after_committed_deltas(
-            candidate_search_index.entries(),
+            &candidate_entries,
             &successor_tail,
             &candidate.roots,
         );
-        let final_baseline_id = match storage
-            .save_completed_index_batch(current_time_ms(), candidate_search_index.entries())
-        {
-            Ok(baseline_id) => baseline_id,
-            Err(error) => {
-                if let Some(successor) = successor {
-                    successor.stop();
+        let final_baseline_id =
+            match storage.save_completed_index_batch(current_time_ms(), &candidate_entries) {
+                Ok(baseline_id) => baseline_id,
+                Err(error) => {
+                    if let Some(successor) = successor {
+                        successor.stop();
+                    }
+                    return Err(rollback_activated_config_revision(
+                        state,
+                        previous,
+                        previous_service,
+                        rollback_target,
+                        restore_config,
+                        error.to_string(),
+                    ));
                 }
-                return Err(rollback_activated_config_revision(
-                    state,
-                    previous,
-                    previous_service,
-                    rollback_target,
-                    restore_config,
-                    error.to_string(),
-                ));
-            }
-        };
+            };
         if let Err(error) = storage.activate_baseline_with_manifest_and_clear_incremental_state(
             final_baseline_id,
             successor_generation,
@@ -1833,9 +1833,10 @@ fn recover_config_revision_baseline_inline(
         .highest_committed_generation()
         .map_err(|error| error.to_string())?;
     let search_index = build_search_index_with_content_for_config(&config, payload.entries)?;
-    let manifest = baseline_manifest_from_entries(search_index.entries(), &roots);
+    let entries = search_index.materialized_entries();
+    let manifest = baseline_manifest_from_entries(&entries, &roots);
     let baseline_id = storage
-        .save_completed_index_batch(current_time_ms(), search_index.entries())
+        .save_completed_index_batch(current_time_ms(), &entries)
         .map_err(|error| error.to_string())?;
     storage
         .activate_baseline_with_manifest_and_clear_incremental_state(
@@ -2657,10 +2658,10 @@ fn build_provider_registry<'a>(
 
 #[cfg(test)]
 fn perform_search(config: &QuickFoxConfig, index: &SearchIndex, query: &str) -> Vec<SearchResult> {
-    let status = if index.entries().is_empty() {
+    let status = if index.is_empty() {
         IndexLifecycle::default().status().clone()
     } else {
-        IndexLifecycle::from_ready(index.entries().len(), current_time_ms())
+        IndexLifecycle::from_ready(index.entry_count(), current_time_ms())
             .status()
             .clone()
     };
@@ -3078,7 +3079,7 @@ fn start_background_index_refresh_with_spawner<R: tauri::Runtime>(
                             ) {
                                 Ok(content_index) => {
                                     let content_payload = IndexRefreshPayload {
-                                        entries: content_index.entries().to_vec(),
+                                        entries: content_index.materialized_entries(),
                                         summary: IndexReport {
                                             failures: Vec::new(),
                                             ..Default::default()
