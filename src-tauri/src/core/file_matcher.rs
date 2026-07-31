@@ -135,7 +135,7 @@ impl StableNamePathMatcher {
         }
 
         if term.contains(['/', '\\']) {
-            return search_text.to_ascii_lowercase().contains(&term);
+            return search_text.to_lowercase().contains(&term.to_lowercase());
         }
 
         path_segments(path).any(|segment| {

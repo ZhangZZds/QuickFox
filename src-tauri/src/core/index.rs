@@ -1428,6 +1428,17 @@ mod tests {
     }
 
     #[test]
+    fn slash_path_queries_match_unicode_case_insensitively() {
+        let index = SearchIndex::from_entries(vec![file_entry("/tmp/Ä/Report.md")]);
+        let parser = crate::core::search::QueryParser::new(Default::default());
+
+        let results = index.search(&parser.parse("/tmp/ä"));
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].detail.as_deref(), Some("/tmp/Ä/Report.md"));
+    }
+
+    #[test]
     fn search_uses_cached_case_insensitive_text_for_name_and_path_matches() {
         let index =
             SearchIndex::from_entries(vec![file_entry("/home/frank/Projects/QuickFox/README.md")]);
