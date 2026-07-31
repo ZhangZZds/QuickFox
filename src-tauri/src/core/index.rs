@@ -126,6 +126,8 @@ impl Clone for SearchIndex {
 }
 
 impl SearchIndex {
+    /// Panicking convenience for tests and already-bounded in-memory overlay batches.
+    /// Production baseline construction must use [`Self::try_from_entries`].
     pub fn from_entries(entries: Vec<IndexedEntry>) -> Self {
         Self::try_from_entries(entries)
             .expect("known-size SearchIndex build exceeded compact u32 limits")

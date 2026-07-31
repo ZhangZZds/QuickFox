@@ -617,6 +617,8 @@ pub struct CompactCandidateMemoryStats {
 }
 
 impl CompactCandidateIndex {
+    /// Panicking convenience for tests and already-bounded in-memory overlay batches.
+    /// Production baseline construction must use [`Self::try_from_entries`].
     pub fn from_entries(entries: Vec<IndexedEntry>) -> Self {
         Self::try_from_entries(entries)
             .expect("known-size compact candidate build exceeded u32 limits")

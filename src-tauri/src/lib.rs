@@ -4229,7 +4229,24 @@ fn apply_baseline_persistence_outcome_for_identity(
                 .lock()
                 .expect("quickfox runtime lock poisoned");
             let entry_count = payload.entries.len();
-            let baseline = build_search_index_for_config(&runtime.config, payload.entries);
+            let baseline = match build_search_index_for_config(&runtime.config, payload.entries) {
+                Ok(baseline) => baseline,
+                Err(message) => {
+                    runtime
+                        .index_lifecycle
+                        .fail_refresh(identity.lifecycle_generation, message);
+                    runtime.manifest_ready = false;
+                    runtime.incremental_status.state = IncrementalState::Degraded;
+                    runtime.incremental_status.degradation_code =
+                        Some(IndexDegradationCode::FullRefreshFallback);
+                    return BaselinePersistenceApplicationOutcome::Applied(Some(
+                        BaselinePersistenceApplication {
+                            status: runtime.index_status(),
+                            completed: false,
+                        },
+                    ));
+                }
+            };
             let installed = runtime.index.replace_baseline_with_authoritative_tail(
                 baseline,
                 baseline_generation,
@@ -4463,7 +4480,17 @@ fn apply_completed_index_refresh(
         .lock()
         .expect("quickfox runtime lock poisoned");
     let entry_count = payload.entries.len();
-    let baseline = build_search_index_for_config(&runtime.config, payload.entries);
+    let baseline = match build_search_index_for_config(&runtime.config, payload.entries) {
+        Ok(baseline) => baseline,
+        Err(message) => {
+            runtime.index_lifecycle.fail_refresh(generation, message);
+            runtime.manifest_ready = false;
+            runtime.incremental_status.state = IncrementalState::Degraded;
+            runtime.incremental_status.degradation_code =
+                Some(IndexDegradationCode::FullRefreshFallback);
+            return Some(runtime.index_status());
+        }
+    };
     let installed =
         runtime
             .index
@@ -5370,7 +5397,7 @@ fn build_runtime_from_recovery(
     config: QuickFoxConfig,
     mut recovery: crate::core::index_journal::IndexRecovery,
 ) -> QuickFoxRuntime {
-    let lifecycle = if recovery.baseline_available() {
+    let mut lifecycle = if recovery.baseline_available() {
         IndexLifecycle::from_ready(recovery.baseline_entry_count(), current_time_ms())
     } else {
         IndexLifecycle::default()
@@ -5396,10 +5423,18 @@ fn build_runtime_from_recovery(
         for entry in &mut entries {
             entry.content_index_state = ContentIndexState::NotIndexed;
         }
-        recovery.index.replace_baseline_search_index(
-            build_search_index_for_config(&config, entries),
-            generation,
-        );
+        match build_search_index_for_config(&config, entries) {
+            Ok(index) => recovery
+                .index
+                .replace_baseline_search_index(index, generation),
+            Err(message) => {
+                let lifecycle_generation = lifecycle.status().generation;
+                lifecycle.fail_refresh(lifecycle_generation, message);
+                incremental_status.state = IncrementalState::Degraded;
+                incremental_status.degradation_code =
+                    Some(IndexDegradationCode::FullRefreshFallback);
+            }
+        }
     }
     QuickFoxRuntime {
         config,
@@ -5507,23 +5542,23 @@ fn build_runtime_from_snapshot(
     let (index, index_lifecycle, report) = if let Some(snapshot) = snapshot {
         let entry_count = snapshot.entries.len();
         let completed_at_ms = snapshot.completed_at_ms;
-        (
-            LayeredSearchIndex::from_search_index(build_search_index_for_config(
-                &config,
-                snapshot.entries,
-            )),
-            IndexLifecycle::from_ready(entry_count, completed_at_ms),
-            IndexReport::default(),
-        )
+        match build_search_index_for_config(&config, snapshot.entries) {
+            Ok(index) => (
+                LayeredSearchIndex::from_search_index(index),
+                IndexLifecycle::from_ready(entry_count, completed_at_ms),
+                IndexReport::default(),
+            ),
+            Err(message) => failed_startup_index_components(message),
+        }
     } else {
-        (
-            LayeredSearchIndex::from_search_index(build_search_index_for_config(
-                &config,
-                Vec::new(),
-            )),
-            IndexLifecycle::default(),
-            IndexReport::default(),
-        )
+        match build_search_index_for_config(&config, Vec::new()) {
+            Ok(index) => (
+                LayeredSearchIndex::from_search_index(index),
+                IndexLifecycle::default(),
+                IndexReport::default(),
+            ),
+            Err(message) => failed_startup_index_components(message),
+        }
     };
     let index_refresh = IndexRefreshControl::for_config(&config);
     QuickFoxRuntime {
@@ -5538,12 +5573,37 @@ fn build_runtime_from_snapshot(
     }
 }
 
+fn failed_startup_index_components(
+    message: String,
+) -> (LayeredSearchIndex, IndexLifecycle, IndexReport) {
+    let mut lifecycle = IndexLifecycle::default();
+    let generation = lifecycle.start_refresh(false);
+    lifecycle.fail_refresh(generation, message);
+    (
+        LayeredSearchIndex::default(),
+        lifecycle,
+        IndexReport::default(),
+    )
+}
+
 fn build_search_index_for_config(
     config: &QuickFoxConfig,
     entries: Vec<IndexedEntry>,
-) -> SearchIndex {
+) -> Result<SearchIndex, String> {
     let _ = config;
-    SearchIndex::from_entries(entries)
+    SearchIndex::try_from_entries(entries)
+        .map_err(|error| format!("compact index arena build failed: {error:?}"))
+}
+
+#[cfg(test)]
+fn build_search_index_for_config_with_arena_limit(
+    config: &QuickFoxConfig,
+    entries: Vec<IndexedEntry>,
+    arena_limit: usize,
+) -> Result<SearchIndex, String> {
+    let _ = config;
+    SearchIndex::try_from_entries_with_arena_limit(entries, arena_limit)
+        .map_err(|error| format!("compact index arena build failed: {error:?}"))
 }
 
 fn build_search_index_with_content_for_config(
@@ -6641,6 +6701,24 @@ mod tests {
         let config = QuickFoxConfig::default_with_index_dirs(vec!["/root".to_owned()]);
 
         let error = build_search_index_with_content_for_config_with_arena_limit(
+            &config,
+            vec![IndexedEntry::from_path_metadata(
+                "/root/AGENTS.md",
+                "/root",
+                IndexedEntryKind::File,
+            )],
+            8,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("arena"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn production_baseline_builder_returns_compact_arena_errors() {
+        let config = QuickFoxConfig::default_with_index_dirs(vec!["/root".to_owned()]);
+
+        let error = build_search_index_for_config_with_arena_limit(
             &config,
             vec![IndexedEntry::from_path_metadata(
                 "/root/AGENTS.md",
