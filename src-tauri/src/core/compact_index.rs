@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::core::file_query::FileQuery;
 use crate::core::index_entry::{
-    build_search_text, ContentIndexState, IndexedEntry, IndexedEntryKind,
+    build_search_text, normalize_path_text_key, ContentIndexState, IndexedEntry, IndexedEntryKind,
 };
 
 #[cfg(test)]
@@ -791,6 +791,95 @@ pub struct ExactPathIndex {
     paths: FingerprintIndex,
 }
 
+#[derive(Debug, Clone, Default)]
+struct PathPrefixIndex {
+    sorted_ids: Vec<EntryId>,
+    unique_key_count: usize,
+}
+
+impl PathPrefixIndex {
+    fn build(table: &EntryTable) -> Self {
+        let mut paths: Vec<_> = table
+            .entries()
+            .iter()
+            .filter_map(|entry| {
+                table
+                    .path(entry)
+                    .map(|path| (normalize_path_text_key(path), entry.id))
+            })
+            .collect();
+        paths.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        let unique_key_count = paths
+            .iter()
+            .map(|(path, _)| path)
+            .collect::<Vec<_>>()
+            .windows(2)
+            .filter(|pair| pair[0] != pair[1])
+            .count()
+            .saturating_add((!paths.is_empty()) as usize);
+        let mut sorted_ids: Vec<_> = paths.into_iter().map(|(_, id)| id).collect();
+        sorted_ids.shrink_to_fit();
+        Self {
+            sorted_ids,
+            unique_key_count,
+        }
+    }
+
+    fn scope_ids(&self, table: &EntryTable, key: &str, subtree: bool) -> Vec<EntryId> {
+        let lower_bound = |needle: &str| {
+            self.sorted_ids.partition_point(|id| {
+                table
+                    .path_by_id(*id)
+                    .map(normalize_path_text_key)
+                    .unwrap_or_default()
+                    .as_str()
+                    < needle
+            })
+        };
+        let mut ids = Vec::new();
+        let exact_start = lower_bound(key);
+        ids.extend(
+            self.sorted_ids[exact_start..]
+                .iter()
+                .copied()
+                .take_while(|id| {
+                    table
+                        .path_by_id(*id)
+                        .is_some_and(|path| normalize_path_text_key(path) == key)
+                }),
+        );
+        if subtree {
+            let prefix = if key == "/" {
+                "/".to_owned()
+            } else {
+                format!("{key}/")
+            };
+            let descendant_start = lower_bound(&prefix);
+            ids.extend(
+                self.sorted_ids[descendant_start..]
+                    .iter()
+                    .copied()
+                    .take_while(|id| {
+                        table
+                            .path_by_id(*id)
+                            .is_some_and(|path| normalize_path_text_key(path).starts_with(&prefix))
+                    }),
+            );
+        }
+        ids
+    }
+
+    fn heap_bytes(&self) -> usize {
+        self.sorted_ids
+            .capacity()
+            .saturating_mul(std::mem::size_of::<EntryId>())
+    }
+
+    fn unique_key_count(&self) -> usize {
+        self.unique_key_count
+    }
+}
+
 impl ExactPathIndex {
     pub fn build(table: &EntryTable) -> Self {
         let pairs = table.entries().iter().filter_map(|entry| {
@@ -819,6 +908,7 @@ pub struct CompactCandidateIndex {
     extensions: ExtensionIndex,
     path_segments: PathSegmentIndex,
     exact_paths: ExactPathIndex,
+    path_prefixes: PathPrefixIndex,
     #[cfg(test)]
     build_id: usize,
 }
@@ -847,6 +937,7 @@ pub struct CompactCandidateMemoryStats {
     pub path_segment_bytes: usize,
     pub path_fuzzy_bytes: usize,
     pub exact_path_bytes: usize,
+    pub path_prefix_bytes: usize,
     pub heap_bytes: usize,
     pub total_resident_bytes: usize,
 }
@@ -878,6 +969,7 @@ impl CompactCandidateIndex {
             extensions: ExtensionIndex::build(&table),
             path_segments: PathSegmentIndex::build(&table)?,
             exact_paths: ExactPathIndex::build(&table),
+            path_prefixes: PathPrefixIndex::build(&table),
             table,
             #[cfg(test)]
             build_id,
@@ -1046,6 +1138,14 @@ impl CompactCandidateIndex {
         })
     }
 
+    pub fn path_scope_ids(&self, key: &str, subtree: bool) -> Vec<EntryId> {
+        self.path_prefixes.scope_ids(&self.table, key, subtree)
+    }
+
+    pub fn unique_path_key_count(&self) -> usize {
+        self.path_prefixes.unique_key_count()
+    }
+
     pub fn entry_ids(&self) -> impl Iterator<Item = EntryId> + '_ {
         self.table.entries().iter().map(|entry| entry.id)
     }
@@ -1081,6 +1181,7 @@ impl CompactCandidateIndex {
             )
             .saturating_add(self.path_segments.fuzzy_buckets.heap_bytes())
             .saturating_add(self.exact_paths.paths.heap_bytes())
+            .saturating_add(self.path_prefixes.heap_bytes())
     }
 
     pub fn memory_stats(&self) -> CompactCandidateMemoryStats {
@@ -1100,12 +1201,14 @@ impl CompactCandidateIndex {
             );
         let path_fuzzy_bytes = self.path_segments.fuzzy_buckets.heap_bytes();
         let exact_path_bytes = self.exact_paths.paths.heap_bytes();
+        let path_prefix_bytes = self.path_prefixes.heap_bytes();
         let heap_bytes = entry_table_heap_bytes
             .saturating_add(name_ngram_bytes)
             .saturating_add(extension_bytes)
             .saturating_add(path_segment_bytes)
             .saturating_add(path_fuzzy_bytes)
-            .saturating_add(exact_path_bytes);
+            .saturating_add(exact_path_bytes)
+            .saturating_add(path_prefix_bytes);
         CompactCandidateMemoryStats {
             entry_count: self.table.len(),
             prefix_key_count: 0,
@@ -1116,6 +1219,7 @@ impl CompactCandidateIndex {
             path_segment_bytes,
             path_fuzzy_bytes,
             exact_path_bytes,
+            path_prefix_bytes,
             heap_bytes,
             total_resident_bytes: std::mem::size_of::<Self>().saturating_add(heap_bytes),
         }

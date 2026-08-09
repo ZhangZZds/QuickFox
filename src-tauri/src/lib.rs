@@ -6702,8 +6702,8 @@ mod tests {
         assert_eq!(runtime.index.entry_count(), 1);
         assert_eq!(
             SearchIndex::materialized_snapshot_count(),
-            2,
-            "one recovered snapshot plus one new baseline metadata snapshot"
+            1,
+            "the compact baseline reuses its authoritative path metadata"
         );
     }
 

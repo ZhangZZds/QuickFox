@@ -204,6 +204,18 @@ impl SearchIndex {
         self.compact_candidates.entry_count()
     }
 
+    pub(crate) fn unique_path_key_count(&self) -> usize {
+        self.compact_candidates.unique_path_key_count()
+    }
+
+    pub(crate) fn compact_path_scope_entries(&self, key: &str, subtree: bool) -> Vec<IndexedEntry> {
+        self.compact_candidates
+            .path_scope_ids(key, subtree)
+            .into_iter()
+            .filter_map(|id| self.compact_candidates.materialize(id))
+            .collect()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.compact_candidates.is_empty()
     }

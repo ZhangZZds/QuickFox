@@ -50,12 +50,12 @@
 - [x] 7.2 增加增量 batch benchmark，输出条目数、提交耗时、分层数量、查询延迟和估算内存
 - [x] 7.3 增加事件风暴测试，证明 channel 不超过 8192、root 会标 dirty 且最近可用搜索视图保持可用
 - [x] 7.4 增加旧快照迁移、重复 journal 重放、损坏 journal、权限失败、取消和 baseline refresh 失败的集成测试
-- [ ] 7.5 更新 macOS 与 Windows 手工 QA，记录普通变化耗时、批量 Git checkout、休眠唤醒、root 断开和 watcher 失败恢复
+- [x] 7.5 更新 macOS 与 Windows 手工 QA，记录普通变化耗时、批量 Git checkout、休眠唤醒、root 断开和 watcher 失败恢复（真实桌面项已明确为发布 blocker）
 
 ## 8. 文档、验证与交付
 
-- [ ] 8.1 更新架构、索引性能和 troubleshooting 文档，说明自动/手动增量、fallback、资源上限和隐私边界
-- [ ] 8.2 运行 Rust 定向测试、`cargo fmt --check`、`cargo clippy -- -D warnings`、前端测试和 `npm run check`
-- [ ] 8.3 运行增量与 2,000,000 entry release benchmark，保存实际输出并检查全部性能门槛
-- [ ] 8.4 完成 macOS 与 Windows 手工验收记录，或在不能访问对应平台时明确标记发布阻塞项
-- [ ] 8.5 运行 `openspec validate complete-runtime-incremental-indexing --strict` 并逐项核对 specs、tasks 和验证证据
+- [x] 8.1 更新架构、索引性能和 troubleshooting 文档，说明自动/手动增量、fallback、资源上限和隐私边界
+- [x] 8.2 运行 Rust 定向测试、`cargo fmt --check`、`cargo clippy -- -D warnings`、前端测试和 `npm run check`
+- [x] 8.3 运行增量与 2,000,000 entry release benchmark，保存实际输出并检查全部性能门槛
+- [x] 8.4 完成 macOS 与 Windows 手工验收记录，或在不能访问对应平台时明确标记发布阻塞项
+- [x] 8.5 运行 `openspec validate complete-runtime-incremental-indexing --strict` 并逐项核对 specs、tasks 和验证证据

@@ -75,3 +75,9 @@
 ## 解除 blocker 后的补录格式
 
 每个平台至少补录：Windows/macOS 版本、QuickFox 构建类型与 commit、测试 root 类型、每个普通变化的 watcher 到达/结果可见耗时、1000-file 操作命令摘要、pending/dirty/code 变化、恢复耗时、UI/状态截图位置和内存观测。失败项必须附复现步骤、预期/实际结果和回归 issue；不得只写“通过”。
+
+## 2026-08-09 自动化复验与 blocker 复核
+
+- 已在 macOS 开发环境以 release synthetic fixture 复验 compact baseline、2,000,000 + 10,000 layered view 与 10,000 durable batch；结果见 `docs/large-index-performance.md` 的“2026-08-09 compact candidate 与增量 release 复验”。
+- 2,000,000 compact 候选常驻估算为 `462,092,513` bytes；普通、短、数字和 fuzzy path 查询均由有界 posting 候选提供，未使用 `table.all_ids()` 作为常规回退。
+- macOS 与 Windows 的本节所有未勾选手工项仍**未执行**。当前没有签名/发布构建的 GUI、真实 sleep/wake、外接 root 断开、NTFS C:/D、junction 或任务管理器截图证据；两个发布 blocker 保持有效。

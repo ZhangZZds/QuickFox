@@ -26,6 +26,9 @@ QuickFox 采用 Tauri 双端架构：
 - `src-tauri/src/core/index.rs`
   - name/path 与正文查询入口
   - 索引状态模型、模糊搜索与正则搜索
+- `src-tauri/src/core/compact_index.rs`
+  - packed entry table 与有界 name/path 候选检索
+  - 1–3 字符 name n-gram 的 delta-varint posting、路径段索引与碰撞复核
 - `src-tauri/src/core/index_watcher.rs`
   - 平台 watcher adapter 与 8192 容量的非阻塞事件通道
 - `src-tauri/src/core/index_update_coordinator.rs`
@@ -150,6 +153,8 @@ Tauri 启动时会初始化一份运行时状态，包含：
 - `TombstoneSet`：精确删除与目录前缀删除。
 
 baseline 在候选截断前过滤已被 overlay 替换或 tombstone 屏蔽的条目，overlay 独立查询，最后沿用既有 matcher/ranker 合并、去重和排序。单次查询捕获同一 generation 的不可变 view，因此不会混读切换前后的状态。普通小批次只重建小型 overlay 候选结构，不重建百万级 baseline。
+
+baseline 的 name 候选使用 1–3 字符 n-gram：每个 posting 的有序 `EntryId` 使用 delta-varint 压缩。短查询和数字子串也由该索引生成候选，而不是退化为遍历整个 entry table；命中 fingerprint 后仍回读 packed name 复核，避免 hash 碰撞改变结果。路径 fuzzy 先按首字符和必要 ASCII 字符集合缩小范围，最终仍交给 matcher 验证 subsequence 语义。
 
 正文查询复用相同可见性语义，但查询时不遍历 baseline 构造隐藏路径。delta 提交时生成只含 overlay 路径和 tombstone 的不可变可见性快照，Tantivy 命中后按路径段过滤。没有正文索引时，普通 name/path 查询仍可用；`content:` 返回“内容索引仍在准备”。非法正文查询返回语法反馈；reader/search I/O 失败返回“内容索引查询失败”，并让运行时进入可观察降级与恢复。
 

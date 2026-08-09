@@ -72,6 +72,8 @@ cargo test --release --manifest-path src-tauri/Cargo.toml \
 - `entry_string_bytes`: entry 内 path/name/parent/root/search_text 等字符串内容估算。
 - `cached_search_text_bytes`: SearchIndex 额外缓存的 searchable text 字节数。
 
+`QUICKFOX_LARGE_INDEX_MEMORY` 的 `compact` 明细会额外输出 `name_ngram_bytes`。这是 1–3 字符 name n-gram 的 delta-varint postings；它覆盖短查询和数字子串候选，不允许以整表扫描替代。`candidates` 是 matcher 前的候选数，`full_scan=true` 仅适用于显式不支持的路径/glob 收窄，不能作为普通 name/path 查询的常规回退。
+
 2,000,000 阈值测试会输出 `QUICKFOX_LARGE_INDEX_THRESHOLD`，其中 `elapsed_us` 是每个查询的耗时，`results` 是返回结果数量。
 
 运行期分层 benchmark 还会输出：
@@ -210,3 +212,30 @@ wall time 为 49.92 s；maximum RSS 为 `6,605,078,528` bytes，peak memory foot
 - macOS 真实桌面 watcher：create/write/rename/delete、1000-file checkout、休眠/唤醒、root 断开、失败降级、10 秒硬上限和 UI 截图。
 - Windows NTFS C:/D: 跨目录 rename、盘符断开/重连、junction 安全回归、真实 200 万文件级 RSS 与 UI 响应。
 - 上述项目记录在 `docs/runtime-incremental-indexing-manual-qa-results-2026-07-31.md`，完成前不能把 synthetic benchmark 等同于发布验收通过。
+
+## 2026-08-09 compact candidate 与增量 release 复验
+
+环境：macOS arm64 开发机，Rust release synthetic benchmark，代码提交 `9fd39b1`。所有以下命令 exit 0、各报告 `1 passed`；数据只证明进程内候选/分层逻辑，不替代真实 Windows 文件系统或桌面 watcher 验收。
+
+### 纯 2,000,000 baseline
+
+`synthetic_large_index_baseline_reports_current_linear_search_characteristics` 输出常驻估算 `462,092,513` bytes（约 441 MiB），低于 500 MiB 目标和 800 MiB 硬上限。`name_ngram_bytes` 为 `95,500,991` bytes，compact path-prefix ID 表为 `8,000,000` bytes；它替代了 LayeredSearchIndex 的重复 baseline 路径字符串 map。
+
+| query                         | 耗时 (µs) | candidates | full_scan |
+| ----------------------------- | --------: | ---------: | --------- |
+| agents-exact                  |        35 |          1 | false     |
+| agents-prefix-extension       |         2 |          1 | false     |
+| agents-prefix                 |         1 |          1 | false     |
+| agents-type-md                |    48,409 |          1 | false     |
+| agents-dir-workspace          |       589 |          1 | false     |
+| low-hit-random                |         2 |          0 | false     |
+| path-segment-fuzzy (`wrkspc`) |       404 |    500,001 | false     |
+| high-hit-project              |    13,835 |    636,364 | false     |
+
+同一 release 阈值测试的最大受测耗时为 `49,505` µs（agents-type-md），低于每查询 250 ms 门槛。`wrkspc` 的 500,001 候选是同一 `workspace` 路径段的真实 fuzzy 命中，首批 20 个结果在 404 µs 返回；不是整表回退。
+
+### 2,000,000 baseline + 10,000 runtime delta
+
+`two_million_baseline_with_runtime_delta_stays_within_latency_budget` 的最大 P95 是 overlay-field-filtered `41,208` µs（41.208 ms），满足 ≤50 ms 门槛。该 fixture 使用 baseline 2,000,000、overlay 5,000、tombstone 5,000，估算 delta 为 `4,801,540` bytes。
+
+`incremental_batch_benchmark_reports_commit_layers_query_p95_and_memory`：10,000 entries 的 commit `45,017` µs、journal `20,611` µs、layer apply `24,405` µs、查询 P95 `3,586` µs，估算 delta 同为 `4,781,540` bytes。

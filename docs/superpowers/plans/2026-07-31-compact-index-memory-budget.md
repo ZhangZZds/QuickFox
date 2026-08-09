@@ -13,6 +13,7 @@
 ### Task 1: 建立完整且会失败的内存门槛
 
 **Files:**
+
 - Modify: `src-tauri/src/core/compact_index.rs`
 - Modify: `src-tauri/src/core/index.rs`
 - Modify: `src-tauri/src/core/layered_index.rs`
@@ -56,6 +57,7 @@ git commit -m "test: enforce compact index memory budget"
 ### Task 2: 将 EntryTable 迁移为唯一 packed 存储
 
 **Files:**
+
 - Modify: `src-tauri/src/core/compact_index.rs`
 - Modify: `src-tauri/src/core/index.rs`
 - Modify: `src-tauri/src/core/file_matcher.rs`
@@ -90,6 +92,7 @@ git commit -m "refactor: make packed index authoritative"
 ### Task 3: 用有界候选结构替换全字符 BTreeMap
 
 **Files:**
+
 - Modify: `src-tauri/src/core/compact_index.rs`
 - Modify: `src-tauri/src/core/index.rs`
 
@@ -121,6 +124,7 @@ git commit -m "perf: bound compact candidate storage"
 ### Task 4: 移除 Layered baseline 路径副本
 
 **Files:**
+
 - Modify: `src-tauri/src/core/compact_index.rs`
 - Modify: `src-tauri/src/core/index.rs`
 - Modify: `src-tauri/src/core/layered_index.rs`
@@ -149,6 +153,7 @@ git commit -m "perf: reuse compact baseline path metadata"
 ### Task 5: 发布级验证、文档与 OpenSpec 收口
 
 **Files:**
+
 - Modify: `docs/large-index-performance.md`
 - Modify: `docs/architecture.md`
 - Modify: `docs/runtime-incremental-indexing-manual-qa-results-2026-07-31.md`

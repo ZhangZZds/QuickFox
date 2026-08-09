@@ -164,7 +164,6 @@ impl ContentVisibilitySnapshot {
 #[derive(Debug)]
 pub struct LayeredSearchIndex {
     baseline: SearchIndex,
-    baseline_by_path: BTreeMap<String, IndexedEntryKind>,
     overlay_entries: BTreeMap<String, IndexedEntry>,
     overlay_generations: BTreeMap<String, u64>,
     overlay: SearchIndex,
@@ -201,15 +200,9 @@ impl LayeredSearchIndex {
     }
 
     pub fn from_search_index(baseline: SearchIndex) -> Self {
-        let baseline_entries = baseline.materialized_entries();
-        let baseline_by_path: BTreeMap<_, _> = baseline_entries
-            .iter()
-            .map(|entry| (normalize_path_text_key(&entry.path), entry.kind.clone()))
-            .collect();
-        let visible_entry_count = baseline_by_path.len();
+        let visible_entry_count = baseline.unique_path_key_count();
         Self {
             baseline,
-            baseline_by_path,
             overlay_entries: BTreeMap::new(),
             overlay_generations: BTreeMap::new(),
             overlay: SearchIndex::default(),
@@ -389,12 +382,7 @@ impl LayeredSearchIndex {
     }
 
     fn install_baseline(&mut self, baseline: SearchIndex, generation: u64) {
-        self.baseline_by_path = baseline
-            .materialized_entries()
-            .iter()
-            .map(|entry| (normalize_path_text_key(&entry.path), entry.kind.clone()))
-            .collect();
-        self.visible_entry_count = self.baseline_by_path.len();
+        self.visible_entry_count = baseline.unique_path_key_count();
         self.baseline = baseline;
         self.overlay_entries.clear();
         self.overlay_generations.clear();
@@ -513,7 +501,6 @@ impl LayeredSearchIndex {
     pub fn estimated_total_resident_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
             .saturating_add(self.baseline.memory_estimate().heap_allocated_bytes())
-            .saturating_add(self.baseline_path_metadata_heap_bytes())
             .saturating_add(self.overlay_entries_heap_bytes())
             .saturating_add(self.overlay_generations_heap_bytes())
             .saturating_add(self.overlay.memory_estimate().heap_allocated_bytes())
@@ -522,18 +509,7 @@ impl LayeredSearchIndex {
     }
 
     pub fn estimated_baseline_path_metadata_bytes(&self) -> usize {
-        self.baseline_path_metadata_heap_bytes()
-    }
-
-    fn baseline_path_metadata_heap_bytes(&self) -> usize {
-        self.baseline_by_path
-            .keys()
-            .map(|path| {
-                path.capacity()
-                    .saturating_add(std::mem::size_of::<(String, IndexedEntryKind)>())
-                    .saturating_add(std::mem::size_of::<usize>().saturating_mul(3))
-            })
-            .sum()
+        0
     }
 
     fn overlay_entries_heap_bytes(&self) -> usize {
@@ -604,9 +580,10 @@ impl LayeredSearchIndex {
         }
         self.record_baseline_probe();
         if self
-            .baseline_by_path
-            .get(key)
-            .is_some_and(|kind| *kind == IndexedEntryKind::Directory)
+            .baseline
+            .compact_path_scope_entries(key, false)
+            .into_iter()
+            .any(|entry| entry.kind == IndexedEntryKind::Directory)
         {
             return true;
         }
@@ -615,28 +592,34 @@ impl LayeredSearchIndex {
             return true;
         }
         self.record_baseline_probe();
-        map_has_descendant(&self.baseline_by_path, key)
+        self.baseline
+            .compact_path_scope_entries(key, true)
+            .into_iter()
+            .any(|entry| normalize_path_text_key(&entry.path) != key)
     }
 
     fn count_visible_scope(&self, key: &str, subtree: bool) -> usize {
         let baseline_count = self
             .baseline_scope_keys(key, subtree)
+            .into_iter()
             .filter(|path| {
-                !self.overlay_entries.contains_key(*path) && !self.tombstones.contains(path)
+                !self.overlay_entries.contains_key(path) && !self.tombstones.contains(path)
             })
             .count();
         let overlay_count = map_scope_keys(&self.overlay_entries, key, subtree).count();
         baseline_count.saturating_add(overlay_count)
     }
 
-    fn baseline_scope_keys<'a>(
-        &'a self,
-        key: &'a str,
-        subtree: bool,
-    ) -> impl Iterator<Item = &'a String> {
-        map_scope_keys(&self.baseline_by_path, key, subtree).inspect(|_| {
-            self.record_baseline_probe();
-        })
+    fn baseline_scope_keys(&self, key: &str, subtree: bool) -> Vec<String> {
+        self.record_baseline_probe();
+        let mut keys: Vec<_> = self
+            .baseline
+            .compact_path_scope_entries(key, subtree)
+            .into_iter()
+            .map(|entry| normalize_path_text_key(&entry.path))
+            .collect();
+        keys.dedup();
+        keys
     }
 
     fn adjust_visible_count(&mut self, before: usize, after: usize) {
@@ -1573,7 +1556,6 @@ mod tests {
         let index = LayeredSearchIndex::from_baseline(baseline);
         let expected = std::mem::size_of::<LayeredSearchIndex>()
             .saturating_add(index.baseline.memory_estimate().heap_allocated_bytes())
-            .saturating_add(index.baseline_path_metadata_heap_bytes())
             .saturating_add(index.overlay_entries_heap_bytes())
             .saturating_add(index.overlay_generations_heap_bytes())
             .saturating_add(index.overlay.memory_estimate().heap_allocated_bytes())
