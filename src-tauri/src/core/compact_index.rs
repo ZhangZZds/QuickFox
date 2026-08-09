@@ -1,6 +1,7 @@
 //! Compact search index data structures.
 
-use std::collections::{BTreeMap, HashMap};
+use std::cmp::Ordering as CmpOrdering;
+use std::collections::HashMap;
 
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -212,6 +213,7 @@ impl EntryTable {
             });
         }
 
+        table.entries.shrink_to_fit();
         table.unique_value_count = arena.unique_value_count();
         table.arena = arena.finish();
         Ok(table)
@@ -382,202 +384,383 @@ impl PackedArenaBuilder {
         self.ranges_by_value.len()
     }
 
-    fn finish(self) -> Vec<u8> {
+    fn finish(mut self) -> Vec<u8> {
+        self.arena.shrink_to_fit();
         self.arena
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct FingerprintPosting {
+    fingerprint: u32,
+    id: EntryId,
+}
+
+#[derive(Debug, Clone, Default)]
+struct FingerprintIndex {
+    postings: Vec<FingerprintPosting>,
+}
+
+impl FingerprintIndex {
+    fn from_pairs(pairs: impl IntoIterator<Item = (u32, EntryId)>) -> Self {
+        let mut postings: Vec<_> = pairs
+            .into_iter()
+            .map(|(fingerprint, id)| FingerprintPosting { fingerprint, id })
+            .collect();
+        postings.sort_unstable();
+        postings.dedup();
+        postings.shrink_to_fit();
+        Self { postings }
+    }
+
+    fn matching_ids(&self, fingerprint: u32) -> impl Iterator<Item = EntryId> + '_ {
+        let start = self
+            .postings
+            .partition_point(|posting| posting.fingerprint < fingerprint);
+        let end = self
+            .postings
+            .partition_point(|posting| posting.fingerprint <= fingerprint);
+        self.postings[start..end].iter().map(|posting| posting.id)
+    }
+
+    fn heap_bytes(&self) -> usize {
+        self.postings
+            .capacity()
+            .saturating_mul(std::mem::size_of::<FingerprintPosting>())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TextPosting {
+    text: PackedTextRange,
+    id: EntryId,
+}
+
+fn sort_text_postings(postings: &mut [TextPosting], table: &EntryTable) {
+    postings.sort_unstable_by(|left, right| {
+        compare_ascii_case_insensitive(
+            table.text(left.text).unwrap_or_default(),
+            table.text(right.text).unwrap_or_default(),
+        )
+        .then_with(|| left.id.cmp(&right.id))
+        .then_with(|| left.text.start.cmp(&right.text.start))
+        .then_with(|| left.text.len.cmp(&right.text.len))
+    });
+}
+
+fn lookup_text_prefix(postings: &[TextPosting], table: &EntryTable, prefix: &str) -> Vec<EntryId> {
+    let normalized = prefix.to_ascii_lowercase();
+    let start = postings.partition_point(|posting| {
+        compare_ascii_case_insensitive(table.text(posting.text).unwrap_or_default(), &normalized)
+            == CmpOrdering::Less
+    });
+    let mut ids = Vec::new();
+    for posting in &postings[start..] {
+        let text = table.text(posting.text).unwrap_or_default();
+        if !starts_with_ascii_case_insensitive(text, &normalized) {
+            break;
+        }
+        ids.push(posting.id);
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct NameTokenIndex {
-    ids_by_token: BTreeMap<String, Vec<EntryId>>,
+    tokens: FingerprintIndex,
 }
 
 impl NameTokenIndex {
     pub fn build(table: &EntryTable) -> Self {
-        let mut index = Self::default();
-        for entry in table.entries() {
-            let Some(name) = table.name(entry) else {
-                continue;
-            };
-            for token in name_tokens(name) {
-                push_unique(&mut index.ids_by_token, token, entry.id);
-            }
+        let pairs = table.entries().iter().flat_map(|entry| {
+            name_tokens(table.name(entry).unwrap_or_default())
+                .into_iter()
+                .map(move |token| (text_fingerprint(&token), entry.id))
+        });
+        Self {
+            tokens: FingerprintIndex::from_pairs(pairs),
         }
-        index
     }
 
-    pub fn lookup(&self, token: &str) -> Vec<EntryId> {
-        self.ids_by_token
-            .get(&token.to_ascii_lowercase())
-            .cloned()
-            .unwrap_or_default()
+    pub fn lookup(&self, table: &EntryTable, token: &str) -> Vec<EntryId> {
+        let normalized = token.to_ascii_lowercase();
+        verified_ids(
+            self.tokens.matching_ids(text_fingerprint(&normalized)),
+            |id| {
+                table
+                    .get(id)
+                    .and_then(|entry| table.name(entry))
+                    .is_some_and(|name| name_has_token_ascii_case_insensitive(name, &normalized))
+            },
+        )
     }
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct PrefixIndex {
-    ids_by_prefix: BTreeMap<String, Vec<EntryId>>,
+    names_and_tokens: Vec<TextPosting>,
 }
 
 impl PrefixIndex {
     pub fn build(table: &EntryTable) -> Self {
-        let mut index = Self::default();
+        let mut names_and_tokens = Vec::new();
         for entry in table.entries() {
-            let Some(name) = table.name(entry) else {
+            if table.name(entry).is_none() {
                 continue;
-            };
-            for prefix in name_prefixes(name) {
-                push_unique(&mut index.ids_by_prefix, prefix, entry.id);
             }
+            names_and_tokens.push(TextPosting {
+                text: entry.name,
+                id: entry.id,
+            });
         }
-        index
+        names_and_tokens
+            .sort_unstable_by_key(|posting| (posting.id, posting.text.start, posting.text.len));
+        names_and_tokens.dedup();
+        sort_text_postings(&mut names_and_tokens, table);
+        names_and_tokens.shrink_to_fit();
+        Self { names_and_tokens }
     }
 
-    pub fn lookup(&self, prefix: &str) -> Vec<EntryId> {
-        self.ids_by_prefix
-            .get(&prefix.to_ascii_lowercase())
-            .cloned()
-            .unwrap_or_default()
+    pub fn lookup(&self, table: &EntryTable, prefix: &str) -> Vec<EntryId> {
+        lookup_text_prefix(&self.names_and_tokens, table, prefix)
     }
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct NameTrigramIndex {
-    ids_by_trigram: BTreeMap<String, Vec<EntryId>>,
+    trigrams: FingerprintIndex,
 }
 
 impl NameTrigramIndex {
     pub fn build(table: &EntryTable) -> Self {
-        let mut index = Self::default();
-        for entry in table.entries() {
-            let Some(name) = table.name(entry) else {
-                continue;
-            };
-            for trigram in name_trigrams(name) {
-                push_unique(&mut index.ids_by_trigram, trigram, entry.id);
-            }
+        let pairs = table.entries().iter().flat_map(|entry| {
+            name_trigrams(table.name(entry).unwrap_or_default())
+                .into_iter()
+                .map(move |trigram| (text_fingerprint(&trigram), entry.id))
+        });
+        Self {
+            trigrams: FingerprintIndex::from_pairs(pairs),
         }
-        index
     }
 
-    pub fn lookup(&self, term: &str) -> Vec<EntryId> {
-        leading_trigram(term)
-            .and_then(|trigram| self.ids_by_trigram.get(&trigram).cloned())
-            .unwrap_or_default()
+    pub fn lookup(&self, table: &EntryTable, term: &str) -> Vec<EntryId> {
+        let Some(trigram) = leading_trigram(term) else {
+            return Vec::new();
+        };
+        verified_ids(
+            self.trigrams.matching_ids(text_fingerprint(&trigram)),
+            |id| {
+                table
+                    .get(id)
+                    .and_then(|entry| table.name(entry))
+                    .is_some_and(|name| contains_ascii_case_insensitive(name, &trigram))
+            },
+        )
     }
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct ExtensionIndex {
-    ids_by_extension: BTreeMap<String, Vec<EntryId>>,
+    extensions: FingerprintIndex,
 }
 
 impl ExtensionIndex {
     pub fn build(table: &EntryTable) -> Self {
-        let mut index = Self::default();
-        for entry in table.entries() {
-            if let Some(extension) = table
+        let pairs = table.entries().iter().filter_map(|entry| {
+            table
                 .extension(entry)
                 .map(str::to_owned)
                 .or_else(|| entry_name_extension(table.name(entry).unwrap_or_default()))
-            {
-                push_unique(
-                    &mut index.ids_by_extension,
-                    extension.to_ascii_lowercase(),
-                    entry.id,
-                );
-            }
+                .map(|extension| (text_fingerprint(&extension), entry.id))
+        });
+        Self {
+            extensions: FingerprintIndex::from_pairs(pairs),
         }
-        index
     }
 
-    pub fn lookup(&self, extension: &str) -> Vec<EntryId> {
-        self.ids_by_extension
-            .get(
-                extension
-                    .trim_start_matches('.')
-                    .to_ascii_lowercase()
-                    .as_str(),
-            )
-            .cloned()
-            .unwrap_or_default()
+    pub fn lookup(&self, table: &EntryTable, extension: &str) -> Vec<EntryId> {
+        let normalized = extension.trim_start_matches('.').to_ascii_lowercase();
+        verified_ids(
+            self.extensions.matching_ids(text_fingerprint(&normalized)),
+            |id| {
+                table.get(id).is_some_and(|entry| {
+                    table
+                        .extension(entry)
+                        .map(str::to_owned)
+                        .or_else(|| entry_name_extension(table.name(entry).unwrap_or_default()))
+                        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(&normalized))
+                })
+            },
+        )
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SegmentBucket {
+    text: PackedTextRange,
+    start: u32,
+    len: u32,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct PathSegmentIndex {
-    ids_by_segment: BTreeMap<String, Vec<EntryId>>,
-    ids_by_prefix: BTreeMap<String, Vec<EntryId>>,
-    ids_by_fuzzy_key: BTreeMap<String, Vec<EntryId>>,
+    buckets: Vec<SegmentBucket>,
+    ids: Vec<EntryId>,
+    fuzzy_buckets: FingerprintIndex,
 }
 
 impl PathSegmentIndex {
     pub fn build(table: &EntryTable) -> Self {
-        let mut index = Self::default();
+        let mut grouped: HashMap<String, (PackedTextRange, Vec<EntryId>)> = HashMap::new();
         for entry in table.entries() {
-            let path = table.path(entry).unwrap_or_default();
-            let parent = table.parent(entry).unwrap_or_default();
-            for segment in path_segments(path).chain(path_segments(parent)) {
-                if let Some(key) = fuzzy_segment_key(&segment) {
-                    push_unique(&mut index.ids_by_fuzzy_key, key, entry.id);
-                }
-                for prefix in segment_prefixes(&segment) {
-                    push_unique(&mut index.ids_by_prefix, prefix, entry.id);
-                }
-                push_unique(&mut index.ids_by_segment, segment, entry.id);
+            let Some(path) = table.path(entry) else {
+                continue;
+            };
+            let mut ranges = path_segment_ranges(path, entry.path.start);
+            if entry.kind != IndexedEntryKind::Directory {
+                ranges.pop();
+            }
+            for text in ranges {
+                let segment = table.text(text).unwrap_or_default();
+                let key = segment.to_ascii_lowercase();
+                let (_, ids) = grouped.entry(key).or_insert_with(|| (text, Vec::new()));
+                ids.push(entry.id);
             }
         }
-        index
+
+        let mut grouped: Vec<_> = grouped.into_iter().collect();
+        grouped.sort_unstable_by(|(_, left), (_, right)| {
+            compare_ascii_case_insensitive(
+                table.text(left.0).unwrap_or_default(),
+                table.text(right.0).unwrap_or_default(),
+            )
+        });
+
+        let total_ids = grouped.iter().map(|(_, (_, ids))| ids.len()).sum();
+        let mut buckets = Vec::with_capacity(grouped.len());
+        let mut ids = Vec::with_capacity(total_ids);
+        let mut fuzzy_pairs = Vec::with_capacity(grouped.len());
+        for (bucket_index, (_, (text, mut bucket_ids))) in grouped.into_iter().enumerate() {
+            bucket_ids.sort_unstable();
+            bucket_ids.dedup();
+            let start = ids.len();
+            ids.extend(bucket_ids);
+            let bucket = SegmentBucket {
+                text,
+                start: u32::try_from(start).expect("path segment posting offset exceeds u32"),
+                len: u32::try_from(ids.len().saturating_sub(start))
+                    .expect("path segment posting length exceeds u32"),
+            };
+            if let Some(key) = fuzzy_segment_key(table.text(text).unwrap_or_default()) {
+                fuzzy_pairs.push((
+                    text_fingerprint(&key),
+                    EntryId::from_usize(bucket_index).expect("path segment bucket exceeds u32"),
+                ));
+            }
+            buckets.push(bucket);
+        }
+        buckets.shrink_to_fit();
+        ids.shrink_to_fit();
+        Self {
+            buckets,
+            ids,
+            fuzzy_buckets: FingerprintIndex::from_pairs(fuzzy_pairs),
+        }
     }
 
-    pub fn lookup(&self, segment: &str) -> Vec<EntryId> {
+    pub fn lookup(&self, table: &EntryTable, segment: &str) -> Vec<EntryId> {
         let normalized = segment.to_ascii_lowercase();
-        let exact = self
-            .ids_by_segment
-            .get(&normalized)
-            .cloned()
-            .unwrap_or_default();
-        if !exact.is_empty() {
-            return exact;
+        let matching = self.matching_buckets(table, &normalized);
+        if let Some(exact) = matching.iter().find(|bucket| {
+            table
+                .text(bucket.text)
+                .is_some_and(|text| text.eq_ignore_ascii_case(&normalized))
+        }) {
+            return self.bucket_ids(*exact);
+        }
+        if !matching.is_empty() {
+            return self.collect_bucket_ids(matching);
         }
 
-        let prefix = self
-            .ids_by_prefix
-            .get(&normalized)
-            .cloned()
-            .unwrap_or_default();
-        if !prefix.is_empty() {
-            return prefix;
-        }
+        let Some(key) = fuzzy_segment_key(&normalized) else {
+            return Vec::new();
+        };
+        let matching: Vec<_> = self
+            .fuzzy_buckets
+            .matching_ids(text_fingerprint(&key))
+            .filter_map(|id| self.buckets.get(id.as_usize()).copied())
+            .filter(|bucket| {
+                table
+                    .text(bucket.text)
+                    .is_some_and(|text| fuzzy_segment_key(text).as_deref() == Some(key.as_str()))
+            })
+            .collect();
+        self.collect_bucket_ids(matching)
+    }
 
-        fuzzy_segment_key(&normalized)
-            .and_then(|key| self.ids_by_fuzzy_key.get(&key).cloned())
-            .unwrap_or_default()
+    fn matching_buckets(&self, table: &EntryTable, prefix: &str) -> Vec<SegmentBucket> {
+        let start = self.buckets.partition_point(|bucket| {
+            compare_ascii_case_insensitive(table.text(bucket.text).unwrap_or_default(), prefix)
+                == CmpOrdering::Less
+        });
+        self.buckets[start..]
+            .iter()
+            .copied()
+            .take_while(|bucket| {
+                starts_with_ascii_case_insensitive(
+                    table.text(bucket.text).unwrap_or_default(),
+                    prefix,
+                )
+            })
+            .collect()
+    }
+
+    fn bucket_ids(&self, bucket: SegmentBucket) -> Vec<EntryId> {
+        let start = bucket.start as usize;
+        let end = start.saturating_add(bucket.len as usize);
+        self.ids.get(start..end).unwrap_or_default().to_vec()
+    }
+
+    fn collect_bucket_ids(&self, buckets: Vec<SegmentBucket>) -> Vec<EntryId> {
+        let mut result = Vec::new();
+        for bucket in buckets {
+            let start = bucket.start as usize;
+            let end = start.saturating_add(bucket.len as usize);
+            if let Some(ids) = self.ids.get(start..end) {
+                result.extend_from_slice(ids);
+            }
+        }
+        result.sort_unstable();
+        result.dedup();
+        result
     }
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct ExactPathIndex {
-    id_by_path: BTreeMap<String, EntryId>,
+    paths: FingerprintIndex,
 }
 
 impl ExactPathIndex {
     pub fn build(table: &EntryTable) -> Self {
-        let mut index = Self::default();
-        for entry in table.entries() {
-            if let Some(path) = table.path(entry) {
-                index.id_by_path.insert(path.to_ascii_lowercase(), entry.id);
-            }
+        let pairs = table.entries().iter().filter_map(|entry| {
+            table
+                .path(entry)
+                .map(|path| (text_fingerprint(path), entry.id))
+        });
+        Self {
+            paths: FingerprintIndex::from_pairs(pairs),
         }
-        index
     }
 
-    pub fn lookup(&self, path: &str) -> Vec<EntryId> {
-        self.id_by_path
-            .get(&path.to_ascii_lowercase())
-            .copied()
-            .into_iter()
-            .collect()
+    pub fn lookup(&self, table: &EntryTable, path: &str) -> Vec<EntryId> {
+        verified_ids(self.paths.matching_ids(text_fingerprint(path)), |id| {
+            table
+                .path_by_id(id)
+                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(path))
+        })
     }
 }
 
@@ -612,6 +795,14 @@ pub struct CompactCandidateMemoryStats {
     pub entry_count: usize,
     pub prefix_key_count: usize,
     pub retained_build_interner_bytes: usize,
+    pub entry_table_heap_bytes: usize,
+    pub name_token_bytes: usize,
+    pub name_prefix_bytes: usize,
+    pub name_trigram_bytes: usize,
+    pub extension_bytes: usize,
+    pub path_segment_bytes: usize,
+    pub path_fuzzy_bytes: usize,
+    pub exact_path_bytes: usize,
     pub heap_bytes: usize,
     pub total_resident_bytes: usize,
 }
@@ -669,22 +860,23 @@ impl CompactCandidateIndex {
     pub fn retrieve_ordinary_term(&self, term: &str) -> CandidateRetrieval {
         let normalized = term.to_ascii_lowercase();
         let (candidates, used_full_scan) = if normalized.contains(['/', '\\']) {
-            let exact = self.exact_paths.lookup(&normalized);
+            let exact = self.exact_paths.lookup(&self.table, &normalized);
             if exact.is_empty() {
                 (self.table.all_ids(), true)
             } else {
                 (exact, false)
             }
         } else {
-            let precise = union_sorted_ids([
-                self.name_tokens.lookup(&normalized),
-                self.prefixes.lookup(&normalized),
-                self.path_segments.lookup(&normalized),
+            let name_candidates = union_sorted_ids([
+                self.name_tokens.lookup(&self.table, &normalized),
+                self.prefixes.lookup(&self.table, &normalized),
             ]);
-            if precise.is_empty() {
-                (self.name_trigrams.lookup(&normalized), false)
-            } else {
+            let path_candidates = self.path_segments.lookup(&self.table, &normalized);
+            let precise = union_sorted_ids([name_candidates, path_candidates]);
+            if !precise.is_empty() {
                 (precise, false)
+            } else {
+                (self.name_trigrams.lookup(&self.table, &normalized), false)
             }
         };
         CandidateRetrieval {
@@ -709,15 +901,19 @@ impl CompactCandidateIndex {
         }
 
         for extension in &query.type_filters {
-            candidates =
-                intersect_optional_candidates(candidates, self.extensions.lookup(extension));
+            candidates = intersect_optional_candidates(
+                candidates,
+                self.extensions.lookup(&self.table, extension),
+            );
         }
 
         for name in &query.name_filters {
-            let mut name_candidates =
-                union_sorted_ids([self.name_tokens.lookup(name), self.prefixes.lookup(name)]);
+            let mut name_candidates = union_sorted_ids([
+                self.name_tokens.lookup(&self.table, name),
+                self.prefixes.lookup(&self.table, name),
+            ]);
             if name_candidates.is_empty() {
-                name_candidates = self.name_trigrams.lookup(name);
+                name_candidates = self.name_trigrams.lookup(&self.table, name);
             }
             if name_candidates.is_empty() {
                 name_candidates = self.table.all_ids();
@@ -731,7 +927,7 @@ impl CompactCandidateIndex {
                 used_full_scan = true;
                 self.table.all_ids()
             } else {
-                self.path_segments.lookup(dir)
+                self.path_segments.lookup(&self.table, dir)
             };
             candidates = intersect_optional_candidates(candidates, dir_candidates);
         }
@@ -745,6 +941,52 @@ impl CompactCandidateIndex {
             },
             candidates,
         }
+    }
+
+    pub fn retrieve_query_name_priority(&self, query: &str) -> Option<CandidateRetrieval> {
+        let parsed = FileQuery::parse(query);
+        if parsed.ordinary_terms.len() != 1 {
+            return None;
+        }
+
+        let term = &parsed.ordinary_terms[0];
+        let mut candidates = union_sorted_ids([
+            self.name_tokens.lookup(&self.table, term),
+            self.prefixes.lookup(&self.table, term),
+            self.name_trigrams.lookup(&self.table, term),
+        ]);
+        if candidates.is_empty() {
+            return None;
+        }
+
+        for extension in &parsed.type_filters {
+            candidates =
+                intersect_sorted_ids(candidates, self.extensions.lookup(&self.table, extension));
+        }
+        for name in &parsed.name_filters {
+            let name_candidates = union_sorted_ids([
+                self.name_tokens.lookup(&self.table, name),
+                self.prefixes.lookup(&self.table, name),
+                self.name_trigrams.lookup(&self.table, name),
+            ]);
+            candidates = intersect_sorted_ids(candidates, name_candidates);
+        }
+        for dir in &parsed.dir_filters {
+            if dir.contains(['*', '?', '[']) {
+                return None;
+            }
+            candidates =
+                intersect_sorted_ids(candidates, self.path_segments.lookup(&self.table, dir));
+        }
+
+        Some(CandidateRetrieval {
+            stats: CandidateRetrievalStats {
+                indexed_entry_count: self.table.len(),
+                candidate_count: candidates.len(),
+                used_full_scan: false,
+            },
+            candidates,
+        })
     }
 
     pub fn retrieve_query_paths(&self, query: &str) -> Vec<String> {
@@ -793,32 +1035,74 @@ impl CompactCandidateIndex {
     fn estimated_heap_bytes(&self) -> usize {
         self.table
             .estimated_heap_bytes()
-            .saturating_add(string_ids_map_heap_bytes(&self.name_tokens.ids_by_token))
-            .saturating_add(string_ids_map_heap_bytes(&self.prefixes.ids_by_prefix))
-            .saturating_add(string_ids_map_heap_bytes(
-                &self.name_trigrams.ids_by_trigram,
-            ))
-            .saturating_add(string_ids_map_heap_bytes(&self.extensions.ids_by_extension))
-            .saturating_add(string_ids_map_heap_bytes(
-                &self.path_segments.ids_by_segment,
-            ))
-            .saturating_add(string_ids_map_heap_bytes(&self.path_segments.ids_by_prefix))
-            .saturating_add(string_ids_map_heap_bytes(
-                &self.path_segments.ids_by_fuzzy_key,
-            ))
-            .saturating_add(exact_path_map_heap_bytes(&self.exact_paths.id_by_path))
+            .saturating_add(self.name_tokens.tokens.heap_bytes())
+            .saturating_add(
+                self.prefixes
+                    .names_and_tokens
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<TextPosting>()),
+            )
+            .saturating_add(self.name_trigrams.trigrams.heap_bytes())
+            .saturating_add(self.extensions.extensions.heap_bytes())
+            .saturating_add(
+                self.path_segments
+                    .buckets
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<SegmentBucket>()),
+            )
+            .saturating_add(
+                self.path_segments
+                    .ids
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<EntryId>()),
+            )
+            .saturating_add(self.path_segments.fuzzy_buckets.heap_bytes())
+            .saturating_add(self.exact_paths.paths.heap_bytes())
     }
 
     pub fn memory_stats(&self) -> CompactCandidateMemoryStats {
-        let heap_bytes = self.estimated_heap_bytes();
+        let entry_table_heap_bytes = self.table.estimated_heap_bytes();
+        let name_token_bytes = self.name_tokens.tokens.heap_bytes();
+        let name_prefix_bytes = self
+            .prefixes
+            .names_and_tokens
+            .capacity()
+            .saturating_mul(std::mem::size_of::<TextPosting>());
+        let name_trigram_bytes = self.name_trigrams.trigrams.heap_bytes();
+        let extension_bytes = self.extensions.extensions.heap_bytes();
+        let path_segment_bytes = self
+            .path_segments
+            .buckets
+            .capacity()
+            .saturating_mul(std::mem::size_of::<SegmentBucket>())
+            .saturating_add(
+                self.path_segments
+                    .ids
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<EntryId>()),
+            );
+        let path_fuzzy_bytes = self.path_segments.fuzzy_buckets.heap_bytes();
+        let exact_path_bytes = self.exact_paths.paths.heap_bytes();
+        let heap_bytes = entry_table_heap_bytes
+            .saturating_add(name_token_bytes)
+            .saturating_add(name_prefix_bytes)
+            .saturating_add(name_trigram_bytes)
+            .saturating_add(extension_bytes)
+            .saturating_add(path_segment_bytes)
+            .saturating_add(path_fuzzy_bytes)
+            .saturating_add(exact_path_bytes);
         CompactCandidateMemoryStats {
             entry_count: self.table.len(),
-            prefix_key_count: self
-                .prefixes
-                .ids_by_prefix
-                .len()
-                .saturating_add(self.path_segments.ids_by_prefix.len()),
+            prefix_key_count: 0,
             retained_build_interner_bytes: 0,
+            entry_table_heap_bytes,
+            name_token_bytes,
+            name_prefix_bytes,
+            name_trigram_bytes,
+            extension_bytes,
+            path_segment_bytes,
+            path_fuzzy_bytes,
+            exact_path_bytes,
             heap_bytes,
             total_resident_bytes: std::mem::size_of::<Self>().saturating_add(heap_bytes),
         }
@@ -834,37 +1118,100 @@ impl EntryTable {
     }
 }
 
-fn string_ids_map_heap_bytes(map: &BTreeMap<String, Vec<EntryId>>) -> usize {
-    let payload: usize = map
-        .iter()
-        .map(|(key, ids)| {
-            key.capacity()
-                .saturating_add(
-                    ids.capacity()
-                        .saturating_mul(std::mem::size_of::<EntryId>()),
-                )
-                .saturating_add(std::mem::size_of::<(String, Vec<EntryId>)>())
-                .saturating_add(std::mem::size_of::<usize>().saturating_mul(3))
-        })
-        .sum();
-    payload
+fn text_fingerprint(text: &str) -> u32 {
+    const FNV_OFFSET: u32 = 0x811c_9dc5;
+    const FNV_PRIME: u32 = 0x0100_0193;
+
+    text.bytes().fold(FNV_OFFSET, |hash, byte| {
+        hash.wrapping_mul(FNV_PRIME) ^ byte.to_ascii_lowercase() as u32
+    })
 }
 
-fn exact_path_map_heap_bytes(map: &BTreeMap<String, EntryId>) -> usize {
-    let payload: usize = map
-        .keys()
-        .map(|key| {
-            key.capacity()
-                .saturating_add(std::mem::size_of::<(String, EntryId)>())
-                .saturating_add(std::mem::size_of::<usize>().saturating_mul(3))
+fn verified_ids(
+    ids: impl IntoIterator<Item = EntryId>,
+    matches: impl Fn(EntryId) -> bool,
+) -> Vec<EntryId> {
+    let mut verified: Vec<_> = ids.into_iter().filter(|id| matches(*id)).collect();
+    verified.sort_unstable();
+    verified.dedup();
+    verified
+}
+
+fn compare_ascii_case_insensitive(left: &str, right: &str) -> CmpOrdering {
+    let mut left_bytes = left.bytes();
+    let mut right_bytes = right.bytes();
+    loop {
+        match (left_bytes.next(), right_bytes.next()) {
+            (Some(left), Some(right)) => {
+                match left.to_ascii_lowercase().cmp(&right.to_ascii_lowercase()) {
+                    CmpOrdering::Equal => continue,
+                    ordering => return ordering,
+                }
+            }
+            (None, Some(_)) => return CmpOrdering::Less,
+            (Some(_), None) => return CmpOrdering::Greater,
+            (None, None) => return CmpOrdering::Equal,
+        }
+    }
+}
+
+fn starts_with_ascii_case_insensitive(text: &str, prefix: &str) -> bool {
+    text.len() >= prefix.len()
+        && text
+            .bytes()
+            .zip(prefix.bytes())
+            .all(|(text, prefix)| text.eq_ignore_ascii_case(&prefix))
+}
+
+fn contains_ascii_case_insensitive(text: &str, needle: &str) -> bool {
+    let needle = needle.as_bytes();
+    needle.is_empty()
+        || text.as_bytes().windows(needle.len()).any(|window| {
+            window
+                .iter()
+                .zip(needle)
+                .all(|(text, needle)| text.eq_ignore_ascii_case(needle))
         })
-        .sum();
-    payload
+}
+
+fn path_segment_ranges(path: &str, path_start: u32) -> Vec<PackedTextRange> {
+    let mut ranges = Vec::new();
+    let mut segment_start = 0;
+    for (index, byte) in path
+        .bytes()
+        .enumerate()
+        .chain(std::iter::once((path.len(), b'/')))
+    {
+        if !matches!(byte, b'/' | b'\\') {
+            continue;
+        }
+        let segment = path[segment_start..index].trim_end_matches(':');
+        if !segment.is_empty() {
+            ranges.push(PackedTextRange {
+                start: path_start.saturating_add(segment_start as u32),
+                len: segment.len() as u32,
+            });
+        }
+        segment_start = index.saturating_add(1);
+    }
+    ranges
 }
 
 fn entry_name_extension(name: &str) -> Option<String> {
     name.rsplit_once('.')
         .map(|(_, extension)| extension.to_ascii_lowercase())
+}
+
+fn name_trigrams(name: &str) -> Vec<String> {
+    let chars: Vec<_> = name.to_ascii_lowercase().chars().collect();
+    let mut trigrams = chars
+        .windows(3)
+        .filter(|window| window.iter().all(|character| character.is_alphabetic()))
+        .map(|window| window.iter().collect::<String>())
+        .collect::<Vec<_>>();
+    trigrams.sort();
+    trigrams.dedup();
+    trigrams
 }
 
 fn name_tokens(name: &str) -> Vec<String> {
@@ -881,62 +1228,34 @@ fn name_tokens(name: &str) -> Vec<String> {
     tokens
 }
 
-fn name_prefixes(name: &str) -> Vec<String> {
-    let lower = name.to_ascii_lowercase();
-    let mut prefixes = Vec::new();
-    for length in 1..=lower.len() {
-        if lower.is_char_boundary(length) {
-            prefixes.push(lower[..length].to_owned());
-        }
-    }
-    for token in name_tokens(name) {
-        for length in 1..=token.len() {
-            if token.is_char_boundary(length) {
-                prefixes.push(token[..length].to_owned());
+fn name_has_token_ascii_case_insensitive(name: &str, expected: &str) -> bool {
+    name.split(|character: char| !character.is_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .any(|token| {
+            if token.eq_ignore_ascii_case(expected) {
+                return true;
             }
-        }
-    }
-    prefixes.sort();
-    prefixes.dedup();
-    prefixes
-}
-
-fn name_trigrams(name: &str) -> Vec<String> {
-    let lower = name.to_ascii_lowercase();
-    let chars: Vec<_> = lower.chars().collect();
-    if chars.len() < 3 {
-        return Vec::new();
-    }
-
-    let mut trigrams = chars
-        .windows(3)
-        .map(|window| window.iter().collect::<String>())
-        .collect::<Vec<_>>();
-    trigrams.sort();
-    trigrams.dedup();
-    trigrams
-}
-
-fn segment_prefixes(segment: &str) -> Vec<String> {
-    let mut prefixes = Vec::new();
-    for length in 1..=segment.len() {
-        if segment.is_char_boundary(length) {
-            prefixes.push(segment[..length].to_owned());
-        }
-    }
-    prefixes
+            let mut start = 0;
+            let mut chars = token.char_indices().peekable();
+            while let Some((index, current)) = chars.next() {
+                let Some((_, next)) = chars.peek().copied() else {
+                    break;
+                };
+                if current.is_lowercase() && next.is_uppercase() {
+                    let end = index + current.len_utf8();
+                    if token[start..end].eq_ignore_ascii_case(expected) {
+                        return true;
+                    }
+                    start = end;
+                }
+            }
+            token[start..].eq_ignore_ascii_case(expected)
+        })
 }
 
 fn leading_trigram(term: &str) -> Option<String> {
     let chars: Vec<_> = term.to_ascii_lowercase().chars().collect();
     (chars.len() >= 3).then(|| chars[..3].iter().collect())
-}
-
-fn path_segments(path: &str) -> impl Iterator<Item = String> + '_ {
-    path.split(['/', '\\'])
-        .map(|segment| segment.trim_end_matches(':'))
-        .filter(|segment| !segment.is_empty())
-        .map(str::to_ascii_lowercase)
 }
 
 fn camel_case_tokens(value: &str) -> Vec<String> {
@@ -970,13 +1289,6 @@ fn fuzzy_segment_key(segment: &str) -> Option<String> {
     let first = chars.next()?;
     let last = chars.last().unwrap_or(first);
     Some(format!("{first}{last}"))
-}
-
-fn push_unique(index: &mut BTreeMap<String, Vec<EntryId>>, key: String, id: EntryId) {
-    let ids = index.entry(key).or_default();
-    if ids.last().copied() != Some(id) {
-        ids.push(id);
-    }
 }
 
 pub fn intersect_sorted_ids(left: Vec<EntryId>, right: Vec<EntryId>) -> Vec<EntryId> {
@@ -1239,6 +1551,32 @@ mod tests {
     }
 
     #[test]
+    fn long_names_and_path_segments_do_not_create_per_character_prefix_keys() {
+        let long_name_stem = "n".repeat(4 * 1024);
+        let long_segment = "p".repeat(4 * 1024);
+        let long_name = format!("{long_name_stem}.md");
+        let long_path = format!("/workspace/{long_segment}/{long_name}");
+        let index = CompactCandidateIndex::from_entries(vec![IndexedEntry::legacy(
+            long_path,
+            long_name,
+            IndexedEntryKind::File,
+        )]);
+
+        let name_prefix = index.retrieve_ordinary_term(&long_name_stem[..2048]);
+        let segment_prefix = index.retrieve_ordinary_term(&long_segment[..2048]);
+        let stats = index.memory_stats();
+
+        assert_eq!(name_prefix.candidates, vec![EntryId(0)]);
+        assert!(!name_prefix.stats.used_full_scan);
+        assert_eq!(segment_prefix.candidates, vec![EntryId(0)]);
+        assert!(!segment_prefix.stats.used_full_scan);
+        assert!(
+            stats.prefix_key_count <= 4,
+            "4 KiB fields must not create O(length) resident prefix keys: {stats:#?}"
+        );
+    }
+
+    #[test]
     fn compact_memory_total_counts_the_inline_struct_once() {
         let index = CompactCandidateIndex::from_entries(vec![IndexedEntry::legacy(
             "D:\\workspace\\QuickFox\\AGENTS.md",
@@ -1288,9 +1626,9 @@ mod tests {
         let token_index = NameTokenIndex::build(&table);
         let prefix_index = PrefixIndex::build(&table);
 
-        assert_eq!(token_index.lookup("agents"), vec![EntryId(0)]);
-        assert_eq!(prefix_index.lookup("agents.m"), vec![EntryId(0)]);
-        assert_eq!(prefix_index.lookup("read"), vec![EntryId(1)]);
+        assert_eq!(token_index.lookup(&table, "agents"), vec![EntryId(0)]);
+        assert_eq!(prefix_index.lookup(&table, "agents.m"), vec![EntryId(0)]);
+        assert_eq!(prefix_index.lookup(&table, "read"), vec![EntryId(1)]);
     }
 
     #[test]
@@ -1309,9 +1647,9 @@ mod tests {
         ]);
         let index = NameTrigramIndex::build(&table);
 
-        assert_eq!(index.lookup("port"), vec![EntryId(0)]);
-        assert_eq!(index.lookup("ort"), vec![EntryId(0)]);
-        assert!(index.lookup("zzzz").is_empty());
+        assert_eq!(index.lookup(&table, "port"), vec![EntryId(0)]);
+        assert_eq!(index.lookup(&table, "ort"), vec![EntryId(0)]);
+        assert!(index.lookup(&table, "zzzz").is_empty());
     }
 
     #[test]
@@ -1343,9 +1681,15 @@ mod tests {
         let extension_index = ExtensionIndex::build(&table);
         let token_index = NameTokenIndex::build(&table);
 
-        assert_eq!(extension_index.lookup("md"), vec![EntryId(0), EntryId(2)]);
         assert_eq!(
-            intersect_sorted_ids(extension_index.lookup("md"), token_index.lookup("agents")),
+            extension_index.lookup(&table, "md"),
+            vec![EntryId(0), EntryId(2)]
+        );
+        assert_eq!(
+            intersect_sorted_ids(
+                extension_index.lookup(&table, "md"),
+                token_index.lookup(&table, "agents"),
+            ),
             vec![EntryId(0)]
         );
     }
@@ -1378,9 +1722,12 @@ mod tests {
 
         let path_index = PathSegmentIndex::build(&table);
 
-        assert_eq!(path_index.lookup("workspace"), vec![EntryId(0), EntryId(1)]);
-        assert_eq!(path_index.lookup("quickfox"), vec![EntryId(0)]);
-        assert_eq!(path_index.lookup("downloads"), vec![EntryId(2)]);
+        assert_eq!(
+            path_index.lookup(&table, "workspace"),
+            vec![EntryId(0), EntryId(1)]
+        );
+        assert_eq!(path_index.lookup(&table, "quickfox"), vec![EntryId(0)]);
+        assert_eq!(path_index.lookup(&table, "downloads"), vec![EntryId(2)]);
     }
 
     #[test]
@@ -1406,6 +1753,28 @@ mod tests {
         assert_eq!(high_hit.candidates.len(), 1_000);
         assert_eq!(high_hit.stats.candidate_count, 1_000);
         assert!(!high_hit.stats.used_full_scan);
+    }
+
+    #[test]
+    fn limited_search_can_prioritize_direct_name_candidates_over_fuzzy_path_recall() {
+        let index = CompactCandidateIndex::from_entries(vec![
+            IndexedEntry::legacy(
+                "/workspace/assets/unrelated.md",
+                "unrelated.md",
+                IndexedEntryKind::File,
+            ),
+            IndexedEntry::legacy(
+                "/workspace/docs/AGENTS.md",
+                "AGENTS.md",
+                IndexedEntryKind::File,
+            ),
+        ]);
+
+        let all_candidates = index.retrieve_query("agents");
+        let direct_names = index.retrieve_query_name_priority("agents").unwrap();
+
+        assert_eq!(all_candidates.candidates, vec![EntryId(0), EntryId(1)]);
+        assert_eq!(direct_names.candidates, vec![EntryId(1)]);
     }
 
     #[test]

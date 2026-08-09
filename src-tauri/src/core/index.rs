@@ -1,7 +1,7 @@
 //! File and directory indexing will live here.
 
 use crate::core::actions::Action;
-use crate::core::compact_index::CompactCandidateIndex;
+use crate::core::compact_index::{CompactCandidateIndex, EntryId};
 use crate::core::content_index::{
     ContentIndex, ContentIndexOptions, ContentPathFilter, ContentSearchError, ContentSearchHit,
     PlainTextExtractor,
@@ -576,41 +576,67 @@ impl SearchIndex {
         }
 
         let matcher = FileMatcher::default();
-        let candidate_ids = self.compact_candidates.retrieve_query(query).candidates;
+        let name_priority = (!parsed_query.has_content_query())
+            .then(|| self.compact_candidates.retrieve_query_name_priority(query))
+            .flatten();
+        let candidate_ids = name_priority
+            .as_ref()
+            .map(|retrieval| retrieval.candidates.clone())
+            .unwrap_or_else(|| self.compact_candidates.retrieve_query(query).candidates);
         if is_cancelled() {
             return None;
         }
 
         let mut candidates = Vec::new();
-        for (candidate_index, id) in candidate_ids.into_iter().enumerate() {
-            if candidate_index % 1024 == 0 && is_cancelled() {
-                return None;
-            }
-            let Some(entry_ref) = self.compact_candidates.entry_ref(id) else {
-                continue;
+        let collect_candidates =
+            |ids: Vec<_>,
+             already_checked: Option<&[EntryId]>,
+             candidates: &mut Vec<IndexedEntry>| {
+                for (candidate_index, id) in ids.into_iter().enumerate() {
+                    if candidate_index % 1024 == 0 && is_cancelled() {
+                        return None;
+                    }
+                    if already_checked.is_some_and(|checked| checked.binary_search(&id).is_ok()) {
+                        continue;
+                    }
+                    let Some(entry_ref) = self.compact_candidates.entry_ref(id) else {
+                        continue;
+                    };
+                    if !matcher.matches_candidate(
+                        &parsed_query,
+                        FileMatchCandidate {
+                            path: entry_ref.path(),
+                            name: entry_ref.name(),
+                            parent: entry_ref.parent(),
+                            extension: entry_ref.extension(),
+                            search_text: entry_ref.match_search_text(),
+                            has_custom_search_text: entry_ref.has_custom_search_text(),
+                        },
+                    ) {
+                        continue;
+                    }
+                    let Some(entry) = self.materialize_entry(id) else {
+                        continue;
+                    };
+                    if !is_visible(&entry) {
+                        continue;
+                    }
+                    candidates.push(entry);
+                    if !parsed_query.has_content_query() && candidates.len() >= limit {
+                        break;
+                    }
+                }
+                Some(())
             };
-            if !matcher.matches_candidate(
-                &parsed_query,
-                FileMatchCandidate {
-                    path: entry_ref.path(),
-                    name: entry_ref.name(),
-                    parent: entry_ref.parent(),
-                    extension: entry_ref.extension(),
-                    search_text: entry_ref.match_search_text(),
-                    has_custom_search_text: entry_ref.has_custom_search_text(),
-                },
-            ) {
-                continue;
-            }
-            let Some(entry) = self.materialize_entry(id) else {
-                continue;
-            };
-            if !is_visible(&entry) {
-                continue;
-            }
-            candidates.push(entry);
-            if !parsed_query.has_content_query() && candidates.len() >= limit {
-                break;
+        collect_candidates(candidate_ids, None, &mut candidates)?;
+
+        if !parsed_query.has_content_query()
+            && candidates.len() < limit
+            && (candidates.is_empty() || limit == usize::MAX)
+        {
+            if let Some(priority) = &name_priority {
+                let fallback = self.compact_candidates.retrieve_query(query).candidates;
+                collect_candidates(fallback, Some(&priority.candidates), &mut candidates)?;
             }
         }
 
@@ -2202,9 +2228,10 @@ mod tests {
         let parser = crate::core::search::QueryParser::new(Default::default());
         let search_index = SearchIndex::from_entries(fixture.entries);
         let memory_estimate = search_index.memory_estimate();
+        let compact_memory = search_index.compact_candidates.memory_stats();
 
         println!(
-            "QUICKFOX_LARGE_INDEX_MEMORY scale={} total_resident_bytes={} estimate={memory_estimate:#?}",
+            "QUICKFOX_LARGE_INDEX_MEMORY scale={} total_resident_bytes={} estimate={memory_estimate:#?} compact={compact_memory:#?}",
             scale,
             memory_estimate.total_resident_bytes()
         );
@@ -2218,6 +2245,7 @@ mod tests {
         );
 
         for query in large_index_benchmark_queries() {
+            let candidate_retrieval = search_index.compact_candidates.retrieve_query(query.query);
             let started = Instant::now();
             let results = search_index.search_with_limit(&parser.parse(query.query), 20);
             let elapsed = started.elapsed();
@@ -2228,11 +2256,13 @@ mod tests {
                 .unwrap_or(-1);
 
             println!(
-                "QUICKFOX_LARGE_INDEX_BASELINE scale={} query={} kind={:?} elapsed_us={} results={} target_position={} linear_entries={} entry_struct_bytes={} entry_string_bytes={} cached_search_text_bytes={}",
+                "QUICKFOX_LARGE_INDEX_BASELINE scale={} query={} kind={:?} elapsed_us={} candidates={} full_scan={} results={} target_position={} linear_entries={} entry_struct_bytes={} entry_string_bytes={} cached_search_text_bytes={}",
                 scale,
                 query.name,
                 query.kind,
                 elapsed.as_micros(),
+                candidate_retrieval.stats.candidate_count,
+                candidate_retrieval.stats.used_full_scan,
                 results.len(),
                 target_position,
                 search_index.entry_count(),
