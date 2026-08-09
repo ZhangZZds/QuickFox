@@ -72,6 +72,8 @@ pub enum CompactIndexBuildError {
     TooManyEntries { count: usize },
     ArenaTooLarge { requested_bytes: usize },
     DepthTooLarge { depth: usize },
+    TooManySegmentPostings { count: usize },
+    TooManyPathSegmentBuckets { count: usize },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -477,6 +479,7 @@ impl NameTokenIndex {
         let pairs = table.entries().iter().flat_map(|entry| {
             name_tokens(table.name(entry).unwrap_or_default())
                 .into_iter()
+                .filter(|token| token.chars().any(char::is_alphabetic))
                 .map(move |token| (text_fingerprint(&token), entry.id))
         });
         Self {
@@ -507,13 +510,14 @@ impl PrefixIndex {
     pub fn build(table: &EntryTable) -> Self {
         let mut names_and_tokens = Vec::new();
         for entry in table.entries() {
-            if table.name(entry).is_none() {
+            let Some(name) = table.name(entry) else {
                 continue;
-            }
-            names_and_tokens.push(TextPosting {
-                text: entry.name,
-                id: entry.id,
-            });
+            };
+            names_and_tokens.extend(
+                name_prefix_ranges(name, entry.name.start)
+                    .into_iter()
+                    .map(|text| TextPosting { text, id: entry.id }),
+            );
         }
         names_and_tokens
             .sort_unstable_by_key(|posting| (posting.id, posting.text.start, posting.text.len));
@@ -612,7 +616,23 @@ pub struct PathSegmentIndex {
 }
 
 impl PathSegmentIndex {
-    pub fn build(table: &EntryTable) -> Self {
+    pub fn build(table: &EntryTable) -> Result<Self, CompactIndexBuildError> {
+        Self::build_with_limits(table, u32::MAX as usize, u32::MAX as usize)
+    }
+
+    fn build_with_limits(
+        table: &EntryTable,
+        max_postings: usize,
+        max_buckets: usize,
+    ) -> Result<Self, CompactIndexBuildError> {
+        Self::build_with_limits_impl(table, max_postings, max_buckets)
+    }
+
+    fn build_with_limits_impl(
+        table: &EntryTable,
+        max_postings: usize,
+        max_buckets: usize,
+    ) -> Result<Self, CompactIndexBuildError> {
         let mut grouped: HashMap<String, (PackedTextRange, Vec<EntryId>)> = HashMap::new();
         for entry in table.entries() {
             let Some(path) = table.path(entry) else {
@@ -646,37 +666,64 @@ impl PathSegmentIndex {
             bucket_ids.sort_unstable();
             bucket_ids.dedup();
             let start = ids.len();
+            let posting_count = start.saturating_add(bucket_ids.len());
+            if posting_count > max_postings || posting_count > u32::MAX as usize {
+                return Err(CompactIndexBuildError::TooManySegmentPostings {
+                    count: posting_count,
+                });
+            }
             ids.extend(bucket_ids);
             let bucket = SegmentBucket {
                 text,
-                start: u32::try_from(start).expect("path segment posting offset exceeds u32"),
-                len: u32::try_from(ids.len().saturating_sub(start))
-                    .expect("path segment posting length exceeds u32"),
+                start: u32::try_from(start)
+                    .map_err(|_| CompactIndexBuildError::TooManySegmentPostings { count: start })?,
+                len: u32::try_from(ids.len().saturating_sub(start)).map_err(|_| {
+                    CompactIndexBuildError::TooManySegmentPostings {
+                        count: ids.len().saturating_sub(start),
+                    }
+                })?,
             };
             if let Some(key) = fuzzy_segment_key(table.text(text).unwrap_or_default()) {
+                if bucket_index > max_buckets || bucket_index > u32::MAX as usize {
+                    return Err(CompactIndexBuildError::TooManyPathSegmentBuckets {
+                        count: bucket_index.saturating_add(1),
+                    });
+                }
                 fuzzy_pairs.push((
                     text_fingerprint(&key),
-                    EntryId::from_usize(bucket_index).expect("path segment bucket exceeds u32"),
+                    EntryId::from_usize(bucket_index).ok_or(
+                        CompactIndexBuildError::TooManyPathSegmentBuckets {
+                            count: bucket_index.saturating_add(1),
+                        },
+                    )?,
                 ));
             }
             buckets.push(bucket);
         }
         buckets.shrink_to_fit();
         ids.shrink_to_fit();
-        Self {
+        Ok(Self {
             buckets,
             ids,
             fuzzy_buckets: FingerprintIndex::from_pairs(fuzzy_pairs),
-        }
+        })
     }
 
     pub fn lookup(&self, table: &EntryTable, segment: &str) -> Vec<EntryId> {
         let normalized = segment.to_ascii_lowercase();
-        let matching = self.matching_buckets(table, &normalized);
+        let precise = self.lookup_precise(table, &normalized);
+        if !precise.is_empty() {
+            return precise;
+        }
+        self.lookup_fuzzy(table, &normalized)
+    }
+
+    fn lookup_precise(&self, table: &EntryTable, segment: &str) -> Vec<EntryId> {
+        let matching = self.matching_buckets(table, segment);
         if let Some(exact) = matching.iter().find(|bucket| {
             table
                 .text(bucket.text)
-                .is_some_and(|text| text.eq_ignore_ascii_case(&normalized))
+                .is_some_and(|text| text.eq_ignore_ascii_case(segment))
         }) {
             return self.bucket_ids(*exact);
         }
@@ -684,17 +731,26 @@ impl PathSegmentIndex {
             return self.collect_bucket_ids(matching);
         }
 
-        let Some(key) = fuzzy_segment_key(&normalized) else {
+        Vec::new()
+    }
+
+    fn lookup_fuzzy(&self, table: &EntryTable, segment: &str) -> Vec<EntryId> {
+        let Some(key) = fuzzy_segment_key(segment) else {
             return Vec::new();
         };
+        let query_mask = ascii_alphabetic_mask(segment);
         let matching: Vec<_> = self
             .fuzzy_buckets
             .matching_ids(text_fingerprint(&key))
             .filter_map(|id| self.buckets.get(id.as_usize()).copied())
             .filter(|bucket| {
-                table
-                    .text(bucket.text)
-                    .is_some_and(|text| fuzzy_segment_key(text).as_deref() == Some(key.as_str()))
+                table.text(bucket.text).is_some_and(|text| {
+                    fuzzy_segment_key(text).as_deref() == Some(key.as_str())
+                        && query_mask.is_none_or(|mask| {
+                            ascii_alphabetic_mask(text)
+                                .is_none_or(|text_mask| text_mask & mask == mask)
+                        })
+                })
             })
             .collect();
         self.collect_bucket_ids(matching)
@@ -834,7 +890,7 @@ impl CompactCandidateIndex {
             prefixes: PrefixIndex::build(&table),
             name_trigrams: NameTrigramIndex::build(&table),
             extensions: ExtensionIndex::build(&table),
-            path_segments: PathSegmentIndex::build(&table),
+            path_segments: PathSegmentIndex::build(&table)?,
             exact_paths: ExactPathIndex::build(&table),
             table,
             #[cfg(test)]
@@ -867,16 +923,36 @@ impl CompactCandidateIndex {
                 (exact, false)
             }
         } else {
-            let name_candidates = union_sorted_ids([
-                self.name_tokens.lookup(&self.table, &normalized),
-                self.prefixes.lookup(&self.table, &normalized),
-            ]);
-            let path_candidates = self.path_segments.lookup(&self.table, &normalized);
-            let precise = union_sorted_ids([name_candidates, path_candidates]);
-            if !precise.is_empty() {
-                (precise, false)
+            if normalized.chars().any(|character| character.is_numeric())
+                && leading_trigram(&normalized).is_none()
+            {
+                (self.table.all_ids(), true)
             } else {
-                (self.name_trigrams.lookup(&self.table, &normalized), false)
+                let name_candidates = union_sorted_ids([
+                    self.name_tokens.lookup(&self.table, &normalized),
+                    self.prefixes.lookup(&self.table, &normalized),
+                ]);
+                let path_candidates = self.path_segments.lookup_precise(&self.table, &normalized);
+                let precise = union_sorted_ids([name_candidates, path_candidates]);
+                if !precise.is_empty() {
+                    (
+                        union_sorted_ids([
+                            precise,
+                            self.path_segments.lookup_fuzzy(&self.table, &normalized),
+                        ]),
+                        false,
+                    )
+                } else {
+                    let fallback = union_sorted_ids([
+                        self.name_trigrams.lookup(&self.table, &normalized),
+                        self.path_segments.lookup_fuzzy(&self.table, &normalized),
+                    ]);
+                    if fallback.is_empty() && normalized.chars().count() < 3 {
+                        (self.table.all_ids(), true)
+                    } else {
+                        (fallback, false)
+                    }
+                }
             }
         };
         CandidateRetrieval {
@@ -1216,16 +1292,104 @@ fn name_trigrams(name: &str) -> Vec<String> {
 
 fn name_tokens(name: &str) -> Vec<String> {
     let mut tokens = Vec::new();
-    for raw in name.split(|character: char| !character.is_alphanumeric()) {
-        if raw.is_empty() {
+    let extension_start = name
+        .rfind('.')
+        .filter(|dot| *dot > 0 && *dot + 1 < name.len());
+    let mut token_start = None;
+    for (index, character) in name
+        .char_indices()
+        .chain(std::iter::once((name.len(), '\0')))
+    {
+        if character.is_alphanumeric() {
+            token_start.get_or_insert(index);
             continue;
         }
+        let Some(start) = token_start.take() else {
+            continue;
+        };
+        if extension_start.is_some_and(|dot| start > dot) {
+            continue;
+        }
+        let raw = &name[start..index];
         tokens.push(raw.to_ascii_lowercase());
         tokens.extend(camel_case_tokens(raw));
     }
     tokens.sort();
     tokens.dedup();
     tokens
+}
+
+fn name_prefix_ranges(name: &str, name_start: u32) -> Vec<PackedTextRange> {
+    let mut ranges = Vec::new();
+    let extension_start = name
+        .rfind('.')
+        .filter(|dot| *dot > 0 && *dot + 1 < name.len());
+    if name.chars().any(char::is_alphabetic) {
+        ranges.push(PackedTextRange {
+            start: name_start,
+            len: name.len() as u32,
+        });
+    }
+
+    let mut token_start = None;
+    for (index, character) in name
+        .char_indices()
+        .chain(std::iter::once((name.len(), '\0')))
+    {
+        if character.is_alphanumeric() {
+            token_start.get_or_insert(index);
+            continue;
+        }
+        let Some(start) = token_start.take() else {
+            continue;
+        };
+        let token = &name[start..index];
+        if extension_start.is_some_and(|dot| start > dot) {
+            continue;
+        }
+        if token.chars().any(char::is_alphabetic) {
+            ranges.push(PackedTextRange {
+                start: name_start.saturating_add(start as u32),
+                len: token.len() as u32,
+            });
+            ranges.extend(camel_case_token_ranges(
+                token,
+                name_start.saturating_add(start as u32),
+            ));
+        }
+    }
+
+    ranges
+}
+
+fn camel_case_token_ranges(token: &str, token_start: u32) -> Vec<PackedTextRange> {
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    let chars: Vec<_> = token.char_indices().collect();
+
+    for window in chars.windows(2) {
+        let (index, current) = window[0];
+        let (_, next) = window[1];
+        if current.is_lowercase() && next.is_uppercase() {
+            let end = index + current.len_utf8();
+            if token[start..end].chars().any(char::is_alphabetic) {
+                ranges.push(PackedTextRange {
+                    start: token_start.saturating_add(start as u32),
+                    len: (end - start) as u32,
+                });
+            }
+            start = end;
+        }
+    }
+
+    if start < token.len() && token[start..].chars().any(char::is_alphabetic) {
+        ranges.push(PackedTextRange {
+            start: token_start.saturating_add(start as u32),
+            len: (token.len() - start) as u32,
+        });
+    }
+
+    ranges
 }
 
 fn name_has_token_ascii_case_insensitive(name: &str, expected: &str) -> bool {
@@ -1255,7 +1419,8 @@ fn name_has_token_ascii_case_insensitive(name: &str, expected: &str) -> bool {
 
 fn leading_trigram(term: &str) -> Option<String> {
     let chars: Vec<_> = term.to_ascii_lowercase().chars().collect();
-    (chars.len() >= 3).then(|| chars[..3].iter().collect())
+    (chars.len() >= 3 && chars[..3].iter().all(|character| character.is_alphabetic()))
+        .then(|| chars[..3].iter().collect())
 }
 
 fn camel_case_tokens(value: &str) -> Vec<String> {
@@ -1289,6 +1454,17 @@ fn fuzzy_segment_key(segment: &str) -> Option<String> {
     let first = chars.next()?;
     let last = chars.last().unwrap_or(first);
     Some(format!("{first}{last}"))
+}
+
+fn ascii_alphabetic_mask(text: &str) -> Option<u32> {
+    let mut mask = 0_u32;
+    for byte in text.bytes() {
+        if !byte.is_ascii_alphabetic() {
+            continue;
+        }
+        mask |= 1 << (byte.to_ascii_lowercase() - b'a');
+    }
+    (mask != 0).then_some(mask)
 }
 
 pub fn intersect_sorted_ids(left: Vec<EntryId>, right: Vec<EntryId>) -> Vec<EntryId> {
@@ -1632,6 +1808,56 @@ mod tests {
     }
 
     #[test]
+    fn prefix_index_recalls_delimited_and_camel_case_token_prefixes() {
+        let table = EntryTable::from_entries(vec![
+            IndexedEntry::legacy(
+                "/workspace/my-report.md",
+                "my-report.md",
+                IndexedEntryKind::File,
+            ),
+            IndexedEntry::legacy(
+                "/workspace/QuickFoxGuide.md",
+                "QuickFoxGuide.md",
+                IndexedEntryKind::File,
+            ),
+        ]);
+        let prefix_index = PrefixIndex::build(&table);
+
+        assert_eq!(prefix_index.lookup(&table, "re"), vec![EntryId(0)]);
+        assert_eq!(prefix_index.lookup(&table, "fo"), vec![EntryId(1)]);
+    }
+
+    #[test]
+    fn numeric_name_substrings_fall_back_without_losing_recall() {
+        let index = CompactCandidateIndex::from_entries(vec![
+            IndexedEntry::legacy(
+                "/workspace/file-1234.md",
+                "file-1234.md",
+                IndexedEntryKind::File,
+            ),
+            IndexedEntry::legacy("/workspace/notes.md", "notes.md", IndexedEntryKind::File),
+        ]);
+
+        let retrieval = index.retrieve_ordinary_term("123");
+
+        assert_eq!(retrieval.candidates, vec![EntryId(0), EntryId(1)]);
+        assert!(retrieval.stats.used_full_scan);
+    }
+
+    #[test]
+    fn short_name_substrings_fall_back_when_no_prefix_or_trigram_exists() {
+        let index = CompactCandidateIndex::from_entries(vec![
+            IndexedEntry::legacy("/workspace/cmd.txt", "cmd.txt", IndexedEntryKind::File),
+            IndexedEntry::legacy("/workspace/notes.md", "notes.md", IndexedEntryKind::File),
+        ]);
+
+        let retrieval = index.retrieve_ordinary_term("md");
+
+        assert_eq!(retrieval.candidates, vec![EntryId(0), EntryId(1)]);
+        assert!(retrieval.stats.used_full_scan);
+    }
+
+    #[test]
     fn name_trigram_index_retrieves_substring_candidates() {
         let table = EntryTable::from_entries(vec![
             IndexedEntry::legacy(
@@ -1720,7 +1946,7 @@ mod tests {
             },
         ]);
 
-        let path_index = PathSegmentIndex::build(&table);
+        let path_index = PathSegmentIndex::build(&table).unwrap();
 
         assert_eq!(
             path_index.lookup(&table, "workspace"),
@@ -1728,6 +1954,22 @@ mod tests {
         );
         assert_eq!(path_index.lookup(&table, "quickfox"), vec![EntryId(0)]);
         assert_eq!(path_index.lookup(&table, "downloads"), vec![EntryId(2)]);
+    }
+
+    #[test]
+    fn path_segment_index_reports_posting_limit_overflow() {
+        let table = EntryTable::from_entries(vec![IndexedEntry::legacy(
+            "/workspace/QuickFox/docs/AGENTS.md",
+            "AGENTS.md",
+            IndexedEntryKind::File,
+        )]);
+
+        let error = PathSegmentIndex::build_with_limits(&table, 0, usize::MAX).unwrap_err();
+
+        assert!(matches!(
+            error,
+            CompactIndexBuildError::TooManySegmentPostings { .. }
+        ));
     }
 
     #[test]
@@ -1759,7 +2001,7 @@ mod tests {
     fn limited_search_can_prioritize_direct_name_candidates_over_fuzzy_path_recall() {
         let index = CompactCandidateIndex::from_entries(vec![
             IndexedEntry::legacy(
-                "/workspace/assets/unrelated.md",
+                "/workspace/agent-sources/unrelated.md",
                 "unrelated.md",
                 IndexedEntryKind::File,
             ),

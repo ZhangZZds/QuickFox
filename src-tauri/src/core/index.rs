@@ -630,10 +630,7 @@ impl SearchIndex {
             };
         collect_candidates(candidate_ids, None, &mut candidates)?;
 
-        if !parsed_query.has_content_query()
-            && candidates.len() < limit
-            && (candidates.is_empty() || limit == usize::MAX)
-        {
+        if !parsed_query.has_content_query() && candidates.len() < limit {
             if let Some(priority) = &name_priority {
                 let fallback = self.compact_candidates.retrieve_query(query).candidates;
                 collect_candidates(fallback, Some(&priority.candidates), &mut candidates)?;
@@ -1508,6 +1505,25 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].title, "project-alpha.md");
         assert_eq!(results[1].title, "project-beta.md");
+    }
+
+    #[test]
+    fn limited_search_fills_remaining_results_from_path_candidates() {
+        let index = SearchIndex::from_entries(vec![
+            file_entry("/workspace/docs/AGENTS.md"),
+            file_entry("/workspace/agents/unrelated.md"),
+        ]);
+        let parser = crate::core::search::QueryParser::new(Default::default());
+
+        let results = index.search_with_limit(&parser.parse("agents"), 20);
+        let paths: Vec<_> = results
+            .iter()
+            .filter_map(|result| result.detail.as_deref())
+            .collect();
+
+        assert_eq!(paths.len(), 2);
+        assert!(paths.contains(&"/workspace/docs/AGENTS.md"));
+        assert!(paths.contains(&"/workspace/agents/unrelated.md"));
     }
 
     #[test]
