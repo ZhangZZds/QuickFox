@@ -74,6 +74,7 @@ pub enum CompactIndexBuildError {
     DepthTooLarge { depth: usize },
     TooManySegmentPostings { count: usize },
     TooManyPathSegmentBuckets { count: usize },
+    TooManyNameNgramBytes { count: usize },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -433,135 +434,126 @@ impl FingerprintIndex {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct TextPosting {
-    text: PackedTextRange,
-    id: EntryId,
-}
-
-fn sort_text_postings(postings: &mut [TextPosting], table: &EntryTable) {
-    postings.sort_unstable_by(|left, right| {
-        compare_ascii_case_insensitive(
-            table.text(left.text).unwrap_or_default(),
-            table.text(right.text).unwrap_or_default(),
-        )
-        .then_with(|| left.id.cmp(&right.id))
-        .then_with(|| left.text.start.cmp(&right.text.start))
-        .then_with(|| left.text.len.cmp(&right.text.len))
-    });
-}
-
-fn lookup_text_prefix(postings: &[TextPosting], table: &EntryTable, prefix: &str) -> Vec<EntryId> {
-    let normalized = prefix.to_ascii_lowercase();
-    let start = postings.partition_point(|posting| {
-        compare_ascii_case_insensitive(table.text(posting.text).unwrap_or_default(), &normalized)
-            == CmpOrdering::Less
-    });
-    let mut ids = Vec::new();
-    for posting in &postings[start..] {
-        let text = table.text(posting.text).unwrap_or_default();
-        if !starts_with_ascii_case_insensitive(text, &normalized) {
-            break;
-        }
-        ids.push(posting.id);
-    }
-    ids.sort_unstable();
-    ids.dedup();
-    ids
+struct NameNgramPosting {
+    width: u8,
+    fingerprint: u32,
+    start: u32,
+    len: u32,
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct NameTokenIndex {
-    tokens: FingerprintIndex,
+pub struct NameNgramIndex {
+    postings: Vec<NameNgramPosting>,
+    encoded_ids: Vec<u8>,
 }
 
-impl NameTokenIndex {
-    pub fn build(table: &EntryTable) -> Self {
-        let pairs = table.entries().iter().flat_map(|entry| {
-            name_tokens(table.name(entry).unwrap_or_default())
-                .into_iter()
-                .filter(|token| token.chars().any(char::is_alphabetic))
-                .map(move |token| (text_fingerprint(&token), entry.id))
-        });
-        Self {
-            tokens: FingerprintIndex::from_pairs(pairs),
-        }
-    }
-
-    pub fn lookup(&self, table: &EntryTable, token: &str) -> Vec<EntryId> {
-        let normalized = token.to_ascii_lowercase();
-        verified_ids(
-            self.tokens.matching_ids(text_fingerprint(&normalized)),
-            |id| {
-                table
-                    .get(id)
-                    .and_then(|entry| table.name(entry))
-                    .is_some_and(|name| name_has_token_ascii_case_insensitive(name, &normalized))
-            },
-        )
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct PrefixIndex {
-    names_and_tokens: Vec<TextPosting>,
-}
-
-impl PrefixIndex {
-    pub fn build(table: &EntryTable) -> Self {
-        let mut names_and_tokens = Vec::new();
+impl NameNgramIndex {
+    pub fn build(table: &EntryTable) -> Result<Self, CompactIndexBuildError> {
+        let mut ids_by_ngram: HashMap<(u8, u32), Vec<EntryId>> = HashMap::new();
         for entry in table.entries() {
-            let Some(name) = table.name(entry) else {
-                continue;
-            };
-            names_and_tokens.extend(
-                name_prefix_ranges(name, entry.name.start)
-                    .into_iter()
-                    .map(|text| TextPosting { text, id: entry.id }),
-            );
+            for (width, fingerprint) in name_ngram_keys(table.name(entry).unwrap_or_default()) {
+                ids_by_ngram
+                    .entry((width, fingerprint))
+                    .or_default()
+                    .push(entry.id);
+            }
         }
-        names_and_tokens
-            .sort_unstable_by_key(|posting| (posting.id, posting.text.start, posting.text.len));
-        names_and_tokens.dedup();
-        sort_text_postings(&mut names_and_tokens, table);
-        names_and_tokens.shrink_to_fit();
-        Self { names_and_tokens }
-    }
 
-    pub fn lookup(&self, table: &EntryTable, prefix: &str) -> Vec<EntryId> {
-        lookup_text_prefix(&self.names_and_tokens, table, prefix)
-    }
-}
+        let mut groups: Vec<_> = ids_by_ngram.into_iter().collect();
+        groups.sort_unstable_by_key(|((width, fingerprint), _)| (*width, *fingerprint));
 
-#[derive(Debug, Clone, Default)]
-pub struct NameTrigramIndex {
-    trigrams: FingerprintIndex,
-}
-
-impl NameTrigramIndex {
-    pub fn build(table: &EntryTable) -> Self {
-        let pairs = table.entries().iter().flat_map(|entry| {
-            name_trigrams(table.name(entry).unwrap_or_default())
-                .into_iter()
-                .map(move |trigram| (text_fingerprint(&trigram), entry.id))
-        });
-        Self {
-            trigrams: FingerprintIndex::from_pairs(pairs),
+        let mut postings = Vec::with_capacity(groups.len());
+        let mut encoded_ids = Vec::new();
+        for ((width, fingerprint), ids) in groups {
+            let start = encoded_ids.len();
+            let mut previous = 0_u32;
+            for id in ids {
+                let value = id.0;
+                encode_varint(value.saturating_sub(previous), &mut encoded_ids);
+                previous = value;
+            }
+            let len = encoded_ids.len().saturating_sub(start);
+            postings.push(NameNgramPosting {
+                width,
+                fingerprint,
+                start: u32::try_from(start).map_err(|_| {
+                    CompactIndexBuildError::TooManyNameNgramBytes {
+                        count: encoded_ids.len(),
+                    }
+                })?,
+                len: u32::try_from(len).map_err(|_| {
+                    CompactIndexBuildError::TooManyNameNgramBytes {
+                        count: encoded_ids.len(),
+                    }
+                })?,
+            });
         }
+        postings.shrink_to_fit();
+        encoded_ids.shrink_to_fit();
+        Ok(Self {
+            postings,
+            encoded_ids,
+        })
     }
 
     pub fn lookup(&self, table: &EntryTable, term: &str) -> Vec<EntryId> {
-        let Some(trigram) = leading_trigram(term) else {
+        let Some((width, ngram)) = query_ngram(term) else {
             return Vec::new();
         };
-        verified_ids(
-            self.trigrams.matching_ids(text_fingerprint(&trigram)),
-            |id| {
-                table
-                    .get(id)
-                    .and_then(|entry| table.name(entry))
-                    .is_some_and(|name| contains_ascii_case_insensitive(name, &trigram))
-            },
-        )
+        let fingerprint = text_fingerprint(&ngram);
+        let start = self
+            .postings
+            .partition_point(|posting| (posting.width, posting.fingerprint) < (width, fingerprint));
+        let candidates = self.postings[start..]
+            .iter()
+            .take_while(|posting| (posting.width, posting.fingerprint) == (width, fingerprint))
+            .flat_map(|posting| self.decode_ids(*posting));
+        verified_ids(candidates, |id| {
+            table
+                .get(id)
+                .and_then(|entry| table.name(entry))
+                .is_some_and(|name| contains_ascii_case_insensitive(name, &ngram))
+        })
+    }
+
+    pub fn lookup_full(&self, table: &EntryTable, term: &str) -> Vec<EntryId> {
+        let normalized = term.to_ascii_lowercase();
+        verified_ids(self.lookup(table, &normalized), |id| {
+            table
+                .get(id)
+                .and_then(|entry| table.name(entry))
+                .is_some_and(|name| contains_ascii_case_insensitive(name, &normalized))
+        })
+    }
+
+    fn decode_ids(&self, posting: NameNgramPosting) -> Vec<EntryId> {
+        let start = posting.start as usize;
+        let end = start.saturating_add(posting.len as usize);
+        let Some(bytes) = self.encoded_ids.get(start..end) else {
+            return Vec::new();
+        };
+        let mut ids = Vec::new();
+        let mut offset = 0;
+        let mut previous = 0_u32;
+        while offset < bytes.len() {
+            let Some((delta, consumed)) = decode_varint(&bytes[offset..]) else {
+                return Vec::new();
+            };
+            let Some(value) = previous.checked_add(delta) else {
+                return Vec::new();
+            };
+            ids.push(EntryId(value));
+            previous = value;
+            offset = offset.saturating_add(consumed);
+        }
+        ids
+    }
+
+    fn heap_bytes(&self) -> usize {
+        self.postings
+            .capacity()
+            .saturating_mul(std::mem::size_of::<NameNgramPosting>())
+            .saturating_add(self.encoded_ids.capacity())
     }
 }
 
@@ -823,9 +815,7 @@ impl ExactPathIndex {
 #[derive(Debug, Clone, Default)]
 pub struct CompactCandidateIndex {
     table: EntryTable,
-    name_tokens: NameTokenIndex,
-    prefixes: PrefixIndex,
-    name_trigrams: NameTrigramIndex,
+    name_ngrams: NameNgramIndex,
     extensions: ExtensionIndex,
     path_segments: PathSegmentIndex,
     exact_paths: ExactPathIndex,
@@ -852,9 +842,7 @@ pub struct CompactCandidateMemoryStats {
     pub prefix_key_count: usize,
     pub retained_build_interner_bytes: usize,
     pub entry_table_heap_bytes: usize,
-    pub name_token_bytes: usize,
-    pub name_prefix_bytes: usize,
-    pub name_trigram_bytes: usize,
+    pub name_ngram_bytes: usize,
     pub extension_bytes: usize,
     pub path_segment_bytes: usize,
     pub path_fuzzy_bytes: usize,
@@ -886,9 +874,7 @@ impl CompactCandidateIndex {
 
         let table = EntryTable::try_from_entries_with_arena_limit(entries, arena_limit)?;
         Ok(Self {
-            name_tokens: NameTokenIndex::build(&table),
-            prefixes: PrefixIndex::build(&table),
-            name_trigrams: NameTrigramIndex::build(&table),
+            name_ngrams: NameNgramIndex::build(&table)?,
             extensions: ExtensionIndex::build(&table),
             path_segments: PathSegmentIndex::build(&table)?,
             exact_paths: ExactPathIndex::build(&table),
@@ -923,36 +909,22 @@ impl CompactCandidateIndex {
                 (exact, false)
             }
         } else {
-            if normalized.chars().any(|character| character.is_numeric())
-                && leading_trigram(&normalized).is_none()
-            {
-                (self.table.all_ids(), true)
-            } else {
-                let name_candidates = union_sorted_ids([
-                    self.name_tokens.lookup(&self.table, &normalized),
-                    self.prefixes.lookup(&self.table, &normalized),
-                ]);
-                let path_candidates = self.path_segments.lookup_precise(&self.table, &normalized);
-                let precise = union_sorted_ids([name_candidates, path_candidates]);
-                if !precise.is_empty() {
-                    (
-                        union_sorted_ids([
-                            precise,
-                            self.path_segments.lookup_fuzzy(&self.table, &normalized),
-                        ]),
-                        false,
-                    )
-                } else {
-                    let fallback = union_sorted_ids([
-                        self.name_trigrams.lookup(&self.table, &normalized),
+            let name_candidates = self.name_ngrams.lookup(&self.table, &normalized);
+            let path_candidates = self.path_segments.lookup_precise(&self.table, &normalized);
+            let precise = union_sorted_ids([name_candidates, path_candidates]);
+            if !precise.is_empty() {
+                (
+                    union_sorted_ids([
+                        precise,
                         self.path_segments.lookup_fuzzy(&self.table, &normalized),
-                    ]);
-                    if fallback.is_empty() && normalized.chars().count() < 3 {
-                        (self.table.all_ids(), true)
-                    } else {
-                        (fallback, false)
-                    }
-                }
+                    ]),
+                    false,
+                )
+            } else {
+                (
+                    self.path_segments.lookup_fuzzy(&self.table, &normalized),
+                    false,
+                )
             }
         };
         CandidateRetrieval {
@@ -984,17 +956,7 @@ impl CompactCandidateIndex {
         }
 
         for name in &query.name_filters {
-            let mut name_candidates = union_sorted_ids([
-                self.name_tokens.lookup(&self.table, name),
-                self.prefixes.lookup(&self.table, name),
-            ]);
-            if name_candidates.is_empty() {
-                name_candidates = self.name_trigrams.lookup(&self.table, name);
-            }
-            if name_candidates.is_empty() {
-                name_candidates = self.table.all_ids();
-                used_full_scan = true;
-            }
+            let name_candidates = self.name_ngrams.lookup_full(&self.table, name);
             candidates = intersect_optional_candidates(candidates, name_candidates);
         }
 
@@ -1026,11 +988,7 @@ impl CompactCandidateIndex {
         }
 
         let term = &parsed.ordinary_terms[0];
-        let mut candidates = union_sorted_ids([
-            self.name_tokens.lookup(&self.table, term),
-            self.prefixes.lookup(&self.table, term),
-            self.name_trigrams.lookup(&self.table, term),
-        ]);
+        let mut candidates = self.name_ngrams.lookup(&self.table, term);
         if candidates.is_empty() {
             return None;
         }
@@ -1040,11 +998,7 @@ impl CompactCandidateIndex {
                 intersect_sorted_ids(candidates, self.extensions.lookup(&self.table, extension));
         }
         for name in &parsed.name_filters {
-            let name_candidates = union_sorted_ids([
-                self.name_tokens.lookup(&self.table, name),
-                self.prefixes.lookup(&self.table, name),
-                self.name_trigrams.lookup(&self.table, name),
-            ]);
+            let name_candidates = self.name_ngrams.lookup_full(&self.table, name);
             candidates = intersect_sorted_ids(candidates, name_candidates);
         }
         for dir in &parsed.dir_filters {
@@ -1111,14 +1065,7 @@ impl CompactCandidateIndex {
     fn estimated_heap_bytes(&self) -> usize {
         self.table
             .estimated_heap_bytes()
-            .saturating_add(self.name_tokens.tokens.heap_bytes())
-            .saturating_add(
-                self.prefixes
-                    .names_and_tokens
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<TextPosting>()),
-            )
-            .saturating_add(self.name_trigrams.trigrams.heap_bytes())
+            .saturating_add(self.name_ngrams.heap_bytes())
             .saturating_add(self.extensions.extensions.heap_bytes())
             .saturating_add(
                 self.path_segments
@@ -1138,13 +1085,7 @@ impl CompactCandidateIndex {
 
     pub fn memory_stats(&self) -> CompactCandidateMemoryStats {
         let entry_table_heap_bytes = self.table.estimated_heap_bytes();
-        let name_token_bytes = self.name_tokens.tokens.heap_bytes();
-        let name_prefix_bytes = self
-            .prefixes
-            .names_and_tokens
-            .capacity()
-            .saturating_mul(std::mem::size_of::<TextPosting>());
-        let name_trigram_bytes = self.name_trigrams.trigrams.heap_bytes();
+        let name_ngram_bytes = self.name_ngrams.heap_bytes();
         let extension_bytes = self.extensions.extensions.heap_bytes();
         let path_segment_bytes = self
             .path_segments
@@ -1160,9 +1101,7 @@ impl CompactCandidateIndex {
         let path_fuzzy_bytes = self.path_segments.fuzzy_buckets.heap_bytes();
         let exact_path_bytes = self.exact_paths.paths.heap_bytes();
         let heap_bytes = entry_table_heap_bytes
-            .saturating_add(name_token_bytes)
-            .saturating_add(name_prefix_bytes)
-            .saturating_add(name_trigram_bytes)
+            .saturating_add(name_ngram_bytes)
             .saturating_add(extension_bytes)
             .saturating_add(path_segment_bytes)
             .saturating_add(path_fuzzy_bytes)
@@ -1172,9 +1111,7 @@ impl CompactCandidateIndex {
             prefix_key_count: 0,
             retained_build_interner_bytes: 0,
             entry_table_heap_bytes,
-            name_token_bytes,
-            name_prefix_bytes,
-            name_trigram_bytes,
+            name_ngram_bytes,
             extension_bytes,
             path_segment_bytes,
             path_fuzzy_bytes,
@@ -1278,182 +1215,54 @@ fn entry_name_extension(name: &str) -> Option<String> {
         .map(|(_, extension)| extension.to_ascii_lowercase())
 }
 
-fn name_trigrams(name: &str) -> Vec<String> {
+fn name_ngram_keys(name: &str) -> Vec<(u8, u32)> {
     let chars: Vec<_> = name.to_ascii_lowercase().chars().collect();
-    let mut trigrams = chars
-        .windows(3)
-        .filter(|window| window.iter().all(|character| character.is_alphabetic()))
-        .map(|window| window.iter().collect::<String>())
-        .collect::<Vec<_>>();
-    trigrams.sort();
-    trigrams.dedup();
-    trigrams
-}
-
-fn name_tokens(name: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let extension_start = name
-        .rfind('.')
-        .filter(|dot| *dot > 0 && *dot + 1 < name.len());
-    let mut token_start = None;
-    for (index, character) in name
-        .char_indices()
-        .chain(std::iter::once((name.len(), '\0')))
-    {
-        if character.is_alphanumeric() {
-            token_start.get_or_insert(index);
-            continue;
-        }
-        let Some(start) = token_start.take() else {
-            continue;
-        };
-        if extension_start.is_some_and(|dot| start > dot) {
-            continue;
-        }
-        let raw = &name[start..index];
-        tokens.push(raw.to_ascii_lowercase());
-        tokens.extend(camel_case_tokens(raw));
-    }
-    tokens.sort();
-    tokens.dedup();
-    tokens
-}
-
-fn name_prefix_ranges(name: &str, name_start: u32) -> Vec<PackedTextRange> {
-    let mut ranges = Vec::new();
-    let extension_start = name
-        .rfind('.')
-        .filter(|dot| *dot > 0 && *dot + 1 < name.len());
-    if name.chars().any(char::is_alphabetic) {
-        ranges.push(PackedTextRange {
-            start: name_start,
-            len: name.len() as u32,
-        });
-    }
-
-    let mut token_start = None;
-    for (index, character) in name
-        .char_indices()
-        .chain(std::iter::once((name.len(), '\0')))
-    {
-        if character.is_alphanumeric() {
-            token_start.get_or_insert(index);
-            continue;
-        }
-        let Some(start) = token_start.take() else {
-            continue;
-        };
-        let token = &name[start..index];
-        if extension_start.is_some_and(|dot| start > dot) {
-            continue;
-        }
-        if token.chars().any(char::is_alphabetic) {
-            ranges.push(PackedTextRange {
-                start: name_start.saturating_add(start as u32),
-                len: token.len() as u32,
-            });
-            ranges.extend(camel_case_token_ranges(
-                token,
-                name_start.saturating_add(start as u32),
+    let mut keys = Vec::new();
+    for width in 1..=3 {
+        for window in chars.windows(width) {
+            keys.push((
+                width as u8,
+                text_fingerprint(&window.iter().collect::<String>()),
             ));
         }
     }
-
-    ranges
+    keys.sort_unstable();
+    keys.dedup();
+    keys
 }
 
-fn camel_case_token_ranges(token: &str, token_start: u32) -> Vec<PackedTextRange> {
-    let mut ranges = Vec::new();
-    let mut start = 0;
-    let chars: Vec<_> = token.char_indices().collect();
+fn query_ngram(term: &str) -> Option<(u8, String)> {
+    let ngram: String = term.to_ascii_lowercase().chars().take(3).collect();
+    (!ngram.is_empty()).then_some((ngram.chars().count() as u8, ngram))
+}
 
-    for window in chars.windows(2) {
-        let (index, current) = window[0];
-        let (_, next) = window[1];
-        if current.is_lowercase() && next.is_uppercase() {
-            let end = index + current.len_utf8();
-            if token[start..end].chars().any(char::is_alphabetic) {
-                ranges.push(PackedTextRange {
-                    start: token_start.saturating_add(start as u32),
-                    len: (end - start) as u32,
-                });
-            }
-            start = end;
+fn encode_varint(mut value: u32, output: &mut Vec<u8>) {
+    while value >= 0x80 {
+        output.push((value as u8 & 0x7f) | 0x80);
+        value >>= 7;
+    }
+    output.push(value as u8);
+}
+
+fn decode_varint(input: &[u8]) -> Option<(u32, usize)> {
+    let mut value = 0_u32;
+    for (index, byte) in input.iter().copied().enumerate().take(5) {
+        if index == 4 && byte & 0x70 != 0 {
+            return None;
+        }
+        value |= ((byte & 0x7f) as u32).checked_shl((index * 7) as u32)?;
+        if byte & 0x80 == 0 {
+            return Some((value, index + 1));
         }
     }
-
-    if start < token.len() && token[start..].chars().any(char::is_alphabetic) {
-        ranges.push(PackedTextRange {
-            start: token_start.saturating_add(start as u32),
-            len: (token.len() - start) as u32,
-        });
-    }
-
-    ranges
-}
-
-fn name_has_token_ascii_case_insensitive(name: &str, expected: &str) -> bool {
-    name.split(|character: char| !character.is_alphanumeric())
-        .filter(|token| !token.is_empty())
-        .any(|token| {
-            if token.eq_ignore_ascii_case(expected) {
-                return true;
-            }
-            let mut start = 0;
-            let mut chars = token.char_indices().peekable();
-            while let Some((index, current)) = chars.next() {
-                let Some((_, next)) = chars.peek().copied() else {
-                    break;
-                };
-                if current.is_lowercase() && next.is_uppercase() {
-                    let end = index + current.len_utf8();
-                    if token[start..end].eq_ignore_ascii_case(expected) {
-                        return true;
-                    }
-                    start = end;
-                }
-            }
-            token[start..].eq_ignore_ascii_case(expected)
-        })
-}
-
-fn leading_trigram(term: &str) -> Option<String> {
-    let chars: Vec<_> = term.to_ascii_lowercase().chars().collect();
-    (chars.len() >= 3 && chars[..3].iter().all(|character| character.is_alphabetic()))
-        .then(|| chars[..3].iter().collect())
-}
-
-fn camel_case_tokens(value: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut start = 0;
-    let chars: Vec<_> = value.char_indices().collect();
-
-    for window in chars.windows(2) {
-        let (index, current) = window[0];
-        let (_, next) = window[1];
-        if current.is_lowercase() && next.is_uppercase() {
-            if start < index + current.len_utf8() {
-                tokens.push(value[start..index + current.len_utf8()].to_ascii_lowercase());
-            }
-            start = index + current.len_utf8();
-        }
-    }
-
-    if start < value.len() {
-        tokens.push(value[start..].to_ascii_lowercase());
-    }
-
-    tokens
-        .into_iter()
-        .filter(|token| !token.is_empty())
-        .collect()
+    None
 }
 
 fn fuzzy_segment_key(segment: &str) -> Option<String> {
-    let mut chars = segment.chars();
-    let first = chars.next()?;
-    let last = chars.last().unwrap_or(first);
-    Some(format!("{first}{last}"))
+    segment
+        .chars()
+        .next()
+        .map(|character| character.to_string())
 }
 
 fn ascii_alphabetic_mask(text: &str) -> Option<u32> {
@@ -1785,7 +1594,7 @@ mod tests {
     }
 
     #[test]
-    fn name_token_and_prefix_indexes_retrieve_agents_candidates() {
+    fn name_ngram_index_retrieves_name_and_substring_candidates() {
         let table = EntryTable::from_entries(vec![
             IndexedEntry::legacy(
                 "D:\\workspace\\QuickFox\\docs\\AGENTS.md",
@@ -1799,16 +1608,15 @@ mod tests {
             ),
         ]);
 
-        let token_index = NameTokenIndex::build(&table);
-        let prefix_index = PrefixIndex::build(&table);
+        let ngram_index = NameNgramIndex::build(&table).unwrap();
 
-        assert_eq!(token_index.lookup(&table, "agents"), vec![EntryId(0)]);
-        assert_eq!(prefix_index.lookup(&table, "agents.m"), vec![EntryId(0)]);
-        assert_eq!(prefix_index.lookup(&table, "read"), vec![EntryId(1)]);
+        assert_eq!(ngram_index.lookup(&table, "agents"), vec![EntryId(0)]);
+        assert_eq!(ngram_index.lookup(&table, "agents.m"), vec![EntryId(0)]);
+        assert_eq!(ngram_index.lookup(&table, "ead"), vec![EntryId(1)]);
     }
 
     #[test]
-    fn prefix_index_recalls_delimited_and_camel_case_token_prefixes() {
+    fn name_ngram_index_recalls_delimited_and_camel_case_substrings() {
         let table = EntryTable::from_entries(vec![
             IndexedEntry::legacy(
                 "/workspace/my-report.md",
@@ -1821,14 +1629,14 @@ mod tests {
                 IndexedEntryKind::File,
             ),
         ]);
-        let prefix_index = PrefixIndex::build(&table);
+        let ngram_index = NameNgramIndex::build(&table).unwrap();
 
-        assert_eq!(prefix_index.lookup(&table, "re"), vec![EntryId(0)]);
-        assert_eq!(prefix_index.lookup(&table, "fo"), vec![EntryId(1)]);
+        assert_eq!(ngram_index.lookup(&table, "re"), vec![EntryId(0)]);
+        assert_eq!(ngram_index.lookup(&table, "Fox"), vec![EntryId(1)]);
     }
 
     #[test]
-    fn numeric_name_substrings_fall_back_without_losing_recall() {
+    fn numeric_name_substrings_use_bounded_ngram_candidates() {
         let index = CompactCandidateIndex::from_entries(vec![
             IndexedEntry::legacy(
                 "/workspace/file-1234.md",
@@ -1840,12 +1648,12 @@ mod tests {
 
         let retrieval = index.retrieve_ordinary_term("123");
 
-        assert_eq!(retrieval.candidates, vec![EntryId(0), EntryId(1)]);
-        assert!(retrieval.stats.used_full_scan);
+        assert_eq!(retrieval.candidates, vec![EntryId(0)]);
+        assert!(!retrieval.stats.used_full_scan);
     }
 
     #[test]
-    fn short_name_substrings_fall_back_when_no_prefix_or_trigram_exists() {
+    fn short_name_substrings_use_bounded_ngram_candidates() {
         let index = CompactCandidateIndex::from_entries(vec![
             IndexedEntry::legacy("/workspace/cmd.txt", "cmd.txt", IndexedEntryKind::File),
             IndexedEntry::legacy("/workspace/notes.md", "notes.md", IndexedEntryKind::File),
@@ -1854,11 +1662,11 @@ mod tests {
         let retrieval = index.retrieve_ordinary_term("md");
 
         assert_eq!(retrieval.candidates, vec![EntryId(0), EntryId(1)]);
-        assert!(retrieval.stats.used_full_scan);
+        assert!(!retrieval.stats.used_full_scan);
     }
 
     #[test]
-    fn name_trigram_index_retrieves_substring_candidates() {
+    fn name_ngram_index_retrieves_substring_candidates() {
         let table = EntryTable::from_entries(vec![
             IndexedEntry::legacy(
                 "/workspace/reports/report.md",
@@ -1871,7 +1679,7 @@ mod tests {
                 IndexedEntryKind::File,
             ),
         ]);
-        let index = NameTrigramIndex::build(&table);
+        let index = NameNgramIndex::build(&table).unwrap();
 
         assert_eq!(index.lookup(&table, "port"), vec![EntryId(0)]);
         assert_eq!(index.lookup(&table, "ort"), vec![EntryId(0)]);
@@ -1905,7 +1713,7 @@ mod tests {
         ]);
 
         let extension_index = ExtensionIndex::build(&table);
-        let token_index = NameTokenIndex::build(&table);
+        let ngram_index = NameNgramIndex::build(&table).unwrap();
 
         assert_eq!(
             extension_index.lookup(&table, "md"),
@@ -1914,7 +1722,7 @@ mod tests {
         assert_eq!(
             intersect_sorted_ids(
                 extension_index.lookup(&table, "md"),
-                token_index.lookup(&table, "agents"),
+                ngram_index.lookup(&table, "agents"),
             ),
             vec![EntryId(0)]
         );
@@ -1954,6 +1762,18 @@ mod tests {
         );
         assert_eq!(path_index.lookup(&table, "quickfox"), vec![EntryId(0)]);
         assert_eq!(path_index.lookup(&table, "downloads"), vec![EntryId(2)]);
+    }
+
+    #[test]
+    fn path_segment_fuzzy_lookup_accepts_subsequences_with_different_end_characters() {
+        let table = EntryTable::from_entries(vec![IndexedEntry::legacy(
+            "/workspace/QuickFox/AGENTS.md",
+            "AGENTS.md",
+            IndexedEntryKind::File,
+        )]);
+        let path_index = PathSegmentIndex::build(&table).unwrap();
+
+        assert_eq!(path_index.lookup(&table, "wrkspc"), vec![EntryId(0)]);
     }
 
     #[test]
