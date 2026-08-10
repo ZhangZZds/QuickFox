@@ -13,6 +13,7 @@
 ### Task 1: Viewport-safe placement geometry
 
 **Files:**
+
 - Create: `src/tooltip.ts`
 - Create: `src/tooltip.test.ts`
 
@@ -23,19 +24,44 @@ import { describe, expect, it } from "vitest";
 import { calculateTooltipPosition } from "./tooltip";
 
 const anchor = (overrides: Partial<DOMRect> = {}): DOMRect =>
-  ({ left: 100, top: 100, right: 118, bottom: 118, width: 18, height: 18, x: 100, y: 100, toJSON: () => ({ }), ...overrides }) as DOMRect;
+  ({
+    left: 100,
+    top: 100,
+    right: 118,
+    bottom: 118,
+    width: 18,
+    height: 18,
+    x: 100,
+    y: 100,
+    toJSON: () => ({}),
+    ...overrides,
+  }) as DOMRect;
 
 describe("calculateTooltipPosition", () => {
   it("prefers the space above the trigger", () => {
-    expect(calculateTooltipPosition(anchor(), { width: 160, height: 48 }, { width: 400, height: 300 })).toEqual({ left: 29, top: 44, placement: "above" });
+    expect(
+      calculateTooltipPosition(anchor(), { width: 160, height: 48 }, { width: 400, height: 300 }),
+    ).toEqual({ left: 29, top: 44, placement: "above" });
   });
 
   it("uses the space below when above would cross the viewport gutter", () => {
-    expect(calculateTooltipPosition(anchor({ top: 12, bottom: 30 }), { width: 160, height: 48 }, { width: 400, height: 300 })).toEqual({ left: 29, top: 38, placement: "below" });
+    expect(
+      calculateTooltipPosition(
+        anchor({ top: 12, bottom: 30 }),
+        { width: 160, height: 48 },
+        { width: 400, height: 300 },
+      ),
+    ).toEqual({ left: 29, top: 38, placement: "below" });
   });
 
   it("clamps a wide tooltip inside the horizontal viewport gutter", () => {
-    expect(calculateTooltipPosition(anchor({ left: 380, right: 398 }), { width: 160, height: 48 }, { width: 400, height: 300 })).toMatchObject({ left: 232, placement: "above" });
+    expect(
+      calculateTooltipPosition(
+        anchor({ left: 380, right: 398 }),
+        { width: 160, height: 48 },
+        { width: 400, height: 300 },
+      ),
+    ).toMatchObject({ left: 232, placement: "above" });
   });
 });
 ```
@@ -54,14 +80,25 @@ export type TooltipPosition = { left: number; top: number; placement: "above" | 
 const GUTTER = 8;
 const GAP = 8;
 
-export function calculateTooltipPosition(anchor: DOMRect, tooltip: Pick<DOMRect, "width" | "height">, viewport: Pick<Window, "innerWidth" | "innerHeight">): TooltipPosition {
+export function calculateTooltipPosition(
+  anchor: DOMRect,
+  tooltip: Pick<DOMRect, "width" | "height">,
+  viewport: Pick<Window, "innerWidth" | "innerHeight">,
+): TooltipPosition {
   const spaceAbove = anchor.top - GAP - GUTTER;
   const spaceBelow = viewport.innerHeight - anchor.bottom - GAP - GUTTER;
   const placement = spaceAbove >= tooltip.height || spaceAbove >= spaceBelow ? "above" : "below";
-  const top = placement === "above"
-    ? Math.max(GUTTER, anchor.top - GAP - tooltip.height)
-    : Math.min(viewport.innerHeight - GUTTER - tooltip.height, anchor.bottom + GAP);
-  const left = Math.max(GUTTER, Math.min(anchor.left + anchor.width / 2 - tooltip.width / 2, viewport.innerWidth - GUTTER - tooltip.width));
+  const top =
+    placement === "above"
+      ? Math.max(GUTTER, anchor.top - GAP - tooltip.height)
+      : Math.min(viewport.innerHeight - GUTTER - tooltip.height, anchor.bottom + GAP);
+  const left = Math.max(
+    GUTTER,
+    Math.min(
+      anchor.left + anchor.width / 2 - tooltip.width / 2,
+      viewport.innerWidth - GUTTER - tooltip.width,
+    ),
+  );
   return { left, top, placement };
 }
 ```
@@ -82,6 +119,7 @@ git commit -m "feat: position help tooltips inside viewport"
 ### Task 2: Portal-based help tooltip
 
 **Files:**
+
 - Modify: `src/App.tsx:1-30,322-350`
 - Modify: `src/App.test.tsx:1668-1700`
 - Modify: `src/styles.css:733-788`
@@ -118,7 +156,13 @@ const triggerRef = useRef<HTMLButtonElement>(null);
 const tooltipRef = useRef<HTMLSpanElement>(null);
 const updatePosition = useCallback(() => {
   if (triggerRef.current && tooltipRef.current) {
-    setPosition(calculateTooltipPosition(triggerRef.current.getBoundingClientRect(), tooltipRef.current.getBoundingClientRect(), window));
+    setPosition(
+      calculateTooltipPosition(
+        triggerRef.current.getBoundingClientRect(),
+        tooltipRef.current.getBoundingClientRect(),
+        window,
+      ),
+    );
   }
 }, []);
 
@@ -127,7 +171,10 @@ useLayoutEffect(() => {
   updatePosition();
   window.addEventListener("resize", updatePosition);
   window.addEventListener("scroll", updatePosition, true);
-  return () => { window.removeEventListener("resize", updatePosition); window.removeEventListener("scroll", updatePosition, true); };
+  return () => {
+    window.removeEventListener("resize", updatePosition);
+    window.removeEventListener("scroll", updatePosition, true);
+  };
 }, [visible, updatePosition]);
 ```
 
@@ -162,6 +209,7 @@ git commit -m "fix: render help tooltips above scroll containers"
 ### Task 3: Full verification and desktop evidence
 
 **Files:**
+
 - Modify: `openspec/changes/fix-tooltip-overlay/tasks.md`
 - Modify: `docs/visual-qa/custom-hotkey-settings-behavior.md` only if the result record is absent
 

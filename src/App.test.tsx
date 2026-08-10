@@ -1464,7 +1464,7 @@ describe("App", () => {
   it("saves updated command settings through the Tauri config command", async () => {
     render(<App initialView="settings" />);
     await screen.findByDisplayValue("/tmp");
-    fireEvent.click(screen.getByLabelText("命令执行"));
+    fireEvent.click(screen.getByRole("checkbox", { name: "命令执行" }));
     fireEvent.click(screen.getByRole("button", { name: "保存设置" }));
 
     expect(saveConfig).toHaveBeenCalledWith({
@@ -1670,14 +1670,35 @@ describe("App", () => {
     await screen.findByDisplayValue("/tmp");
 
     expect(screen.getByRole("button", { name: "索引目录说明" })).toBeInTheDocument();
-    expect(screen.getByText(/每行填写一个完整目录路径，例如/)).toBeInTheDocument();
     expect(screen.getByText(/type:pdf/)).toBeInTheDocument();
     expect(screen.getByText(/content:"hello world"/)).toBeInTheDocument();
+
+    const indexDirectoryHelp = screen.getByRole("button", { name: "索引目录说明" });
+    fireEvent.focus(indexDirectoryHelp);
+    expect(screen.getByRole("tooltip")).toHaveTextContent("每行填写一个完整目录路径，例如");
+    fireEvent.blur(indexDirectoryHelp);
 
     fireEvent.click(screen.getByRole("tab", { name: "外观" }));
 
     expect(screen.getByRole("button", { name: "全局唤醒键说明" })).toBeInTheDocument();
-    expect(screen.getByText(/保存后新按键生效/)).toBeInTheDocument();
+    fireEvent.focus(screen.getByRole("button", { name: "全局唤醒键说明" }));
+    expect(screen.getByRole("tooltip")).toHaveTextContent("保存后新按键生效");
+  });
+
+  it("renders focused help as a window-level tooltip and hides it on blur", async () => {
+    render(<App initialView="settings" />);
+    await screen.findByDisplayValue("/tmp");
+
+    const trigger = screen.getByRole("button", { name: "索引目录说明" });
+    fireEvent.focus(trigger);
+
+    const tooltip = await screen.findByRole("tooltip");
+    expect(tooltip).toHaveTextContent("每行填写一个完整目录路径");
+    expect(tooltip.parentElement).toBe(document.body);
+    expect(trigger).toHaveAttribute("aria-describedby", tooltip.id);
+
+    fireEvent.blur(trigger);
+    expect(screen.queryByRole("tooltip")).not.toBeInTheDocument();
   });
 
   it("exposes full settings values and field guidance for truncated rows", async () => {
@@ -1691,11 +1712,15 @@ describe("App", () => {
 
     fireEvent.click(screen.getByRole("tab", { name: "历史" }));
     expect(screen.getByRole("button", { name: "输入历史条数说明" })).toBeInTheDocument();
-    expect(screen.getByText(/0 表示不保留/)).toBeInTheDocument();
+    const historyHelp = screen.getByRole("button", { name: "输入历史条数说明" });
+    fireEvent.focus(historyHelp);
+    expect(screen.getByRole("tooltip")).toHaveTextContent("0 表示不保留");
+    fireEvent.blur(historyHelp);
 
     fireEvent.click(screen.getByRole("tab", { name: "命令安全" }));
     expect(screen.getByRole("button", { name: "命令执行说明" })).toBeInTheDocument();
-    expect(screen.getByText(/每次执行前仍会要求确认/)).toBeInTheDocument();
+    fireEvent.focus(screen.getByRole("button", { name: "命令执行说明" }));
+    expect(screen.getByRole("tooltip")).toHaveTextContent("每次执行前仍会要求确认");
   });
 
   it("closes the web search engine wizard with Esc without closing settings", async () => {
@@ -1786,7 +1811,7 @@ describe("App", () => {
     await screen.findByDisplayValue("/tmp");
 
     const auxiliaryColumn = screen.getByRole("region", { name: "辅助信息" });
-    expect(auxiliaryColumn).toContainElement(screen.getByLabelText("正则前缀"));
+    expect(auxiliaryColumn).toContainElement(screen.getByRole("textbox", { name: "正则前缀" }));
     expect(auxiliaryColumn).toContainElement(screen.getByText("配置文件位置"));
     expect(auxiliaryColumn).toContainElement(
       screen.getAllByText("/Users/frank/Library/Application Support/QuickFox/config.json")[0],
@@ -1838,10 +1863,10 @@ describe("App", () => {
     expect(screen.getByRole("group", { name: "历史" })).toBeInTheDocument();
     expect(screen.getByRole("group", { name: "命令执行" })).toBeInTheDocument();
     expect(screen.getByRole("group", { name: "外观与窗口" })).toBeInTheDocument();
-    expect(screen.getByLabelText("索引目录")).toBeInTheDocument();
-    expect(screen.getByLabelText("正则前缀")).toHaveValue("re:");
-    expect(screen.getByLabelText("命令执行")).not.toBeChecked();
-    expect(screen.getByLabelText("输入历史条数")).toHaveValue(15);
+    expect(screen.getByRole("textbox", { name: "索引目录" })).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "正则前缀" })).toHaveValue("re:");
+    expect(screen.getByRole("checkbox", { name: "命令执行" })).not.toBeChecked();
+    expect(screen.getByRole("spinbutton", { name: "输入历史条数" })).toHaveValue(15);
   });
 
   it("adds a DuckDuckGo web search engine from the settings wizard", async () => {
@@ -1891,23 +1916,23 @@ describe("App", () => {
     render(<App initialView="settings" />);
     await screen.findByDisplayValue("/tmp");
 
-    fireEvent.change(screen.getByLabelText("索引目录"), {
+    fireEvent.change(screen.getByRole("textbox", { name: "索引目录" }), {
       target: { value: "/tmp\n/Users/frank/Documents" },
     });
-    fireEvent.change(screen.getByLabelText("排除目录"), {
+    fireEvent.change(screen.getByRole("textbox", { name: "排除目录" }), {
       target: { value: "/tmp/cache" },
     });
-    fireEvent.change(screen.getByLabelText("排除模式"), {
+    fireEvent.change(screen.getByRole("textbox", { name: "排除模式" }), {
       target: { value: "*.log\nnode_modules" },
     });
-    fireEvent.change(screen.getByLabelText("索引性能模式"), {
+    fireEvent.change(screen.getByRole("combobox", { name: "索引性能模式" }), {
       target: { value: "complete" },
     });
     fireEvent.click(screen.getByLabelText("尊重项目 ignore"));
-    fireEvent.change(screen.getByLabelText("内容索引目录"), {
+    fireEvent.change(screen.getByRole("textbox", { name: "内容索引目录" }), {
       target: { value: "/tmp/Documents\n/Users/frank/workspace" },
     });
-    fireEvent.change(screen.getByLabelText("内容大小上限 MB"), {
+    fireEvent.change(screen.getByRole("spinbutton", { name: "内容大小上限 MB" }), {
       target: { value: "4" },
     });
     fireEvent.click(screen.getByLabelText("运行期文件监听"));
@@ -1934,7 +1959,7 @@ describe("App", () => {
     render(<App initialView="settings" />);
     await screen.findByDisplayValue("/tmp");
 
-    const includeDirs = screen.getByLabelText("索引目录");
+    const includeDirs = screen.getByRole("textbox", { name: "索引目录" });
     fireEvent.change(includeDirs, {
       target: { value: "/tmp\n" },
     });

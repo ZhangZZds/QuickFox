@@ -18,7 +18,11 @@ const anchor = (overrides: Partial<DOMRect> = {}): DOMRect =>
 describe("calculateTooltipPosition", () => {
   it("prefers the space above the trigger", () => {
     expect(
-      calculateTooltipPosition(anchor(), { width: 160, height: 48 }, { innerWidth: 400, innerHeight: 300 }),
+      calculateTooltipPosition(
+        anchor(),
+        { width: 160, height: 48 },
+        { innerWidth: 400, innerHeight: 300 },
+      ),
     ).toEqual({ left: 29, top: 44, placement: "above" });
   });
 

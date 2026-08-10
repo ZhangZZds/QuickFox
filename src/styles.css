@@ -738,7 +738,6 @@ input {
 }
 
 .settings-help {
-  position: relative;
   display: inline-grid;
   place-items: center;
 }
@@ -759,13 +758,9 @@ input {
 }
 
 .settings-help-tooltip {
-  position: absolute;
+  position: fixed;
   z-index: 200;
-  left: 50%;
-  bottom: calc(100% + 8px);
-  width: max-content;
-  max-width: min(380px, 70vw);
-  transform: translateX(-50%);
+  max-width: min(380px, calc(100vw - 16px));
   border: 1px solid #cbd8d1;
   border-radius: 6px;
   padding: 8px 10px;
@@ -774,15 +769,9 @@ input {
   font-size: 12px;
   font-weight: 500;
   line-height: 1.45;
-  opacity: 0;
   pointer-events: none;
   white-space: normal;
   box-shadow: 0 12px 32px rgba(23, 32, 26, 0.22);
-}
-
-.settings-help:hover .settings-help-tooltip,
-.settings-help:focus-within .settings-help-tooltip {
-  opacity: 1;
 }
 
 .settings-form input,

@@ -14,8 +14,7 @@ export function calculateTooltipPosition(
 ): TooltipPosition {
   const spaceAbove = anchor.top - GAP - GUTTER;
   const spaceBelow = viewport.innerHeight - anchor.bottom - GAP - GUTTER;
-  const placement =
-    spaceAbove >= tooltip.height || spaceAbove >= spaceBelow ? "above" : "below";
+  const placement = spaceAbove >= tooltip.height || spaceAbove >= spaceBelow ? "above" : "below";
   const top =
     placement === "above"
       ? Math.max(GUTTER, anchor.top - GAP - tooltip.height)

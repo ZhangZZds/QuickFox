@@ -1,11 +1,16 @@
 import {
   type KeyboardEvent as ReactKeyboardEvent,
   type ReactNode,
+  useCallback,
   useEffect,
+  useId,
+  useLayoutEffect,
   useRef,
   useState,
 } from "react";
+import { createPortal } from "react-dom";
 
+import { calculateTooltipPosition, type TooltipPosition } from "./tooltip";
 import {
   appPaths,
   executeAction,
@@ -319,15 +324,82 @@ function normalizedShortcutKey(key: string) {
   return aliases[key] ?? null;
 }
 
-function HelpIcon({ label, text }: { label: string; text: string }) {
+function HelpIcon({
+  label,
+  text,
+  buttonLabel = `${label}说明`,
+}: {
+  label: string;
+  text: string;
+  buttonLabel?: string;
+}) {
+  const [visible, setVisible] = useState(false);
+  const [position, setPosition] = useState<TooltipPosition>({
+    left: 8,
+    top: 8,
+    placement: "below",
+  });
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const tooltipRef = useRef<HTMLSpanElement>(null);
+  const tooltipId = useId();
+  const updatePosition = useCallback(() => {
+    if (!triggerRef.current || !tooltipRef.current) {
+      return;
+    }
+
+    setPosition(
+      calculateTooltipPosition(
+        triggerRef.current.getBoundingClientRect(),
+        tooltipRef.current.getBoundingClientRect(),
+        window,
+      ),
+    );
+  }, []);
+
+  useLayoutEffect(() => {
+    if (!visible) {
+      return;
+    }
+
+    updatePosition();
+    window.addEventListener("resize", updatePosition);
+    window.addEventListener("scroll", updatePosition, true);
+    return () => {
+      window.removeEventListener("resize", updatePosition);
+      window.removeEventListener("scroll", updatePosition, true);
+    };
+  }, [updatePosition, visible]);
+
   return (
     <span className="settings-help">
-      <button type="button" aria-label={`${label}说明`} className="settings-help-button">
+      <button
+        aria-describedby={visible ? tooltipId : undefined}
+        aria-label={buttonLabel}
+        className="settings-help-button"
+        onBlur={() => setVisible(false)}
+        onFocus={() => setVisible(true)}
+        onPointerEnter={() => setVisible(true)}
+        onPointerLeave={() => setVisible(false)}
+        ref={triggerRef}
+        type="button"
+      >
         ?
       </button>
-      <span role="tooltip" className="settings-help-tooltip">
-        {text}
-      </span>
+      {visible
+        ? createPortal(
+            <span
+              className="settings-help-tooltip"
+              data-placement={position.placement}
+              id={tooltipId}
+              ref={tooltipRef}
+              role="tooltip"
+              style={{ left: position.left, top: position.top }}
+            >
+              {text}
+            </span>,
+            document.body,
+          )
+        : null}
     </span>
   );
 }
@@ -338,14 +410,7 @@ function FullPathValue({ label, value }: { label: string; value: string }) {
       <span aria-label={`${label}完整路径文本`} className="settings-full-path-value" title={value}>
         {value}
       </span>
-      <span className="settings-help">
-        <button type="button" aria-label={`${label}完整路径`} className="settings-help-button">
-          ?
-        </button>
-        <span role="tooltip" className="settings-help-tooltip">
-          {value}
-        </span>
-      </span>
+      <HelpIcon buttonLabel={`${label}完整路径`} label={label} text={value} />
     </span>
   );
 }
