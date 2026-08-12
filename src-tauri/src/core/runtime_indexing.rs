@@ -635,6 +635,11 @@ impl RuntimeIndexingService {
             return;
         }
 
+        if watcher_rescan_requires_calibration(failure.is_some(), degradation) {
+            self.schedule_watcher_rescan_calibration(dirty_roots);
+            return;
+        }
+
         let now = Instant::now();
         for root in dirty_roots {
             self.degraded_roots.insert(root.clone());
@@ -657,6 +662,18 @@ impl RuntimeIndexingService {
         } else {
             BaselineRefreshReason::DirtyRoots
         });
+    }
+
+    fn schedule_watcher_rescan_calibration(&mut self, dirty_roots: BTreeSet<PathBuf>) {
+        let now = Instant::now();
+        for root in dirty_roots {
+            self.coordinator.mark_dirty_root(root, now);
+        }
+        self.status.state = IncrementalState::Calibrating;
+        self.status.degradation_code = None;
+        self.status.pending_events = self.coordinator.pending_event_count();
+        self.status.dirty_roots = self.coordinator.dirty_root_count();
+        self.publish_status();
     }
 
     fn commit_ready_batch(&mut self) {
@@ -692,8 +709,15 @@ impl RuntimeIndexingService {
             };
         let failed_roots = self.failed_configured_roots(&scanned.failures);
         let failed_root_count = failed_roots.len();
+        for root in dirty_roots
+            .iter()
+            .filter(|root| !failed_roots.contains(*root))
+        {
+            self.degraded_roots.remove(root);
+        }
         self.degraded_roots.extend(failed_roots.iter().cloned());
         dirty_roots.extend(failed_roots);
+        let remaining_dirty_root_count = self.degraded_roots.len();
         let has_durable_changes = !scanned.upserts.is_empty()
             || !scanned.removals.is_empty()
             || !scanned.manifest_upserts.is_empty()
@@ -702,8 +726,10 @@ impl RuntimeIndexingService {
             if failed_root_count > 0 {
                 self.publish_calibration_failure(dirty_roots.len());
             } else {
+                self.status.state = IncrementalState::Watching;
+                self.status.degradation_code = None;
                 self.status.pending_events = 0;
-                self.status.dirty_roots = dirty_root_count;
+                self.status.dirty_roots = remaining_dirty_root_count;
                 self.publish_status();
             }
             return;
@@ -731,17 +757,16 @@ impl RuntimeIndexingService {
             return;
         }
 
-        let dirty_root_count = dirty_roots.len();
-        self.status.state = if dirty_root_count == 0 {
+        self.status.state = if remaining_dirty_root_count == 0 {
             IncrementalState::Watching
         } else {
             IncrementalState::Degraded
         };
         self.status.pending_events = 0;
-        self.status.dirty_roots = dirty_root_count;
+        self.status.dirty_roots = remaining_dirty_root_count;
         self.status.last_batch_entries = delta.upserts.len().saturating_add(delta.removals.len());
         self.status.last_batch_duration_ms = started.elapsed().as_millis() as u64;
-        if dirty_root_count == 0 {
+        if remaining_dirty_root_count == 0 {
             self.status.degradation_code = None;
         }
         (self.publish)(RuntimeIndexingEvent::DeltaCommitted(delta));
@@ -750,7 +775,7 @@ impl RuntimeIndexingService {
         self.next_generation = self.next_generation.saturating_add(1);
         self.publish_status();
         if failed_root_count > 0 {
-            self.publish_calibration_failure(dirty_root_count);
+            self.publish_calibration_failure(remaining_dirty_root_count);
         }
     }
 
@@ -816,6 +841,13 @@ impl RuntimeIndexingService {
     fn publish_status(&self) {
         (self.publish)(RuntimeIndexingEvent::Status(self.status.clone()));
     }
+}
+
+fn watcher_rescan_requires_calibration(
+    has_failure: bool,
+    degradation: Option<IndexDegradationCode>,
+) -> bool {
+    !has_failure && degradation == Some(IndexDegradationCode::WatcherOverflow)
 }
 
 pub fn delta_safety_limit_reached(entry_count: usize, estimated_bytes: usize) -> bool {
@@ -899,6 +931,22 @@ mod tests {
             ),
             RefreshDecision::FullRefresh(BaselineRefreshReason::IndexConfigChanged)
         );
+    }
+
+    #[test]
+    fn watcher_rescan_is_calibrated_without_requesting_baseline_recovery() {
+        assert!(watcher_rescan_requires_calibration(
+            false,
+            Some(IndexDegradationCode::WatcherOverflow),
+        ));
+        assert!(!watcher_rescan_requires_calibration(
+            true,
+            Some(IndexDegradationCode::WatcherOverflow),
+        ));
+        assert!(!watcher_rescan_requires_calibration(
+            false,
+            Some(IndexDegradationCode::ChannelOverflow),
+        ));
     }
 
     struct FixedScanner(Mutex<VecDeque<Result<TargetedScanResult, TargetedScanError>>>);
@@ -1150,6 +1198,54 @@ mod tests {
             .search("new")
             .iter()
             .any(|result| result.title == "new.md"));
+    }
+
+    #[test]
+    fn native_watcher_commits_an_empty_file_created_after_startup() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().canonicalize().unwrap();
+        let storage = SqliteStorage::open(root.path().join("native-runtime.sqlite")).unwrap();
+        let baseline_id = storage.save_completed_index_batch(1, &[]).unwrap();
+        let manifest = baseline_manifest_from_entries(&[], std::slice::from_ref(&root_path));
+        storage
+            .activate_baseline_with_manifest_and_clear_incremental_state(baseline_id, 0, &manifest)
+            .unwrap();
+        let rules = IndexPathRules::from_plan(&IndexScanPlan {
+            include_roots: vec![root_path.clone()],
+            ..IndexScanPlan::default()
+        })
+        .unwrap();
+        let watcher = RuntimeIndexWatcher::watch_roots(vec![root_path.clone()]).unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let published = Arc::clone(&events);
+        let handle = start_runtime_indexing(
+            watcher,
+            TargetedIndexScanner::new(rules),
+            Box::new(storage),
+            RuntimeIndexingOptions {
+                roots: vec![root_path.clone()],
+                policy: CoordinatorPolicy::new(
+                    Duration::from_millis(10),
+                    Duration::from_millis(100),
+                ),
+                initial_generation: 0,
+            },
+            move |event| published.lock().unwrap().push(event),
+        )
+        .unwrap();
+        let created = root_path.join("empty.txt");
+        fs::write(&created, []).unwrap();
+
+        wait_until("native empty-file delta", || {
+            events.lock().unwrap().iter().any(|event| {
+                matches!(
+                    event,
+                    RuntimeIndexingEvent::DeltaCommitted(delta)
+                        if delta.upserts.iter().any(|entry| entry.path == created.to_string_lossy())
+                )
+            })
+        });
+        handle.stop();
     }
 
     #[test]

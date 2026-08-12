@@ -81,3 +81,15 @@
 - 已在 macOS 开发环境以 release synthetic fixture 复验 compact baseline、2,000,000 + 10,000 layered view 与 10,000 durable batch；结果见 `docs/large-index-performance.md` 的“2026-08-09 compact candidate 与增量 release 复验”。
 - 2,000,000 compact 候选常驻估算为 `462,092,513` bytes；普通、短、数字和 fuzzy path 查询均由有界 posting 候选提供，未使用 `table.all_ids()` 作为常规回退。
 - macOS 与 Windows 的本节所有未勾选手工项仍**未执行**。当前没有签名/发布构建的 GUI、真实 sleep/wake、外接 root 断开、NTFS C:/D、junction 或任务管理器截图证据；两个发布 blocker 保持有效。
+
+## 2026-08-11 v1.6.0 发布决定
+
+- 最终 `npm run check` 通过：108 个前端测试、520 个 Rust 测试通过，6 个显式
+  release/benchmark 测试按设计忽略；Prettier、ESLint、前端构建、rustfmt 和 Clippy
+  均 exit 0。
+- `openspec validate --all --strict` 通过 8 个主规范，三个相关 change 已同步归档。
+- macOS 开发版连接真实用户数据库验证了空文件 create/remove：分别持久化为
+  generation 5 `upsert` 和 generation 6 `remove`，active baseline 未变化。
+- 维护者确认设置页 tooltip 与新增文件搜索验收为 OK，并明确授权提交 `main`、发布
+  v1.6.0，同时接受 Windows NTFS 多盘、休眠/唤醒和断盘恢复未形成新结构化手工记录
+  的验证边界。该决定解除本版本发布阻塞，但不把未执行项目表述为已经测试通过。

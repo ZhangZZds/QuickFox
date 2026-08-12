@@ -47,15 +47,25 @@ pub struct IndexScanPlan {
 #[derive(Debug, Clone)]
 pub struct IndexPathRules {
     pub roots: Vec<PathBuf>,
+    root_candidates: Vec<ConfiguredRootCandidate>,
     exclude_dirs: HashSet<PathBuf>,
     exclude_patterns: GlobSet,
     pub respect_project_ignores: bool,
 }
 
+#[derive(Debug, Clone)]
+struct ConfiguredRootCandidate {
+    path: PathBuf,
+    root_index: usize,
+}
+
 impl IndexPathRules {
     pub fn from_plan(plan: &IndexScanPlan) -> Result<Self, std::io::Error> {
+        let roots = unique_paths(plan.include_roots.clone());
+        let root_candidates = canonicalize_with_originals(&roots);
         Ok(Self {
-            roots: unique_paths(plan.include_roots.clone()),
+            roots,
+            root_candidates,
             exclude_dirs: canonicalize_existing_paths(&plan.exclude_dirs),
             exclude_patterns: compile_exclude_patterns(&plan.exclude_patterns)?,
             respect_project_ignores: plan.respect_project_ignores,
@@ -67,20 +77,38 @@ impl IndexPathRules {
     }
 
     fn configured_root_for_mode(&self, path: &Path, mode: PathComparisonMode) -> Option<&Path> {
-        self.roots
+        self.configured_root_match_for_mode(path, mode)
+            .map(|candidate| self.roots[candidate.root_index].as_path())
+    }
+
+    fn configured_root_boundary_for_mode(
+        &self,
+        path: &Path,
+        mode: PathComparisonMode,
+    ) -> Option<&Path> {
+        self.configured_root_match_for_mode(path, mode)
+            .map(|candidate| candidate.path.as_path())
+    }
+
+    fn configured_root_match_for_mode(
+        &self,
+        path: &Path,
+        mode: PathComparisonMode,
+    ) -> Option<&ConfiguredRootCandidate> {
+        self.root_candidates
             .iter()
-            .filter(|root| path_is_same_or_descendant_for_mode(root, path, mode))
-            .max_by_key(|root| {
-                normalize_path_key_for_mode(root, mode)
+            .filter(|candidate| path_is_same_or_descendant_for_mode(&candidate.path, path, mode))
+            .max_by_key(|candidate| {
+                normalize_path_key_for_mode(&candidate.path, mode)
                     .split('/')
                     .filter(|component| !component.is_empty())
                     .count()
             })
-            .map(PathBuf::as_path)
     }
 
     pub fn is_forced_or_user_excluded(&self, path: &Path) -> bool {
-        let configured_root = self.configured_root_for(path);
+        let configured_root =
+            self.configured_root_boundary_for_mode(path, PathComparisonMode::native());
         let configured_root_key = configured_root.map(normalize_path_key);
         path.ancestors()
             .take_while(|candidate| {
@@ -89,9 +117,13 @@ impl IndexPathRules {
                     .is_none_or(|root| normalize_path_key(candidate) != *root)
             })
             .any(|candidate| {
+                let pattern_candidate = configured_root
+                    .and_then(|root| candidate.strip_prefix(root).ok())
+                    .filter(|relative| !relative.as_os_str().is_empty())
+                    .unwrap_or(candidate);
                 is_forced_excluded(candidate)
                     || is_user_excluded(candidate, &self.exclude_dirs)
-                    || matches_exclude_patterns(candidate, &self.exclude_patterns)
+                    || matches_exclude_patterns(pattern_candidate, &self.exclude_patterns)
             })
     }
 
@@ -225,11 +257,7 @@ impl IgnoreScanner {
         cache: &mut IgnoreBatchCache,
         is_cancelled: impl Fn() -> bool,
     ) -> Result<IndexReport, std::io::Error> {
-        if !path_is_same_or_descendant_for_mode(
-            configured_root,
-            target,
-            PathComparisonMode::native(),
-        ) {
+        if rules.configured_root_for(target) != Some(configured_root) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "target is outside its configured index root",
@@ -894,6 +922,22 @@ fn canonicalize_existing_paths(paths: &[PathBuf]) -> HashSet<PathBuf> {
         .collect()
 }
 
+fn canonicalize_with_originals(paths: &[PathBuf]) -> Vec<ConfiguredRootCandidate> {
+    let mut seen = HashSet::new();
+    let mut candidates = Vec::new();
+    for (root_index, path) in paths.iter().enumerate() {
+        for candidate in std::iter::once(path.clone()).chain(path.canonicalize().ok()) {
+            if seen.insert(candidate.clone()) {
+                candidates.push(ConfiguredRootCandidate {
+                    path: candidate,
+                    root_index,
+                });
+            }
+        }
+    }
+    candidates
+}
+
 fn is_user_excluded(path: &Path, exclude_dirs: &HashSet<PathBuf>) -> bool {
     exclude_dirs.contains(path)
 }
@@ -1237,6 +1281,24 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn index_path_rules_accept_native_events_reported_through_a_canonical_root_alias() {
+        let temp = tempfile::tempdir().unwrap();
+        let configured_root = temp.path().to_path_buf();
+        let canonical_root = configured_root.canonicalize().unwrap();
+        let rules = IndexPathRules::from_plan(&IndexScanPlan {
+            include_roots: vec![configured_root.clone()],
+            ..IndexScanPlan::default()
+        })
+        .unwrap();
+
+        assert_eq!(
+            rules.configured_root_for(&canonical_root.join("native-event.txt")),
+            Some(configured_root.as_path())
+        );
+        assert!(!rules.is_excluded(&canonical_root.join("native-event.txt")));
     }
 
     #[test]

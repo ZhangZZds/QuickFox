@@ -15,7 +15,7 @@ use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const TARGETED_DIRECT_JOURNAL_SQL: &str = r#"
     SELECT batches.generation, entries.ordinal, entries.operation, entries.path, entries.entry_json
@@ -129,6 +129,7 @@ impl SqliteStorage {
             let _ = std::fs::create_dir_all(parent);
         }
         let connection = Connection::open(path)?;
+        connection.busy_timeout(Duration::from_secs(10))?;
         connection.pragma_update(None, "foreign_keys", true)?;
         let storage = Self {
             connection,
@@ -225,6 +226,8 @@ impl SqliteStorage {
             );
             "#,
         )?;
+        Self::ensure_runtime_state_schema(&transaction)?;
+        Self::ensure_delta_batch_schema(&transaction)?;
         Self::ensure_index_entry_metadata_columns(&transaction)?;
         Self::backfill_index_entry_keys(&transaction, self.comparison_mode)?;
         Self::ensure_delta_entry_key_columns(&transaction)?;
@@ -253,13 +256,11 @@ impl SqliteStorage {
         )? {
             transaction.execute_batch(
                 r#"
-                DROP INDEX IF EXISTS idx_index_directory_manifest_root;
-                DROP INDEX IF EXISTS idx_index_directory_manifest_parent;
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_index_directory_manifest_path_key
                     ON index_directory_manifest(path_key);
-                CREATE INDEX IF NOT EXISTS idx_index_directory_manifest_root
+                CREATE INDEX IF NOT EXISTS idx_index_directory_manifest_root_key
                     ON index_directory_manifest(root_key);
-                CREATE INDEX IF NOT EXISTS idx_index_directory_manifest_parent
+                CREATE INDEX IF NOT EXISTS idx_index_directory_manifest_parent_key
                     ON index_directory_manifest(parent_key);
                 "#,
             )?;
@@ -270,6 +271,131 @@ impl SqliteStorage {
             transaction.pragma_update(None, "user_version", 3)?;
         }
         transaction.commit()?;
+        Ok(())
+    }
+
+    fn ensure_runtime_state_schema(connection: &Connection) -> Result<(), StorageError> {
+        let columns = table_columns(connection, "index_runtime_state")?;
+        let required = [
+            "singleton",
+            "active_baseline_id",
+            "baseline_generation",
+            "last_generation",
+            "degradation_code",
+            "baseline_refresh_reason",
+        ];
+        if required.iter().all(|column| columns.contains(*column))
+            && foreign_key_matches(
+                connection,
+                "index_runtime_state",
+                "active_baseline_id",
+                "index_batches",
+                "id",
+                "SET NULL",
+            )?
+        {
+            return Ok(());
+        }
+
+        let active_baseline = if columns.contains("active_baseline_id") {
+            "active_baseline_id"
+        } else {
+            "(SELECT MAX(id) FROM index_batches)"
+        };
+        let baseline_generation = if columns.contains("baseline_generation") {
+            "baseline_generation"
+        } else {
+            "0"
+        };
+        let last_generation = if columns.contains("last_generation") {
+            "last_generation"
+        } else {
+            "0"
+        };
+        let degradation_code = if columns.contains("degradation_code") {
+            "degradation_code"
+        } else {
+            "NULL"
+        };
+        let refresh_reason = if columns.contains("baseline_refresh_reason") {
+            "baseline_refresh_reason"
+        } else {
+            "NULL"
+        };
+        connection.execute_batch(&format!(
+            r#"
+            DROP TABLE IF EXISTS index_runtime_state_migrated;
+            CREATE TABLE index_runtime_state_migrated (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                active_baseline_id INTEGER,
+                baseline_generation INTEGER NOT NULL,
+                last_generation INTEGER NOT NULL,
+                degradation_code TEXT,
+                baseline_refresh_reason TEXT,
+                FOREIGN KEY (active_baseline_id) REFERENCES index_batches(id) ON DELETE SET NULL
+            );
+            INSERT INTO index_runtime_state_migrated
+                (singleton, active_baseline_id, baseline_generation, last_generation,
+                 degradation_code, baseline_refresh_reason)
+            SELECT singleton, {active_baseline}, {baseline_generation}, {last_generation},
+                   {degradation_code}, {refresh_reason}
+            FROM index_runtime_state;
+            DROP TABLE index_runtime_state;
+            ALTER TABLE index_runtime_state_migrated RENAME TO index_runtime_state;
+            "#
+        ))?;
+        Ok(())
+    }
+
+    fn ensure_delta_batch_schema(connection: &Connection) -> Result<(), StorageError> {
+        let columns = table_columns(connection, "index_delta_batches")?;
+        let required = [
+            "id",
+            "generation",
+            "status",
+            "committed_at_ms",
+            "payload_hash",
+        ];
+        if required.iter().all(|column| columns.contains(*column))
+            && !columns.contains("created_at_ms")
+        {
+            return Ok(());
+        }
+
+        connection.execute_batch(
+            r#"
+            DROP TABLE index_delta_entries;
+            DROP TABLE index_delta_batches;
+
+            CREATE TABLE index_delta_batches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                generation INTEGER NOT NULL UNIQUE,
+                status TEXT NOT NULL CHECK (status IN ('pending', 'committed')),
+                committed_at_ms INTEGER NOT NULL,
+                payload_hash TEXT NOT NULL
+            );
+
+            CREATE TABLE index_delta_entries (
+                batch_id INTEGER NOT NULL,
+                ordinal INTEGER NOT NULL,
+                operation TEXT NOT NULL CHECK (operation IN ('upsert', 'remove')),
+                path TEXT NOT NULL,
+                entry_json TEXT,
+                root_key TEXT,
+                parent_key TEXT,
+                PRIMARY KEY (batch_id, ordinal),
+                FOREIGN KEY (batch_id) REFERENCES index_delta_batches(id) ON DELETE CASCADE
+            );
+
+            UPDATE index_runtime_state
+            SET last_generation = baseline_generation,
+                degradation_code = NULL,
+                baseline_refresh_reason = NULL
+            WHERE singleton = 1;
+
+            DELETE FROM index_directory_manifest;
+            "#,
+        )?;
         Ok(())
     }
 
@@ -621,8 +747,11 @@ impl SqliteStorage {
                 &["parent_key", "batch_id"][..],
             ),
             ("idx_index_directory_manifest_path_key", &["path_key"][..]),
-            ("idx_index_directory_manifest_root", &["root_key"][..]),
-            ("idx_index_directory_manifest_parent", &["parent_key"][..]),
+            ("idx_index_directory_manifest_root_key", &["root_key"][..]),
+            (
+                "idx_index_directory_manifest_parent_key",
+                &["parent_key"][..],
+            ),
             (
                 "idx_index_entries_batch_root_parent",
                 &["batch_id", "root_key", "parent_key"][..],
@@ -2579,8 +2708,106 @@ mod tests {
     use crate::core::targeted_index_scanner::{DirectoryFingerprint, TargetedIndexScanner};
     use std::cell::{Cell, RefCell};
     use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tempfile::TempDir;
+
+    #[test]
+    fn legacy_delta_batch_schema_is_upgraded_before_runtime_commit() {
+        let path = temp_db_path("legacy-delta-batch-schema");
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute_batch(
+                    r#"
+                    CREATE TABLE index_delta_batches (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        generation INTEGER NOT NULL UNIQUE CHECK (generation >= 0),
+                        status TEXT NOT NULL CHECK (status IN ('pending', 'committed')),
+                        created_at_ms INTEGER NOT NULL,
+                        committed_at_ms INTEGER,
+                        CHECK (
+                            (status = 'pending' AND committed_at_ms IS NULL)
+                            OR (status = 'committed' AND committed_at_ms IS NOT NULL)
+                        )
+                    );
+                    "#,
+                )
+                .unwrap();
+        }
+
+        let storage = SqliteStorage::open(path.clone()).unwrap();
+        let baseline_id = storage.save_completed_index_batch(1, &[]).unwrap();
+        storage
+            .activate_baseline_and_clear_incremental_state(baseline_id, 0)
+            .unwrap();
+        storage
+            .commit_incremental_batch(
+                &CommittedIndexDelta {
+                    generation: 1,
+                    upserts: vec![indexed_entry("/root/new.txt")],
+                    removals: Vec::new(),
+                },
+                &[],
+                &[],
+            )
+            .unwrap();
+
+        assert_eq!(storage.highest_committed_generation().unwrap(), 1);
+        drop(storage);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn opening_storage_waits_for_a_short_lived_migration_lock() {
+        let path = temp_db_path("startup-storage-lock");
+        let storage = SqliteStorage::open(path.clone()).unwrap();
+        storage
+            .connection
+            .execute_batch("BEGIN EXCLUSIVE;")
+            .unwrap();
+
+        let reopen_path = path.clone();
+        let reopened = std::thread::spawn(move || SqliteStorage::open(reopen_path));
+        std::thread::sleep(Duration::from_secs(6));
+        storage.connection.execute_batch("COMMIT;").unwrap();
+
+        assert!(reopened.join().unwrap().is_ok());
+        drop(storage);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn reopening_storage_does_not_require_an_exclusive_manifest_index_rebuild() {
+        let path = temp_db_path("manifest-index-read-lock");
+        let storage = SqliteStorage::open(path.clone()).unwrap();
+        let reader = Connection::open(&path).unwrap();
+        reader.execute_batch("BEGIN;").unwrap();
+        let mut statement = reader
+            .prepare("SELECT path FROM index_directory_manifest")
+            .unwrap();
+        let mut rows = statement.query([]).unwrap();
+        let _ = rows.next().unwrap();
+
+        let (completed_tx, completed_rx) = std::sync::mpsc::sync_channel(1);
+        let reopen_path = path.clone();
+        let reopen = std::thread::spawn(move || {
+            let result = SqliteStorage::open(reopen_path);
+            let _ = completed_tx.send(result.is_ok());
+            result
+        });
+        let reopened_without_waiting_for_reader = completed_rx
+            .recv_timeout(Duration::from_millis(500))
+            .unwrap_or(false);
+
+        drop(rows);
+        drop(statement);
+        reader.execute_batch("COMMIT;").unwrap();
+        assert!(reopen.join().unwrap().is_ok());
+        assert!(reopened_without_waiting_for_reader);
+
+        drop(storage);
+        let _ = fs::remove_file(path);
+    }
 
     #[test]
     fn migration_creates_incremental_index_tables_without_losing_legacy_snapshot() {
@@ -2755,7 +2982,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_reads_legacy_baseline_before_incompatible_runtime_state() {
+    fn recovery_reads_legacy_baseline_after_runtime_state_migration() {
         let path = temp_db_path("runtime-state-missing-generation");
         {
             let connection = Connection::open(&path).unwrap();
@@ -2780,9 +3007,51 @@ mod tests {
         let recovery = crate::core::index_journal::recover_layered_index(&storage);
 
         assert_eq!(recovery.baseline_entry_count(), 1);
+        assert_eq!(recovery.degradation_code(), None);
+
+        drop(storage);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn migration_upgrades_legacy_runtime_state_before_recovery_queries_it() {
+        let path = temp_db_path("legacy-runtime-state-columns");
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute_batch(
+                    r#"
+                    CREATE TABLE index_batches (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        completed_at_ms INTEGER NOT NULL,
+                        entry_count INTEGER NOT NULL
+                    );
+                    INSERT INTO index_batches (completed_at_ms, entry_count) VALUES (10, 1);
+                    CREATE TABLE index_runtime_state (
+                        singleton INTEGER PRIMARY KEY,
+                        last_generation INTEGER NOT NULL,
+                        degradation_code TEXT,
+                        baseline_refresh_reason TEXT
+                    );
+                    INSERT INTO index_runtime_state
+                        (singleton, last_generation, degradation_code, baseline_refresh_reason)
+                    VALUES (1, 1, NULL, NULL);
+                    "#,
+                )
+                .unwrap();
+        }
+
+        let storage = SqliteStorage::open(path.clone()).unwrap();
+
         assert_eq!(
-            recovery.degradation_code(),
-            Some(crate::core::index_journal::IndexDegradationCode::JournalReplayFailed)
+            storage.runtime_state().unwrap(),
+            Some(IncrementalRuntimeState {
+                active_baseline_id: Some(1),
+                baseline_generation: 0,
+                last_generation: 1,
+                degradation_code: None,
+                baseline_refresh_reason: None,
+            })
         );
 
         drop(storage);

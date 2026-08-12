@@ -25,7 +25,7 @@ use crate::core::index_refresh_orchestrator::{
     SystemRefreshWorkerSpawner,
 };
 use crate::core::index_scanner::{IndexPathRules, IndexScanPlan, IndexScanStage};
-use crate::core::index_watcher::RuntimeIndexWatcher;
+use crate::core::index_watcher::{RuntimeIndexWatcher, WatcherFailure};
 use crate::core::layered_index::{CommittedIndexDelta, LayeredSearchIndex};
 use crate::core::platform::{
     CommandSafetyChecker, CommandSafetyDecision, DevelopmentToolAdapter, HotkeyKey, HotkeyState,
@@ -52,7 +52,7 @@ use crate::core::targeted_index_scanner::{
 };
 use keytap::{EventKind, Key, Tap};
 use serde::Serialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
@@ -148,6 +148,10 @@ impl StartupIndexingGate {
         !self.worker_scheduled.load(Ordering::Acquire)
             && !self.retry_attempted.swap(true, Ordering::AcqRel)
     }
+}
+
+fn release_startup_indexing_after_setup(gate: &StartupIndexingGate) {
+    gate.release_after_setup();
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1063,8 +1067,9 @@ fn prepare_config_revision_candidate_with_registration_boundary(
     let starting_generation = storage
         .highest_committed_generation()
         .map_err(|error| error.to_string())?;
+    let rules = runtime_index_rules(&config, roots.clone())?;
     let capture_watcher =
-        RuntimeIndexWatcher::watch_roots(roots.clone()).map_err(|failure| failure.message)?;
+        runtime_index_watcher(roots.clone(), &rules).map_err(|failure| failure.message)?;
     let mut session = RuntimeCalibrationSession::new(revision, starting_generation);
     session
         .mark_capture_registered()
@@ -1091,15 +1096,6 @@ fn prepare_config_revision_candidate_with_registration_boundary(
         .mark_calibration_complete(starting_generation)
         .map_err(|error| format!("config calibration transition failed: {error:?}"))?;
     let buffered_capture_events = capture_tail();
-    let options = build_scan_options(&config);
-    let rules = IndexPathRules::from_plan(&IndexScanPlan {
-        include_roots: roots.clone(),
-        exclude_dirs: options.exclude_dirs,
-        exclude_patterns: options.exclude_patterns,
-        respect_project_ignores: options.respect_project_ignores,
-        stage: None,
-    })
-    .map_err(|error| error.to_string())?;
     Ok(ConfigRevisionCandidate {
         config,
         roots,
@@ -1258,17 +1254,18 @@ fn transition_runtime_config_revision_with_hooks(
             }
         };
         rollback_entries = entries_after_committed_deltas(rollback_entries, &rollback_tail);
-        let successor_watcher = match RuntimeIndexWatcher::watch_roots(candidate.roots.clone()) {
-            Ok(watcher) => watcher,
-            Err(failure) => {
-                return Err(restore_fenced_config_service(
-                    state,
-                    previous,
-                    previous_service,
-                    failure.message,
-                ));
-            }
-        };
+        let successor_watcher =
+            match runtime_index_watcher(candidate.roots.clone(), &candidate.rules) {
+                Ok(watcher) => watcher,
+                Err(failure) => {
+                    return Err(restore_fenced_config_service(
+                        state,
+                        previous,
+                        previous_service,
+                        failure.message,
+                    ));
+                }
+            };
         let inbox = match candidate.capture_watcher.take_inbox() {
             Some(inbox) => inbox,
             None => {
@@ -2212,7 +2209,9 @@ fn config_file_path() -> Option<PathBuf> {
 }
 
 fn storage_store() -> Option<SqliteStorage> {
-    SqliteStorage::open(storage_file_path()?).ok()
+    SqliteStorage::open(storage_file_path()?)
+        .inspect_err(|error| eprintln!("QuickFox storage initialization failed: {error}"))
+        .ok()
 }
 
 fn storage_file_path() -> Option<PathBuf> {
@@ -2413,7 +2412,9 @@ fn schedule_startup_indexing_in_setup<R: tauri::Runtime>(
             .index
             .watcher_enabled;
         if enabled {
-            let _ = start_background_index_refresh(worker_app.clone(), &state);
+            if let Err(error) = start_background_index_refresh(worker_app.clone(), &state) {
+                record_startup_index_refresh_failure(&worker_app, &error);
+            }
         }
     })
 }
@@ -2434,6 +2435,17 @@ fn record_startup_scheduling_failure<R: tauri::Runtime>(app: &tauri::AppHandle<R
         );
         runtime.index_status()
     };
+    let _ = app.emit("quickfox://index-status", status);
+}
+
+fn record_startup_index_refresh_failure<R: tauri::Runtime>(app: &tauri::AppHandle<R>, error: &str) {
+    eprintln!("QuickFox startup index refresh failed: {error}");
+    let state = app.state::<QuickFoxAppState>();
+    let status = state
+        .runtime
+        .lock()
+        .expect("quickfox runtime lock poisoned")
+        .index_status();
     let _ = app.emit("quickfox://index-status", status);
 }
 
@@ -2970,22 +2982,21 @@ fn start_background_index_refresh_with_spawner<R: tauri::Runtime>(
                     matches!(persistence, BaselinePersistenceOutcome::Completed(_));
                 let app_for_state = app_for_update.clone();
                 let persistence_identity = identity.clone();
-                let persistence_tail_deltas =
-                    if baseline_persistence_completed && !should_build_content_index {
-                        match finalize_durable_refresh_successor(
-                            &persistence_state,
-                            &identity,
-                            authoritative_generation,
-                        ) {
-                            Ok(tail) => tail,
-                            Err(error) => {
-                                persistence = BaselinePersistenceOutcome::Failed(error);
-                                Vec::new()
-                            }
+                let persistence_tail_deltas = if baseline_persistence_completed {
+                    match finalize_durable_refresh_successor(
+                        &persistence_state,
+                        &identity,
+                        authoritative_generation,
+                    ) {
+                        Ok(tail) => tail,
+                        Err(error) => {
+                            persistence = BaselinePersistenceOutcome::Failed(error);
+                            Vec::new()
                         }
-                    } else {
-                        Vec::new()
-                    };
+                    }
+                } else {
+                    Vec::new()
+                };
                 update_result = app_for_update.run_on_main_thread(move || {
                     let state = app_for_state.state::<QuickFoxAppState>();
                     match apply_baseline_persistence_outcome_for_identity(
@@ -3013,10 +3024,12 @@ fn start_background_index_refresh_with_spawner<R: tauri::Runtime>(
                             let _ =
                                 app_for_state.emit("quickfox://index-status", application.status);
                             if should_restart {
-                                let _ = restart_runtime_incremental_indexing(
+                                if let Err(error) = restart_runtime_incremental_indexing(
                                     app_for_state.clone(),
                                     &state,
-                                );
+                                ) {
+                                    eprintln!("QuickFox runtime watcher startup failed: {error}");
+                                }
                             }
                         }
                         BaselinePersistenceApplicationOutcome::Superseded => {
@@ -3608,10 +3621,6 @@ fn prepare_index_refresh_handoff(
         }
     }
 
-    let successor_watcher = RuntimeIndexWatcher::watch_roots(roots.clone()).map_err(|failure| {
-        record_index_refresh_runtime_failure(state, identity, RuntimeRestartFailureKind::Watcher);
-        failure.message
-    })?;
     let capture_storage = storage_store().ok_or_else(|| {
         record_index_refresh_runtime_failure(state, identity, RuntimeRestartFailureKind::Storage);
         "index journal storage is unavailable".to_owned()
@@ -3637,6 +3646,10 @@ fn prepare_index_refresh_handoff(
     .map_err(|error| {
         record_index_refresh_runtime_failure(state, identity, RuntimeRestartFailureKind::Rules);
         error.to_string()
+    })?;
+    let successor_watcher = runtime_index_watcher(roots.clone(), &rules).map_err(|failure| {
+        record_index_refresh_runtime_failure(state, identity, RuntimeRestartFailureKind::Watcher);
+        failure.message
     })?;
     let capture_handle = start_runtime_indexing(
         capture_watcher,
@@ -3819,7 +3832,8 @@ fn finalize_durable_refresh_successor_with_storage(
         (runtime.config.clone(), runtime.index.watched_roots())
     };
     let roots = refresh_capture_roots(&config, recovered_roots)?;
-    let standby = RuntimeIndexWatcher::watch_roots(roots).map_err(|failure| failure.message)?;
+    let rules = runtime_index_rules(&config, roots.clone())?;
+    let standby = runtime_index_watcher(roots, &rules).map_err(|failure| failure.message)?;
     let handle = {
         let _fence = state
             .index_refresh_fence
@@ -3951,6 +3965,7 @@ fn prepare_refresh_standby_capture(
         .index
         .watched_roots();
     let roots = refresh_capture_roots(config, recovered_roots)?;
+    let rules = runtime_index_rules(config, roots.clone())?;
     let _fence = state
         .index_refresh_fence
         .lock()
@@ -3970,7 +3985,7 @@ fn prepare_refresh_standby_capture(
     {
         return Ok(());
     }
-    let watcher = RuntimeIndexWatcher::watch_roots(roots).map_err(|failure| failure.message)?;
+    let watcher = runtime_index_watcher(roots, &rules).map_err(|failure| failure.message)?;
     runtime.index_refresh.standby_watcher = Some(watcher);
     Ok(())
 }
@@ -4448,10 +4463,10 @@ fn apply_baseline_persistence_outcome(
 fn should_restart_after_baseline_persistence(
     state: &QuickFoxAppState,
     application: &BaselinePersistenceApplication,
-    should_build_content_index: bool,
+    _should_build_content_index: bool,
 ) -> bool {
     if application.completed {
-        return !should_build_content_index;
+        return true;
     }
     if matches!(
         application.status.availability,
@@ -4645,9 +4660,23 @@ fn restart_runtime_incremental_indexing<R: tauri::Runtime>(
         return Ok(());
     }
 
+    let rules = match runtime_index_rules(&config, roots.clone()) {
+        Ok(rules) => rules,
+        Err(error) => {
+            publish_runtime_restart_failure_for_snapshot(
+                app.clone(),
+                state,
+                config_revision,
+                &config_fingerprint,
+                &roots,
+                RuntimeRestartFailureKind::Rules,
+            );
+            return Err(error);
+        }
+    };
     let watcher = match standby_watcher {
         Some(watcher) => watcher,
-        None => match RuntimeIndexWatcher::watch_roots(roots.clone()) {
+        None => match runtime_index_watcher(roots.clone(), &rules) {
             Ok(watcher) => watcher,
             Err(failure) => {
                 let message = failure.message.clone();
@@ -4662,27 +4691,6 @@ fn restart_runtime_incremental_indexing<R: tauri::Runtime>(
                 return Err(message);
             }
         },
-    };
-    let options = build_scan_options(&config);
-    let rules = match IndexPathRules::from_plan(&IndexScanPlan {
-        include_roots: roots.clone(),
-        exclude_dirs: options.exclude_dirs,
-        exclude_patterns: options.exclude_patterns,
-        respect_project_ignores: options.respect_project_ignores,
-        stage: None,
-    }) {
-        Ok(rules) => rules,
-        Err(error) => {
-            publish_runtime_restart_failure_for_snapshot(
-                app.clone(),
-                state,
-                config_revision,
-                &config_fingerprint,
-                &roots,
-                RuntimeRestartFailureKind::Rules,
-            );
-            return Err(error.to_string());
-        }
     };
     let scanner = TargetedIndexScanner::new(rules);
     let journal = match storage_store() {
@@ -4720,15 +4728,16 @@ fn restart_runtime_incremental_indexing<R: tauri::Runtime>(
             return Ok(());
         }
     }
+    let runtime_options = RuntimeIndexingOptions {
+        roots,
+        policy: crate::core::index_update_coordinator::CoordinatorPolicy::production(),
+        initial_generation,
+    };
     let handle = match start_runtime_indexing(
         watcher,
         scanner,
         Box::new(journal),
-        RuntimeIndexingOptions {
-            roots,
-            policy: crate::core::index_update_coordinator::CoordinatorPolicy::production(),
-            initial_generation,
-        },
+        runtime_options,
         move |event| publish_runtime_indexing_event(publish_app.clone(), publish_service, event),
     ) {
         Ok(handle) => handle,
@@ -4851,6 +4860,34 @@ fn runtime_watch_roots(config: &QuickFoxConfig, index: &LayeredSearchIndex) -> V
             .filter(|root| root.is_dir()),
     );
     roots.into_iter().collect()
+}
+
+fn runtime_index_rules(
+    config: &QuickFoxConfig,
+    roots: Vec<PathBuf>,
+) -> Result<IndexPathRules, String> {
+    let options = build_scan_options(config);
+    IndexPathRules::from_plan(&IndexScanPlan {
+        include_roots: roots,
+        exclude_dirs: options.exclude_dirs,
+        exclude_patterns: options.exclude_patterns,
+        respect_project_ignores: options.respect_project_ignores,
+        stage: None,
+    })
+    .map_err(|error| error.to_string())
+}
+
+fn runtime_index_watcher(
+    roots: Vec<PathBuf>,
+    rules: &IndexPathRules,
+) -> Result<RuntimeIndexWatcher, WatcherFailure> {
+    let filter_rules = rules.clone();
+    RuntimeIndexWatcher::watch_roots_with_filter(
+        roots,
+        Arc::new(move |path: &Path| {
+            filter_rules.configured_root_for(path).is_some() && !filter_rules.is_excluded(path)
+        }),
+    )
 }
 
 fn publish_runtime_indexing_event<R: tauri::Runtime>(
@@ -6419,6 +6456,7 @@ pub fn run() {
             ) {
                 record_startup_scheduling_failure(app.handle(), &error);
             }
+            release_startup_indexing_after_setup(&setup_startup_gate);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -6442,7 +6480,7 @@ pub fn run() {
         .expect("error while building QuickFox")
         .run(move |app, event| match event {
             RunEvent::Ready => {
-                startup_gate.release_after_setup();
+                release_startup_indexing_after_setup(&startup_gate);
                 if startup_gate.claim_retry() {
                     if let Err(error) = schedule_startup_indexing_in_setup(
                         app.clone(),
@@ -6927,6 +6965,45 @@ mod tests {
         assert!(!ran.load(std::sync::atomic::Ordering::Acquire));
         gate.release_after_setup();
         join.join().unwrap();
+        assert!(ran.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[test]
+    fn setup_release_unblocks_startup_indexing_without_ready_event() {
+        type PendingStartupJob = Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>;
+
+        struct CapturingSpawner {
+            pending: PendingStartupJob,
+        }
+
+        impl RefreshWorkerSpawner for CapturingSpawner {
+            fn spawn(&self, task: Box<dyn FnOnce() + Send>) -> Result<(), String> {
+                *self.pending.lock().unwrap() = Some(task);
+                Ok(())
+            }
+        }
+
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ran_from_job = Arc::clone(&ran);
+        let pending = Arc::new(Mutex::new(None::<Box<dyn FnOnce() + Send>>));
+        let spawner = CapturingSpawner {
+            pending: Arc::clone(&pending),
+        };
+        let gate = Arc::new(StartupIndexingGate::default());
+
+        schedule_startup_indexing_with(&spawner, Arc::clone(&gate), move || {
+            ran_from_job.store(true, std::sync::atomic::Ordering::Release)
+        })
+        .unwrap();
+
+        let worker = pending.lock().unwrap().take().unwrap();
+        let join = thread::spawn(worker);
+        std::thread::yield_now();
+        assert!(!ran.load(std::sync::atomic::Ordering::Acquire));
+
+        release_startup_indexing_after_setup(&gate);
+        join.join().unwrap();
+
         assert!(ran.load(std::sync::atomic::Ordering::Acquire));
     }
 
@@ -10915,6 +10992,12 @@ mod tests {
             crate::core::index::IndexStatusKind::Building
         );
         assert!(state.runtime.lock().unwrap().index_refresh.active.is_some());
+
+        assert!(should_restart_after_baseline_persistence(
+            &state,
+            &application,
+            true,
+        ));
     }
 
     #[test]

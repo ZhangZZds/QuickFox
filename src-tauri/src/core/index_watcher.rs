@@ -23,6 +23,7 @@ pub enum IndexWatchEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WatchSendOutcome {
     Queued,
+    Filtered,
     Overflowed,
     Disconnected,
 }
@@ -34,15 +35,23 @@ struct WatchInboxState {
     latest_degradation: Option<IndexDegradationCode>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct WatchEventSender {
     sender: SyncSender<IndexWatchEvent>,
     watched_roots: Arc<Vec<PathBuf>>,
     state: Arc<Mutex<WatchInboxState>>,
+    path_filter: Arc<dyn Fn(&Path) -> bool + Send + Sync>,
 }
 
 impl WatchEventSender {
     pub fn try_send(&self, event: IndexWatchEvent) -> WatchSendOutcome {
+        let accepted = event_paths(&event)
+            .into_iter()
+            .filter(|path| !path.as_os_str().is_empty())
+            .any(|path| (self.path_filter)(path));
+        if !accepted {
+            return WatchSendOutcome::Filtered;
+        }
         match self.sender.try_send(event) {
             Ok(()) => WatchSendOutcome::Queued,
             Err(TrySendError::Full(event)) => {
@@ -106,6 +115,14 @@ pub struct WatchEventInbox {
 
 impl WatchEventInbox {
     pub fn bounded(watched_roots: Vec<PathBuf>, capacity: usize) -> (WatchEventSender, Self) {
+        Self::bounded_filtered(watched_roots, capacity, Arc::new(|_| true))
+    }
+
+    pub fn bounded_filtered(
+        watched_roots: Vec<PathBuf>,
+        capacity: usize,
+        path_filter: Arc<dyn Fn(&Path) -> bool + Send + Sync>,
+    ) -> (WatchEventSender, Self) {
         let (sender, receiver) = mpsc::sync_channel(capacity);
         let state = Arc::new(Mutex::new(WatchInboxState::default()));
         (
@@ -113,6 +130,7 @@ impl WatchEventInbox {
                 sender,
                 watched_roots: Arc::new(watched_roots),
                 state: Arc::clone(&state),
+                path_filter,
             },
             Self { receiver, state },
         )
@@ -244,15 +262,26 @@ pub struct RuntimeIndexWatcher {
 
 impl RuntimeIndexWatcher {
     pub fn watch_roots(roots: Vec<PathBuf>) -> Result<Self, WatcherFailure> {
-        Self::watch_roots_with_probe_parent(roots, None)
+        Self::watch_roots_with_filter(roots, Arc::new(|_| true))
+    }
+
+    pub fn watch_roots_with_filter(
+        roots: Vec<PathBuf>,
+        path_filter: Arc<dyn Fn(&Path) -> bool + Send + Sync>,
+    ) -> Result<Self, WatcherFailure> {
+        Self::watch_roots_with_probe_parent(roots, None, path_filter)
     }
 
     fn watch_roots_with_probe_parent(
         roots: Vec<PathBuf>,
         probe_parent: Option<&Path>,
+        path_filter: Arc<dyn Fn(&Path) -> bool + Send + Sync>,
     ) -> Result<Self, WatcherFailure> {
-        let (callback_sender, inbox) =
-            WatchEventInbox::bounded(roots.clone(), DEFAULT_WATCH_CHANNEL_CAPACITY);
+        let (callback_sender, inbox) = WatchEventInbox::bounded_filtered(
+            roots.clone(),
+            DEFAULT_WATCH_CHANNEL_CAPACITY,
+            path_filter,
+        );
         let mut builder = tempfile::Builder::new();
         builder.prefix("quickfox-watcher-probe-");
         let registration_probe = match probe_parent {
@@ -532,6 +561,33 @@ mod tests {
     }
 
     #[test]
+    fn filtered_events_are_dropped_before_the_bounded_channel_can_overflow() {
+        let root = PathBuf::from("/Users/example");
+        let excluded = root.join("Library/Application Support/QuickFox/quickfox.sqlite");
+        let included = root.join("workspace/cann/new.txt");
+        let (sender, inbox) = WatchEventInbox::bounded_filtered(
+            vec![root],
+            1,
+            Arc::new(|path| !path.starts_with("/Users/example/Library")),
+        );
+
+        assert_eq!(
+            sender.try_send(IndexWatchEvent::Write(excluded)),
+            WatchSendOutcome::Filtered
+        );
+        assert_eq!(
+            sender.try_send(IndexWatchEvent::Create(included.clone())),
+            WatchSendOutcome::Queued
+        );
+        assert_eq!(
+            inbox.recv_timeout(Duration::from_millis(10)),
+            Ok(IndexWatchEvent::Create(included))
+        );
+        assert!(inbox.take_dirty_roots().is_empty());
+        assert!(inbox.take_degradation_code().is_none());
+    }
+
+    #[test]
     fn runtime_watcher_owns_an_inbox_until_it_is_taken() {
         let root = tempfile::tempdir().unwrap();
         let mut watcher =
@@ -579,6 +635,7 @@ mod tests {
         let watcher = RuntimeIndexWatcher::watch_roots_with_probe_parent(
             vec![watched_root.canonicalize().unwrap()],
             Some(&probe_parent),
+            Arc::new(|_| true),
         )
         .unwrap();
         let owned_probe = watcher._registration_probe.path().to_path_buf();
