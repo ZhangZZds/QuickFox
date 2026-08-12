@@ -28,7 +28,7 @@
 ## Verification
 
 - `npm run check`
-  - 108 个前端测试通过
+  - 313 个前端测试通过
   - 520 个 Rust 测试通过，6 个显式 release/benchmark 测试按设计忽略
   - Prettier、ESLint、TypeScript、Vite build、rustfmt、Clippy 全部通过
 - `openspec validate --all --strict`：8/8 通过

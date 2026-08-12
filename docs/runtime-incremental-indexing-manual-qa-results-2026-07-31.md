@@ -84,7 +84,7 @@
 
 ## 2026-08-11 v1.6.0 发布决定
 
-- 最终 `npm run check` 通过：108 个前端测试、520 个 Rust 测试通过，6 个显式
+- 最终 `npm run check` 通过：313 个前端测试、520 个 Rust 测试通过，6 个显式
   release/benchmark 测试按设计忽略；Prettier、ESLint、前端构建、rustfmt 和 Clippy
   均 exit 0。
 - `openspec validate --all --strict` 通过 8 个主规范，三个相关 change 已同步归档。
