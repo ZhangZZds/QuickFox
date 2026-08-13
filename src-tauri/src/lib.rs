@@ -2308,7 +2308,7 @@ fn load_startup_config() -> QuickFoxConfig {
                 eprintln!("QuickFox safe Windows index-default migration failed: {error:?}");
             }
         }
-        return config;
+        config
     }
     #[cfg(not(target_os = "windows"))]
     config
@@ -2612,11 +2612,11 @@ fn user_hot_path_roots() -> Vec<PathBuf> {
 fn remaining_drive_roots(configured_roots: &[PathBuf]) -> Vec<PathBuf> {
     #[cfg(target_os = "windows")]
     {
-        return windows_existing_drive_roots()
+        windows_existing_drive_roots()
             .into_iter()
             .map(PathBuf::from)
             .filter(|path| !configured_roots.iter().any(|root| root == path))
-            .collect();
+            .collect()
     }
 
     #[cfg(not(target_os = "windows"))]

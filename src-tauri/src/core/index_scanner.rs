@@ -1001,7 +1001,9 @@ fn path_to_string(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::index::{IndexFailure, IndexedEntryKind};
+    #[cfg(unix)]
+    use crate::core::index::IndexFailure;
+    use crate::core::index::IndexedEntryKind;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 

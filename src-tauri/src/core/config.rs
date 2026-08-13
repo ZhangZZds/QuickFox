@@ -233,12 +233,12 @@ fn default_content_include_dirs() -> Vec<String> {
 
     #[cfg(target_os = "windows")]
     {
-        return ["Desktop", "桌面"]
+        ["Desktop", "桌面"]
             .into_iter()
             .map(|name| home.join(name))
             .filter(|path| path.is_dir())
             .map(path_to_config_string)
-            .collect();
+            .collect()
     }
 
     #[cfg(not(target_os = "windows"))]
