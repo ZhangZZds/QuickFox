@@ -10602,11 +10602,16 @@ mod tests {
                 Err("injected spawn failure".to_owned())
             }
         }
-        let config = QuickFoxConfig::default_with_index_dirs(vec!["/tmp".to_owned()]);
+        let temp = tempfile::tempdir().unwrap();
+        let watched_root = temp.path().join("standby-root");
+        fs::create_dir_all(&watched_root).unwrap();
+        let config = QuickFoxConfig::default_with_index_dirs(vec![watched_root
+            .to_string_lossy()
+            .into_owned()]);
         let mut runtime = build_runtime_from_snapshot(config, None);
         let refresh = begin_runtime_index_refresh(&mut runtime).unwrap();
         runtime.index_refresh.standby_watcher =
-            Some(RuntimeIndexWatcher::watch_roots(vec![PathBuf::from("/tmp")]).unwrap());
+            Some(RuntimeIndexWatcher::watch_roots(vec![watched_root]).unwrap());
         let state = QuickFoxAppState {
             runtime: Mutex::new(runtime),
             index_refresh_fence: Mutex::new(()),
@@ -12391,8 +12396,10 @@ mod tests {
         flush_and_replay_runtime_calibration(&control, &state, &storage).unwrap();
 
         assert!(callback_acquired_runtime.load(Ordering::Acquire));
+        let durable_generation = storage.highest_committed_generation().unwrap();
         let mut runtime = state.runtime.lock().unwrap();
-        assert_eq!(runtime.index.generation(), 1);
+        assert!(durable_generation >= 1);
+        assert_eq!(runtime.index.generation(), durable_generation);
         assert!(runtime
             .index
             .search_files(
