@@ -64,5 +64,50 @@ jobs:
           npm run test
           npm run rust:test
 
+      - name: Diagnose Windows test loader failure
+        if: failure() && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $testBinary = Get-ChildItem src-tauri/target/debug/deps/quickfox_lib-*.exe |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+          if (-not $testBinary) {
+            Write-Host "QuickFox Rust test binary was not produced."
+            exit 0
+          }
+
+          Write-Host "Test binary: $($testBinary.FullName)"
+          $dumpbin = Get-ChildItem "${env:ProgramFiles}\Microsoft Visual Studio\2022" `
+            -Filter dumpbin.exe -Recurse -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+          if ($dumpbin) {
+            & $dumpbin.FullName /DEPENDENTS $testBinary.FullName
+            & $dumpbin.FullName /IMPORTS $testBinary.FullName
+          }
+
+          Get-WinEvent -FilterHashtable @{
+            LogName = 'Application'
+            StartTime = (Get-Date).AddMinutes(-15)
+          } -ErrorAction SilentlyContinue |
+            Where-Object { $_.Message -like '*quickfox_lib*' } |
+            Select-Object -First 10 |
+            Format-List TimeCreated, ProviderName, Id, LevelDisplayName, Message
+
+          $gflags = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\Debuggers" `
+            -Filter gflags.exe -Recurse -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -like '*\x64\*' } |
+            Select-Object -First 1
+          $cdb = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\Debuggers" `
+            -Filter cdb.exe -Recurse -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -like '*\x64\*' } |
+            Select-Object -First 1
+          if ($gflags -and $cdb) {
+            & $gflags.FullName /i $testBinary.Name +sls
+            & $cdb.FullName -c 'g;q' $testBinary.FullName --list
+            & $gflags.FullName /i $testBinary.Name -sls
+          } else {
+            Write-Host "Windows SDK loader-snap tools are unavailable on this runner."
+          }
+
       - name: Build frontend
         run: npm run build
