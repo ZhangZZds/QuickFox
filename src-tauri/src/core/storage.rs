@@ -17,6 +17,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+const BASELINE_WRITE_CHUNK_SIZE: usize = 2_048;
+const BASELINE_DELETE_CHUNK_SIZE: usize = 4_096;
+const MIN_FREE_DISK_RESERVE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+const MAX_BASELINE_ESTIMATED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
 const TARGETED_DIRECT_JOURNAL_SQL: &str = r#"
     SELECT batches.generation, entries.ordinal, entries.operation, entries.path, entries.entry_json
     FROM index_delta_entries AS entries INDEXED BY idx_index_delta_entries_parent_batch
@@ -125,17 +130,29 @@ impl SqliteStorage {
         path: PathBuf,
         comparison_mode: PathComparisonMode,
     ) -> Result<Self, StorageError> {
+        let initialize_auto_vacuum = !path.exists()
+            || std::fs::metadata(&path)
+                .map(|metadata| metadata.len() == 0)
+                .unwrap_or(false);
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
         let connection = Connection::open(path)?;
         connection.busy_timeout(Duration::from_secs(10))?;
+        if initialize_auto_vacuum {
+            connection.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
+        }
+        connection.pragma_update(None, "journal_mode", "WAL")?;
+        connection.pragma_update(None, "synchronous", "NORMAL")?;
+        connection.pragma_update(None, "wal_autocheckpoint", 1_000)?;
+        connection.pragma_update(None, "journal_size_limit", 64 * 1024 * 1024_i64)?;
         connection.pragma_update(None, "foreign_keys", true)?;
         let storage = Self {
             connection,
             comparison_mode,
         };
         storage.migrate()?;
+        storage.discard_incomplete_index_batches()?;
         Ok(storage)
     }
 
@@ -168,7 +185,9 @@ impl SqliteStorage {
             CREATE TABLE IF NOT EXISTS index_batches (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 completed_at_ms INTEGER NOT NULL,
-                entry_count INTEGER NOT NULL
+                entry_count INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'completed'
+                    CHECK (status IN ('building', 'completed'))
             );
 
             CREATE TABLE IF NOT EXISTS index_entries (
@@ -226,6 +245,7 @@ impl SqliteStorage {
             );
             "#,
         )?;
+        Self::ensure_index_batch_status_column(&transaction)?;
         Self::ensure_runtime_state_schema(&transaction)?;
         Self::ensure_delta_batch_schema(&transaction)?;
         Self::ensure_index_entry_metadata_columns(&transaction)?;
@@ -274,6 +294,43 @@ impl SqliteStorage {
         Ok(())
     }
 
+    fn ensure_index_batch_status_column(connection: &Connection) -> Result<(), StorageError> {
+        if !table_columns(connection, "index_batches")?.contains("status") {
+            connection.execute_batch(
+                r#"
+                ALTER TABLE index_batches
+                ADD COLUMN status TEXT NOT NULL DEFAULT 'completed'
+                    CHECK (status IN ('building', 'completed'));
+                "#,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn discard_incomplete_index_batches(&self) -> Result<(), StorageError> {
+        loop {
+            let removed = self.connection.execute(
+                r#"
+                DELETE FROM index_entries
+                WHERE rowid IN (
+                    SELECT entries.rowid
+                    FROM index_entries AS entries
+                    JOIN index_batches AS batches ON batches.id = entries.batch_id
+                    WHERE batches.status = 'building'
+                    LIMIT ?1
+                )
+                "#,
+                params![BASELINE_DELETE_CHUNK_SIZE as i64],
+            )?;
+            if removed == 0 {
+                break;
+            }
+        }
+        self.connection
+            .execute("DELETE FROM index_batches WHERE status = 'building'", [])?;
+        Ok(())
+    }
+
     fn ensure_runtime_state_schema(connection: &Connection) -> Result<(), StorageError> {
         let columns = table_columns(connection, "index_runtime_state")?;
         let required = [
@@ -300,7 +357,7 @@ impl SqliteStorage {
         let active_baseline = if columns.contains("active_baseline_id") {
             "active_baseline_id"
         } else {
-            "(SELECT MAX(id) FROM index_batches)"
+            "(SELECT MAX(id) FROM index_batches WHERE status = 'completed')"
         };
         let baseline_generation = if columns.contains("baseline_generation") {
             "baseline_generation"
@@ -668,6 +725,10 @@ impl SqliteStorage {
             return Ok(false);
         }
         let required_tables = [
+            (
+                "index_batches",
+                &["id", "completed_at_ms", "entry_count", "status"][..],
+            ),
             ("index_entries", &["path_key", "root_key", "parent_key"][..]),
             (
                 "index_delta_batches",
@@ -1425,68 +1486,186 @@ impl SqliteStorage {
         completed_at_ms: i64,
         entries: &[IndexedEntry],
     ) -> Result<i64, StorageError> {
+        self.ensure_baseline_storage_budget(entries)?;
         let transaction = self.connection.unchecked_transaction()?;
         transaction.execute(
             r#"
-            INSERT INTO index_batches (completed_at_ms, entry_count)
-            VALUES (?1, ?2)
+            INSERT INTO index_batches (completed_at_ms, entry_count, status)
+            VALUES (?1, ?2, 'building')
             "#,
             params![completed_at_ms, entries.len() as i64],
         )?;
         let batch_id = transaction.last_insert_rowid();
+        transaction.commit()?;
 
-        {
-            let mut statement = transaction.prepare(
-                r#"
-                INSERT INTO index_entries
-                    (
-                        batch_id,
-                        path,
-                        name,
-                        kind,
-                        search_text,
-                        updated_at_ms,
-                        parent,
-                        extension,
-                        depth,
-                        root,
-                        modified_ms,
-                        size_bytes,
-                        content_index_state,
-                        path_key,
-                        root_key,
-                        parent_key
-                    )
-                VALUES (
-                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
-                    ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16
-                )
-                "#,
+        let write_result = (|| -> Result<(), StorageError> {
+            for chunk in entries.chunks(BASELINE_WRITE_CHUNK_SIZE) {
+                let transaction = self.connection.unchecked_transaction()?;
+                {
+                    let mut statement = transaction.prepare(
+                        r#"
+                        INSERT INTO index_entries
+                            (
+                                batch_id,
+                                path,
+                                name,
+                                kind,
+                                search_text,
+                                updated_at_ms,
+                                parent,
+                                extension,
+                                depth,
+                                root,
+                                modified_ms,
+                                size_bytes,
+                                content_index_state,
+                                path_key,
+                                root_key,
+                                parent_key
+                            )
+                        VALUES (
+                            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+                            ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16
+                        )
+                        "#,
+                    )?;
+                    for entry in chunk {
+                        statement.execute(params![
+                            batch_id,
+                            entry.path,
+                            entry.name,
+                            index_kind_to_storage(&entry.kind),
+                            "",
+                            completed_at_ms,
+                            nullable_text(&entry.parent),
+                            entry.extension.as_deref(),
+                            entry.depth as i64,
+                            nullable_text(&entry.root),
+                            entry.modified_ms,
+                            entry.size_bytes.map(|size| size as i64),
+                            content_index_state_to_storage(&entry.content_index_state),
+                            normalize_path_text_key_for_mode(&entry.path, self.comparison_mode),
+                            normalize_path_text_key_for_mode(&entry.root, self.comparison_mode),
+                            normalize_path_text_key_for_mode(&entry.parent, self.comparison_mode),
+                        ])?;
+                    }
+                }
+                transaction.commit()?;
+            }
+
+            let transaction = self.connection.unchecked_transaction()?;
+            let updated = transaction.execute(
+                "UPDATE index_batches SET status = 'completed' WHERE id = ?1 AND status = 'building'",
+                params![batch_id],
             )?;
-            for entry in entries {
-                statement.execute(params![
-                    batch_id,
-                    entry.path,
-                    entry.name,
-                    index_kind_to_storage(&entry.kind),
-                    searchable_text(entry),
-                    completed_at_ms,
-                    nullable_text(&entry.parent),
-                    entry.extension.as_deref(),
-                    entry.depth as i64,
-                    nullable_text(&entry.root),
-                    entry.modified_ms,
-                    entry.size_bytes.map(|size| size as i64),
-                    content_index_state_to_storage(&entry.content_index_state),
-                    normalize_path_text_key_for_mode(&entry.path, self.comparison_mode),
-                    normalize_path_text_key_for_mode(&entry.root, self.comparison_mode),
-                    normalize_path_text_key_for_mode(&entry.parent, self.comparison_mode),
-                ])?;
+            if updated != 1 {
+                return Err(StorageError::InvalidJournal(
+                    "baseline batch disappeared before completion".to_owned(),
+                ));
+            }
+            transaction.commit()?;
+            Ok(())
+        })();
+
+        if let Err(error) = write_result {
+            let _ = self.discard_incomplete_index_batches();
+            return Err(error);
+        }
+        Ok(batch_id)
+    }
+
+    fn ensure_baseline_storage_budget(&self, entries: &[IndexedEntry]) -> Result<(), StorageError> {
+        let estimated_bytes = estimated_baseline_storage_bytes(entries);
+        validate_baseline_storage_budget(estimated_bytes, u64::MAX)?;
+        let Some(database_path) = self.connection.path().map(Path::new) else {
+            return Ok(());
+        };
+        let Some(parent) = database_path.parent() else {
+            return Ok(());
+        };
+        let available_bytes = fs2::available_space(parent).map_err(|error| {
+            StorageError::InvalidJournal(format!(
+                "failed to inspect index storage free space: {error}"
+            ))
+        })?;
+        validate_baseline_storage_budget(estimated_bytes, available_bytes)
+    }
+
+    pub fn prune_index_batches_except(&self, retained_batch_id: i64) -> Result<(), StorageError> {
+        self.prune_index_batches_retaining(&[retained_batch_id])
+    }
+
+    pub fn prune_index_batches_after_checkpoint(
+        &self,
+        checkpoint_batch_id: i64,
+    ) -> Result<(), StorageError> {
+        let active_batch_id = self
+            .runtime_state()?
+            .and_then(|state| state.active_baseline_id);
+        let mut retained = vec![checkpoint_batch_id];
+        if let Some(active_batch_id) = active_batch_id.filter(|id| *id != checkpoint_batch_id) {
+            retained.push(active_batch_id);
+        }
+        self.prune_index_batches_retaining(&retained)
+    }
+
+    fn prune_index_batches_retaining(
+        &self,
+        retained_batch_ids: &[i64],
+    ) -> Result<(), StorageError> {
+        if retained_batch_ids.is_empty() {
+            return Err(StorageError::InvalidJournal(
+                "baseline cleanup must retain at least one completed batch".to_owned(),
+            ));
+        }
+        let placeholders = std::iter::repeat_n("?", retained_batch_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let completed_count = self.connection.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM index_batches WHERE status = 'completed' AND id IN ({placeholders})"
+            ),
+            params_from_iter(retained_batch_ids.iter()),
+            |row| row.get::<_, i64>(0),
+        )?;
+        if completed_count != retained_batch_ids.len() as i64 {
+            return Err(StorageError::InvalidJournal(
+                "baseline cleanup cannot discard data for a missing or incomplete retained batch"
+                    .to_owned(),
+            ));
+        }
+        let delete_entries_sql = format!(
+            r#"
+            DELETE FROM index_entries
+            WHERE rowid IN (
+                SELECT rowid
+                FROM index_entries
+                WHERE batch_id NOT IN ({placeholders})
+                LIMIT ?
+            )
+            "#
+        );
+        loop {
+            let mut values = retained_batch_ids
+                .iter()
+                .copied()
+                .map(Value::Integer)
+                .collect::<Vec<_>>();
+            values.push(Value::Integer(BASELINE_DELETE_CHUNK_SIZE as i64));
+            let removed = self
+                .connection
+                .execute(&delete_entries_sql, params_from_iter(values))?;
+            if removed == 0 {
+                break;
             }
         }
-
-        transaction.commit()?;
-        Ok(batch_id)
+        self.connection.execute(
+            &format!("DELETE FROM index_batches WHERE id NOT IN ({placeholders})"),
+            params_from_iter(retained_batch_ids.iter()),
+        )?;
+        self.connection
+            .execute_batch("PRAGMA incremental_vacuum;")?;
+        Ok(())
     }
 
     pub fn latest_index_snapshot(&self) -> Result<Option<IndexSnapshot>, StorageError> {
@@ -1496,6 +1675,7 @@ impl SqliteStorage {
                 r#"
                 SELECT id, completed_at_ms
                 FROM index_batches
+                WHERE status = 'completed'
                 ORDER BY completed_at_ms DESC, id DESC
                 LIMIT 1
                 "#,
@@ -1517,7 +1697,7 @@ impl SqliteStorage {
                 SELECT batches.id, batches.completed_at_ms
                 FROM index_runtime_state AS state
                 JOIN index_batches AS batches ON batches.id = state.active_baseline_id
-                WHERE state.singleton = 1
+                WHERE state.singleton = 1 AND batches.status = 'completed'
                 "#,
                 [],
                 |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
@@ -1552,7 +1732,7 @@ impl SqliteStorage {
         let completed_at_ms = self
             .connection
             .query_row(
-                "SELECT completed_at_ms FROM index_batches WHERE id = ?1",
+                "SELECT completed_at_ms FROM index_batches WHERE id = ?1 AND status = 'completed'",
                 params![batch_id],
                 |row| row.get::<_, i64>(0),
             )
@@ -1582,7 +1762,7 @@ impl SqliteStorage {
             });
         };
         let completed_at_ms = self.connection.query_row(
-            "SELECT completed_at_ms FROM index_batches WHERE id = ?1",
+            "SELECT completed_at_ms FROM index_batches WHERE id = ?1 AND status = 'completed'",
             params![batch_id],
             |row| row.get::<_, i64>(0),
         )?;
@@ -1598,7 +1778,7 @@ impl SqliteStorage {
         Ok(self
             .connection
             .query_row(
-                "SELECT id FROM index_batches ORDER BY completed_at_ms DESC, id DESC LIMIT 1",
+                "SELECT id FROM index_batches WHERE status = 'completed' ORDER BY completed_at_ms DESC, id DESC LIMIT 1",
                 [],
                 |row| row.get::<_, i64>(0),
             )
@@ -2456,7 +2636,7 @@ fn activate_baseline_in_transaction(
     baseline_generation: u64,
 ) -> Result<(), StorageError> {
     let baseline_exists = connection.query_row(
-        "SELECT EXISTS (SELECT 1 FROM index_batches WHERE id = ?1)",
+        "SELECT EXISTS (SELECT 1 FROM index_batches WHERE id = ?1 AND status = 'completed')",
         params![baseline_id],
         |row| row.get::<_, i64>(0),
     )? != 0;
@@ -2541,12 +2721,36 @@ fn path_is_descendant(root: &str, candidate: &str) -> bool {
     }
 }
 
-fn searchable_text(entry: &IndexedEntry) -> String {
-    if entry.search_text.is_empty() {
-        build_search_text(&entry.name, &entry.path)
-    } else {
-        entry.search_text.clone()
+fn estimated_baseline_storage_bytes(entries: &[IndexedEntry]) -> u64 {
+    entries.iter().fold(0_u64, |total, entry| {
+        let text_bytes = entry
+            .path
+            .len()
+            .saturating_add(entry.name.len())
+            .saturating_add(entry.parent.len())
+            .saturating_add(entry.root.len())
+            .saturating_add(entry.extension.as_deref().map(str::len).unwrap_or(0));
+        let row_bytes = (text_bytes as u64).saturating_mul(6).saturating_add(512);
+        total.saturating_add(row_bytes)
+    })
+}
+
+fn validate_baseline_storage_budget(
+    estimated_bytes: u64,
+    available_bytes: u64,
+) -> Result<(), StorageError> {
+    if estimated_bytes > MAX_BASELINE_ESTIMATED_BYTES {
+        return Err(StorageError::InvalidJournal(format!(
+            "index baseline requires an estimated {estimated_bytes} bytes, exceeding the 8 GiB safety limit; narrow the configured index directories"
+        )));
     }
+    let required_bytes = estimated_bytes.saturating_add(MIN_FREE_DISK_RESERVE_BYTES);
+    if available_bytes < required_bytes {
+        return Err(StorageError::InvalidJournal(format!(
+            "index baseline requires an estimated {estimated_bytes} bytes but only {available_bytes} bytes are available; QuickFox keeps a 5 GiB safety reserve"
+        )));
+    }
+    Ok(())
 }
 
 fn nullable_text(value: &str) -> Option<&str> {
@@ -4714,6 +4918,152 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_baseline_is_never_visible_and_is_removed_on_reopen() {
+        let path = temp_db_path("incomplete-index-snapshot");
+        let storage = SqliteStorage::open(path.clone()).unwrap();
+        storage
+            .connection
+            .execute(
+                "INSERT INTO index_batches (completed_at_ms, entry_count, status) VALUES (100, 1, 'building')",
+                [],
+            )
+            .unwrap();
+        let batch_id = storage.connection.last_insert_rowid();
+        storage
+            .connection
+            .execute(
+                r#"
+                INSERT INTO index_entries
+                    (batch_id, path, name, kind, search_text, updated_at_ms)
+                VALUES (?1, '/tmp/partial.txt', 'partial.txt', 'file', '', 100)
+                "#,
+                params![batch_id],
+            )
+            .unwrap();
+
+        assert!(storage.latest_index_snapshot().unwrap().is_none());
+        drop(storage);
+
+        let storage = SqliteStorage::open(path.clone()).unwrap();
+        let batch_count = storage
+            .connection
+            .query_row("SELECT COUNT(*) FROM index_batches", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        assert_eq!(batch_count, 0);
+
+        drop(storage);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn pruning_baselines_keeps_only_the_retained_completed_batch() {
+        let path = temp_db_path("prune-index-snapshots");
+        let storage = SqliteStorage::open(path.clone()).unwrap();
+        let old_id = storage
+            .save_completed_index_batch(100, &[indexed_entry("/root/old.txt")])
+            .unwrap();
+        let retained_id = storage
+            .save_completed_index_batch(200, &[indexed_entry("/root/current.txt")])
+            .unwrap();
+
+        storage.prune_index_batches_except(retained_id).unwrap();
+
+        let batch_ids = storage
+            .connection
+            .prepare("SELECT id FROM index_batches ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(batch_ids, vec![retained_id]);
+        assert!(!batch_ids.contains(&old_id));
+        assert_eq!(
+            storage.latest_index_snapshot().unwrap().unwrap().entries[0].path,
+            "/root/current.txt"
+        );
+
+        drop(storage);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn checkpoint_cleanup_retains_active_baseline_and_latest_checkpoint() {
+        let path = temp_db_path("prune-index-checkpoints");
+        let storage = SqliteStorage::open(path.clone()).unwrap();
+        let active_id = storage
+            .save_completed_index_batch(100, &[indexed_entry("/root/active.txt")])
+            .unwrap();
+        storage
+            .activate_baseline_and_clear_incremental_state(active_id, 0)
+            .unwrap();
+        let obsolete_checkpoint_id = storage
+            .save_completed_index_batch(200, &[indexed_entry("/root/old-checkpoint.txt")])
+            .unwrap();
+        let checkpoint_id = storage
+            .save_completed_index_batch(300, &[indexed_entry("/root/checkpoint.txt")])
+            .unwrap();
+
+        storage
+            .prune_index_batches_after_checkpoint(checkpoint_id)
+            .unwrap();
+
+        let batch_ids = storage
+            .connection
+            .prepare("SELECT id FROM index_batches ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(batch_ids, vec![active_id, checkpoint_id]);
+        assert!(!batch_ids.contains(&obsolete_checkpoint_id));
+
+        drop(storage);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn new_storage_uses_bounded_wal_and_incremental_page_reclamation() {
+        let path = temp_db_path("sqlite-storage-policy");
+        let storage = SqliteStorage::open(path.clone()).unwrap();
+
+        let journal_mode = storage
+            .connection
+            .pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))
+            .unwrap();
+        let auto_vacuum = storage
+            .connection
+            .pragma_query_value(None, "auto_vacuum", |row| row.get::<_, i64>(0))
+            .unwrap();
+        let journal_size_limit = storage
+            .connection
+            .pragma_query_value(None, "journal_size_limit", |row| row.get::<_, i64>(0))
+            .unwrap();
+
+        assert_eq!(journal_mode, "wal");
+        assert_eq!(auto_vacuum, 2);
+        assert_eq!(journal_size_limit, 64 * 1024 * 1024);
+
+        drop(storage);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn baseline_storage_budget_preserves_free_space_and_rejects_oversized_snapshots() {
+        assert!(
+            validate_baseline_storage_budget(512 * 1024 * 1024, 6 * 1024 * 1024 * 1024).is_ok()
+        );
+        assert!(
+            validate_baseline_storage_budget(2 * 1024 * 1024 * 1024, 6 * 1024 * 1024 * 1024)
+                .is_err()
+        );
+        assert!(validate_baseline_storage_budget(9 * 1024 * 1024 * 1024, u64::MAX).is_err());
+    }
+
+    #[test]
     fn storage_persists_and_loads_latest_completed_index_snapshot() {
         let path = temp_db_path("index-snapshot");
         let storage = SqliteStorage::open(path.clone()).unwrap();
@@ -4757,6 +5107,7 @@ mod tests {
                 path: "/home/frank/Downloads".to_owned(),
                 name: "Downloads".to_owned(),
                 kind: IndexedEntryKind::Directory,
+                search_text: "downloads /home/frank/downloads".to_owned(),
                 ..IndexedEntry::legacy("", "", IndexedEntryKind::Directory)
             }]
         );

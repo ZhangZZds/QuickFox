@@ -62,6 +62,7 @@ QuickFox 采用 Tauri 双端架构：
   - TOML 配置模型与默认配置
 - `src-tauri/src/core/storage.rs`
   - SQLite 持久化、历史与索引快照
+  - baseline 分块事务、完成状态、旧批次回收与磁盘空间预算
 
 ### Tauri 集成层
 
@@ -178,6 +179,8 @@ include/exclude roots、exclude patterns、project ignore 或正文索引范围�
 | debounce                     | 5 秒静默，首事件后 10 秒硬上限 | 强制形成批次                           |
 | overlay + tombstone          | 50,000 条                      | 安排后台 baseline 全量刷新             |
 | 估算增量状态                 | 64 MiB                         | 安排后台 baseline 全量刷新             |
+| 单 baseline 估算存储         | 8 GiB                          | 拒绝持久化并提示缩小索引目录           |
+| 索引存储可用空间             | 至少保留 5 GiB                 | 拒绝新 baseline，保留最近可用索引      |
 | 正文增量队列                 | 8 个 job，单 worker 串行发布   | 不阻塞 name/path；安排可恢复的后台刷新 |
 | 单文件正文                   | 默认最大 2 MiB                 | 过大/二进制/不支持文件只跳过正文       |
 

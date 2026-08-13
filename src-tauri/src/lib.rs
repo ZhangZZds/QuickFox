@@ -1687,6 +1687,9 @@ fn transition_runtime_config_revision_with_hooks(
             successor_generation,
             storage.highest_committed_generation().unwrap_or(0)
         );
+        if let Err(error) = storage.prune_index_batches_except(final_baseline_id) {
+            eprintln!("QuickFox obsolete baseline cleanup failed: {error}");
+        }
         Ok(next_shortcut)
     })();
     drop(_refresh_fence);
@@ -1842,6 +1845,9 @@ fn recover_config_revision_baseline_inline(
             &manifest,
         )
         .map_err(|error| error.to_string())?;
+    if let Err(error) = storage.prune_index_batches_except(baseline_id) {
+        eprintln!("QuickFox obsolete baseline cleanup failed: {error}");
+    }
     let mut runtime = state
         .runtime
         .lock()
@@ -2136,9 +2142,8 @@ fn clear_input_history() -> Result<&'static str, String> {
 fn default_index_dirs() -> Vec<String> {
     #[cfg(target_os = "windows")]
     {
-        let roots = windows_existing_drive_roots();
-        if !roots.is_empty() {
-            return roots;
+        if let Some(home) = home_dir() {
+            return windows_default_index_dirs_from_home(&home, |path| path.is_dir());
         }
     }
 
@@ -2146,6 +2151,31 @@ fn default_index_dirs() -> Vec<String> {
         .or_else(|_| std::env::var("USERPROFILE"))
         .into_iter()
         .collect()
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_default_index_dirs_from_home(
+    home: &Path,
+    exists: impl Fn(&Path) -> bool,
+) -> Vec<String> {
+    let roots = [
+        "Desktop",
+        "Documents",
+        "Downloads",
+        "Projects",
+        "workspace",
+        "Workspace",
+    ]
+    .into_iter()
+    .map(|name| home.join(name))
+    .filter(|path| exists(path))
+    .map(|path| path.to_string_lossy().into_owned())
+    .collect::<Vec<_>>();
+    if roots.is_empty() {
+        vec![home.to_string_lossy().into_owned()]
+    } else {
+        roots
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -2262,9 +2292,43 @@ fn current_time_ms() -> i64 {
 }
 
 fn load_startup_config() -> QuickFoxConfig {
-    config_store()
-        .and_then(|store| store.load_or_create_default(default_index_dirs()).ok())
-        .unwrap_or_else(|| QuickFoxConfig::default_with_index_dirs(default_index_dirs()))
+    let defaults = default_index_dirs();
+    let Some(store) = config_store() else {
+        return QuickFoxConfig::default_with_index_dirs(defaults);
+    };
+    let Ok(config) = store.load_or_create_default(defaults.clone()) else {
+        return QuickFoxConfig::default_with_index_dirs(defaults);
+    };
+    #[cfg(target_os = "windows")]
+    {
+        let mut config = config;
+        let legacy_drive_roots = windows_existing_drive_roots();
+        if migrate_legacy_windows_default_index_config(&mut config, &legacy_drive_roots, defaults) {
+            if let Err(error) = store.save(&config) {
+                eprintln!("QuickFox safe Windows index-default migration failed: {error:?}");
+            }
+        }
+        return config;
+    }
+    #[cfg(not(target_os = "windows"))]
+    config
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn migrate_legacy_windows_default_index_config(
+    config: &mut QuickFoxConfig,
+    legacy_drive_roots: &[String],
+    safe_roots: Vec<String>,
+) -> bool {
+    if legacy_drive_roots.is_empty() {
+        return false;
+    }
+    let legacy_index = QuickFoxConfig::default_with_index_dirs(legacy_drive_roots.to_vec()).index;
+    if config.index != legacy_index {
+        return false;
+    }
+    config.index.include_dirs = safe_roots;
+    true
 }
 
 fn build_scan_options(config: &QuickFoxConfig) -> IndexScanOptions {
@@ -3561,7 +3625,11 @@ fn persist_and_activate_baseline_with_manifest(
             baseline_generation,
             manifest,
         )
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    if let Err(error) = storage.prune_index_batches_except(baseline_id) {
+        eprintln!("QuickFox obsolete baseline cleanup failed: {error}");
+    }
+    Ok(())
 }
 
 fn prepare_index_refresh_handoff(
@@ -4159,7 +4227,14 @@ fn persist_checkpoint_for_identity(
         return false;
     }
     if let Some(storage) = storage_store() {
-        let _ = storage.save_completed_index_batch(completed_at_ms, entries);
+        match storage.save_completed_index_batch(completed_at_ms, entries) {
+            Ok(checkpoint_id) => {
+                if let Err(error) = storage.prune_index_batches_after_checkpoint(checkpoint_id) {
+                    eprintln!("QuickFox obsolete checkpoint cleanup failed: {error}");
+                }
+            }
+            Err(error) => eprintln!("QuickFox index checkpoint persistence failed: {error}"),
+        }
     }
     true
 }
@@ -6130,6 +6205,16 @@ fn toggle_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>, state: &Quic
     apply_launcher_window_effect(app, effect);
 }
 
+fn show_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    let state = app.state::<QuickFoxAppState>();
+    state
+        .window_state
+        .lock()
+        .expect("quickfox window state lock poisoned")
+        .show();
+    apply_launcher_window_effect(app, LauncherWindowEffect::ShowAndFocus);
+}
+
 fn show_settings_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     if let Some(window) = app.get_webview_window("settings") {
         let _ = window.show();
@@ -6400,6 +6485,12 @@ pub fn run() {
     let setup_startup_gate = Arc::clone(&startup_gate);
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            let dispatch = app.clone();
+            if let Err(error) = app.run_on_main_thread(move || show_main_window(&dispatch)) {
+                eprintln!("QuickFox single-instance window dispatch failed: {error}");
+            }
+        }))
         .manage(QuickFoxAppState {
             runtime: Mutex::new(build_runtime()),
             index_refresh_fence: Mutex::new(()),
@@ -12457,6 +12548,58 @@ mod tests {
         });
 
         assert_eq!(roots, vec!["C:\\".to_owned(), "E:\\".to_owned()]);
+    }
+
+    #[test]
+    fn windows_first_run_defaults_to_existing_user_hot_paths_not_drive_roots() {
+        let home = Path::new("C:/Users/Frank");
+        let roots = windows_default_index_dirs_from_home(home, |path| {
+            path.ends_with("Desktop") || path.ends_with("Documents")
+        });
+
+        assert_eq!(
+            roots,
+            vec![
+                "C:/Users/Frank/Desktop".to_owned(),
+                "C:/Users/Frank/Documents".to_owned()
+            ]
+        );
+        assert!(roots.iter().all(|root| root != "C:\\" && root != "D:\\"));
+    }
+
+    #[test]
+    fn windows_first_run_falls_back_to_profile_when_hot_paths_are_missing() {
+        let roots = windows_default_index_dirs_from_home(Path::new("C:/Users/Frank"), |_| false);
+
+        assert_eq!(roots, vec!["C:/Users/Frank".to_owned()]);
+    }
+
+    #[test]
+    fn windows_legacy_generated_drive_roots_migrate_to_safe_defaults() {
+        let drives = vec!["C:\\".to_owned(), "D:\\".to_owned()];
+        let safe = vec!["C:/Users/Frank/Desktop".to_owned()];
+        let mut config = QuickFoxConfig::default_with_index_dirs(drives.clone());
+
+        assert!(migrate_legacy_windows_default_index_config(
+            &mut config,
+            &drives,
+            safe.clone()
+        ));
+        assert_eq!(config.index.include_dirs, safe);
+    }
+
+    #[test]
+    fn windows_customized_drive_root_config_is_not_migrated() {
+        let drives = vec!["C:\\".to_owned(), "D:\\".to_owned()];
+        let mut config = QuickFoxConfig::default_with_index_dirs(drives.clone());
+        config.index.exclude_dirs.push("D:/Archive".to_owned());
+
+        assert!(!migrate_legacy_windows_default_index_config(
+            &mut config,
+            &drives,
+            vec!["C:/Users/Frank/Desktop".to_owned()]
+        ));
+        assert_eq!(config.index.include_dirs, drives);
     }
 
     #[test]

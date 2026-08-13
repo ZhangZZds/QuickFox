@@ -3,6 +3,8 @@
 ## 快捷键与窗口
 
 - 发布版启动后不弹出额外 cmd/console 窗口
+- QuickFox 已在后台运行时再次启动，已有 launcher 被显示并聚焦，任务管理器中仍只有
+  一个 QuickFox 进程、一个托盘实例和一套索引任务
 - 双击 Shift 能唤起启动窗口
 - 设置页“外观”中能把全局唤醒键录制为 `Control+Space` 等组合键；保存后新组合键能唤起/隐藏启动器
 - 设置页“外观”中尝试录制 `Alt+Space` 时显示系统占用提示，且不会把它保存为新的唤醒键
@@ -40,7 +42,9 @@
 - `ddg 1234` 能生成 DuckDuckGo 搜索结果并用默认浏览器打开
 - `bd 1234` 能生成百度搜索结果并用默认浏览器打开
 - 首次启动或大文件树启动时，启动器和托盘不被索引过程阻塞
-- 默认 `balanced` 模式下，将索引目录设为 `C:\Users` 和 `D:\` 这类大目录后首次启动，应用入口和 Desktop/Downloads 等热路径先可搜索，启动器提示“文件搜索已部分可用”，随后后台补全大目录
+- 首次创建 Windows 配置时，默认索引范围只包含实际存在的 Desktop、Documents、
+  Downloads、Projects、workspace 等用户热路径，不自动加入 `C:\` 或 `D:\`
+- `balanced` 模式下，用户显式将索引目录设为 `C:\Users` 和 `D:\` 这类大目录后，应用入口和 Desktop/Downloads 等热路径先可搜索，启动器提示“文件搜索已部分可用”，随后后台补全大目录
 - `fast` 模式下首次启动只扫描应用入口和热路径，不自动补扫 `D:\` 等配置大根目录；设置页应说明结果范围更窄
 - `complete` 模式下首次索引覆盖完整配置范围；设置页应说明首次索引更慢但覆盖更完整
 - 文件索引未完成时，启动器提示“文件索引正在建立”或对应失败信息
@@ -60,6 +64,10 @@
 - 将 name/path 索引范围配置为真实 Windows C/D 多盘大目录，例如 `C:\Users` 和 `D:\`；记录实际磁盘总量、扫描 root 和排除项
 - 等待索引进入 ready 或 refreshing-but-available 状态；记录设置页显示的 entry count、当前 stage、scanned、accepted、skipped、failures
 - 打开任务管理器记录 QuickFox 进程常驻内存；200 万文件级目标小于 500MB，硬上限小于 800MB，超过时必须记录截图和复现配置
+- 同时记录 `%APPDATA%\QuickFox\quickfox.sqlite`、`-wal`/`-shm` 的峰值；写入期间不得
+  出现 GB 级 `quickfox.sqlite-journal`，完成后只保留 active baseline
+- 制造低空间条件时，baseline 写入必须在剩余空间低于“估算值 + 5 GiB”前失败；单个
+  baseline 估算超过 8 GiB 时必须提示缩小索引目录
 - 在启动器连续输入 `agents.md`，特别观察输入到 `m` 时是否卡顿；录屏中应能看出输入框持续响应、旧搜索结果不会覆盖新输入
 - 查询 `agents.md`、`agents.m`、`agents`、`type:md agents`、`dir:workspace agents`，目标文件应稳定在前 5 个结果内
 - 查询一个不存在的长词，例如 `needle-not-present-987654321`，不应出现明显输入冻结或全量扫描造成的长时间空白
