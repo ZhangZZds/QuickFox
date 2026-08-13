@@ -6205,6 +6205,7 @@ fn toggle_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>, state: &Quic
     apply_launcher_window_effect(app, effect);
 }
 
+#[cfg(not(test))]
 fn show_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     let state = app.state::<QuickFoxAppState>();
     state
@@ -6484,13 +6485,16 @@ pub fn run() {
     let startup_gate = Arc::new(StartupIndexingGate::default());
     let setup_startup_gate = Arc::clone(&startup_gate);
 
-    tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            let dispatch = app.clone();
-            if let Err(error) = app.run_on_main_thread(move || show_main_window(&dispatch)) {
-                eprintln!("QuickFox single-instance window dispatch failed: {error}");
-            }
-        }))
+    let builder = tauri::Builder::default();
+    #[cfg(not(test))]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        let dispatch = app.clone();
+        if let Err(error) = app.run_on_main_thread(move || show_main_window(&dispatch)) {
+            eprintln!("QuickFox single-instance window dispatch failed: {error}");
+        }
+    }));
+
+    builder
         .manage(QuickFoxAppState {
             runtime: Mutex::new(build_runtime()),
             index_refresh_fence: Mutex::new(()),
