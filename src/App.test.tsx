@@ -413,7 +413,7 @@ describe("App", () => {
     });
 
     const status = await screen.findByRole("region", { name: "启动器状态" });
-    expect(status).toHaveTextContent("文件索引正在建立");
+    await waitFor(() => expect(status).toHaveTextContent("文件索引正在建立"));
     expect(status).toHaveTextContent("计算器和网页搜索仍可使用");
   });
 
@@ -650,7 +650,7 @@ describe("App", () => {
 
     const watcher = await screen.findByLabelText("运行期文件监听");
     expect(watcher).toBeChecked();
-    const summary = screen.getByText("自动增量已降级，正在校准 1 个索引目录");
+    const summary = await screen.findByText("自动增量已降级，正在校准 1 个索引目录");
     expect(summary.textContent).not.toMatch(/\/Users\//);
     expect(screen.queryByText("watcherOverflow")).not.toBeInTheDocument();
   });
