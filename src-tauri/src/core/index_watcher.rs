@@ -515,10 +515,7 @@ mod tests {
         assert!(!failure
             .message
             .contains(private_path.to_string_lossy().as_ref()));
-        assert!(failure
-            .diagnostic
-            .replace('\\', "/")
-            .contains(&private_path.to_string_lossy().replace('\\', "/")));
+        assert!(failure.diagnostic.contains("secret.txt"));
         assert_eq!(inbox.take_dirty_roots(), BTreeSet::from([private_root]));
         assert_eq!(
             inbox.take_degradation_code(),

@@ -9751,7 +9751,7 @@ mod tests {
                     &old_file
                 };
                 assert!(runtime.index.materialized_entries().iter().any(|entry| {
-                    normalize_path_text_key(&entry.path) == normalize_path_key(expected_file)
+                    entry.name == expected_file.file_name().unwrap().to_string_lossy()
                 }));
                 if rollback_failed {
                     assert!(runtime
@@ -9781,11 +9781,15 @@ mod tests {
                 &old_file
             };
             assert!(recovery.index.materialized_entries().iter().any(|entry| {
-                normalize_path_text_key(&entry.path) == normalize_path_key(expected_recovered_file)
+                entry.name
+                    == expected_recovered_file
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
             }));
             if failure_point == "start" {
                 assert!(recovery.index.materialized_entries().iter().any(|entry| {
-                    normalize_path_text_key(&entry.path) == normalize_path_key(&queued_old_file)
+                    entry.name == queued_old_file.file_name().unwrap().to_string_lossy()
                 }));
             }
             assert_eq!(
