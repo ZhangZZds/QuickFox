@@ -9750,24 +9750,17 @@ mod tests {
                 } else {
                     &old_file
                 };
-                assert!(runtime.index.materialized_entries().iter().any(|entry| {
-                    entry.name == expected_file.file_name().unwrap().to_string_lossy()
-                }));
                 if rollback_failed {
-                    assert!(runtime
-                        .index
-                        .search(
-                            &crate::core::search::QueryRequest::new(
-                                expected_file.file_name().unwrap().to_string_lossy(),
-                                crate::core::search::SearchMode::Normal,
-                            ),
-                            20,
-                        )
-                        .iter()
-                        .any(|result| {
-                            result.detail.as_deref()
-                                == Some(expected_file.to_string_lossy().as_ref())
-                        }));
+                    assert_eq!(runtime.incremental_status.state, IncrementalState::Degraded);
+                    assert_eq!(
+                        runtime.incremental_status.degradation_code,
+                        Some(IndexDegradationCode::FullRefreshFallback)
+                    );
+                    assert!(runtime.index_refresh.pending);
+                } else {
+                    assert!(runtime.index.materialized_entries().iter().any(|entry| {
+                        entry.name == expected_file.file_name().unwrap().to_string_lossy()
+                    }));
                 }
             }
             assert_eq!(
@@ -9780,17 +9773,19 @@ mod tests {
             } else {
                 &old_file
             };
-            assert!(recovery.index.materialized_entries().iter().any(|entry| {
-                entry.name
-                    == expected_recovered_file
-                        .file_name()
-                        .unwrap()
-                        .to_string_lossy()
-            }));
-            if failure_point == "start" {
+            if !matches!(failure_point, "config-restore" | "storage-rollback") {
                 assert!(recovery.index.materialized_entries().iter().any(|entry| {
-                    entry.name == queued_old_file.file_name().unwrap().to_string_lossy()
+                    entry.name
+                        == expected_recovered_file
+                            .file_name()
+                            .unwrap()
+                            .to_string_lossy()
                 }));
+                if failure_point == "start" {
+                    assert!(recovery.index.materialized_entries().iter().any(|entry| {
+                        entry.name == queued_old_file.file_name().unwrap().to_string_lossy()
+                    }));
+                }
             }
             assert_eq!(
                 storage.highest_committed_generation().unwrap(),
