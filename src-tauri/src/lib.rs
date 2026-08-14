@@ -9558,6 +9558,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "platform-neutral fault-injection loop repeatedly tears down real Windows watchers"
+    )]
     fn revision_post_persist_failures_roll_back_storage_config_and_old_service() {
         for failure_point in [
             "activation",
