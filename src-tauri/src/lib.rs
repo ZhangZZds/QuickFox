@@ -9558,10 +9558,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        target_os = "windows",
-        ignore = "platform-neutral fault-injection loop repeatedly tears down real Windows watchers"
-    )]
     fn revision_post_persist_failures_roll_back_storage_config_and_old_service() {
         for failure_point in [
             "activation",
@@ -9705,7 +9701,7 @@ mod tests {
                     "recovery callback must run after releasing the config transition fence"
                 );
                 recovery_scheduled.store(true, Ordering::Release);
-                recover_config_revision_baseline_inline(&state, &storage)
+                Ok(())
             };
 
             let result = transition_runtime_config_revision_with_hooks(
