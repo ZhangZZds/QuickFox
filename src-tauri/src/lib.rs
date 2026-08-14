@@ -9750,11 +9750,9 @@ mod tests {
                 } else {
                     &old_file
                 };
-                assert!(runtime
-                    .index
-                    .materialized_entries()
-                    .iter()
-                    .any(|entry| { entry.path == expected_file.to_string_lossy() }));
+                assert!(runtime.index.materialized_entries().iter().any(|entry| {
+                    normalize_path_text_key(&entry.path) == normalize_path_key(expected_file)
+                }));
                 if rollback_failed {
                     assert!(runtime
                         .index
@@ -9782,17 +9780,13 @@ mod tests {
             } else {
                 &old_file
             };
-            assert!(recovery
-                .index
-                .materialized_entries()
-                .iter()
-                .any(|entry| entry.path == expected_recovered_file.to_string_lossy()));
+            assert!(recovery.index.materialized_entries().iter().any(|entry| {
+                normalize_path_text_key(&entry.path) == normalize_path_key(expected_recovered_file)
+            }));
             if failure_point == "start" {
-                assert!(recovery
-                    .index
-                    .materialized_entries()
-                    .iter()
-                    .any(|entry| entry.path == queued_old_file.to_string_lossy()));
+                assert!(recovery.index.materialized_entries().iter().any(|entry| {
+                    normalize_path_text_key(&entry.path) == normalize_path_key(&queued_old_file)
+                }));
             }
             assert_eq!(
                 storage.highest_committed_generation().unwrap(),
@@ -10504,9 +10498,12 @@ mod tests {
             .map(|event| match event {
                 IndexWatchEvent::Create(path)
                 | IndexWatchEvent::Write(path)
-                | IndexWatchEvent::Remove(path) => path == after_successor_handoff,
+                | IndexWatchEvent::Remove(path) => {
+                    normalize_path_key(path) == normalize_path_key(&after_successor_handoff)
+                }
                 IndexWatchEvent::Rename { from, to } => {
-                    from == after_successor_handoff || to == after_successor_handoff
+                    normalize_path_key(from) == normalize_path_key(&after_successor_handoff)
+                        || normalize_path_key(to) == normalize_path_key(&after_successor_handoff)
                 }
             })
             .unwrap_or(false);
@@ -12567,8 +12564,8 @@ mod tests {
         assert_eq!(
             roots,
             vec![
-                "C:/Users/Frank/Desktop".to_owned(),
-                "C:/Users/Frank/Documents".to_owned()
+                home.join("Desktop").to_string_lossy().into_owned(),
+                home.join("Documents").to_string_lossy().into_owned()
             ]
         );
         assert!(roots.iter().all(|root| root != "C:\\" && root != "D:\\"));
@@ -12578,7 +12575,10 @@ mod tests {
     fn windows_first_run_falls_back_to_profile_when_hot_paths_are_missing() {
         let roots = windows_default_index_dirs_from_home(Path::new("C:/Users/Frank"), |_| false);
 
-        assert_eq!(roots, vec!["C:/Users/Frank".to_owned()]);
+        assert_eq!(
+            roots,
+            vec![Path::new("C:/Users/Frank").to_string_lossy().into_owned()]
+        );
     }
 
     #[test]

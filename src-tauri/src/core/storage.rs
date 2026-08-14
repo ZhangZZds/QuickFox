@@ -3641,9 +3641,10 @@ mod tests {
             )
             .unwrap();
 
+        let committed_removal = &storage.committed_index_deltas_after(0).unwrap()[0].removals[0];
         assert_eq!(
-            storage.committed_index_deltas_after(0).unwrap()[0].removals,
-            vec![removed]
+            normalize_path_key_for_mode(committed_removal, PathComparisonMode::native()),
+            normalize_path_key_for_mode(&removed, PathComparisonMode::native())
         );
         assert_eq!(
             storage.directory_manifest_for_root(root.path()).unwrap(),

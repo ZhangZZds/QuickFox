@@ -8,6 +8,7 @@ use crate::core::content_index::{
 };
 use crate::core::file_matcher::{FileMatchCandidate, FileMatcher};
 use crate::core::file_query::FileQuery;
+use crate::core::index_entry::{path_is_same_or_descendant_for_mode, PathComparisonMode};
 pub use crate::core::index_entry::{
     ContentIndexState, IndexAvailability, IndexFailure, IndexLifecycle, IndexReport,
     IndexScanOptions, IndexStatus, IndexStatusKind, IndexedEntry, IndexedEntryKind,
@@ -888,12 +889,9 @@ fn snapshot_metadata_matches(previous: &IndexedEntry, scanned: &IndexedEntry) ->
 }
 
 fn path_is_affected(path: &str, roots: &HashSet<String>) -> bool {
-    roots.iter().any(|root| {
-        path == root
-            || path
-                .strip_prefix(root)
-                .is_some_and(|rest| rest.starts_with(std::path::MAIN_SEPARATOR))
-    })
+    roots
+        .iter()
+        .any(|root| path_is_same_or_descendant_for_mode(root, path, PathComparisonMode::native()))
 }
 
 fn entry_to_result(entry: &IndexedEntry) -> SearchResult {
@@ -2479,7 +2477,7 @@ mod tests {
     fn file_entry(path: &str) -> IndexedEntry {
         IndexedEntry::legacy(
             path,
-            path.rsplit('/').next().unwrap().to_owned(),
+            path.rsplit(['/', '\\']).next().unwrap().to_owned(),
             IndexedEntryKind::File,
         )
     }

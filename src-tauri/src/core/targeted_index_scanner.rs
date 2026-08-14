@@ -858,7 +858,7 @@ mod tests {
         assert!(delta
             .manifest_upserts
             .iter()
-            .any(|fingerprint| fingerprint.path.ends_with("new/nested")));
+            .any(|fingerprint| Path::new(&fingerprint.path).ends_with(Path::new("new/nested"))));
     }
 
     #[test]
@@ -1061,11 +1061,11 @@ mod tests {
         let full_contains = full
             .entries
             .iter()
-            .any(|entry| entry.path == file.to_string_lossy());
+            .any(|entry| normalize_path_text_key(&entry.path) == normalize_path_key(file));
         let targeted_contains = targeted
             .upserts
             .iter()
-            .any(|entry| entry.path == file.to_string_lossy());
+            .any(|entry| normalize_path_text_key(&entry.path) == normalize_path_key(file));
 
         assert_eq!(full_contains, expected);
         assert_eq!(targeted_contains, full_contains);

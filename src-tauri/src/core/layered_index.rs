@@ -947,7 +947,11 @@ mod tests {
         });
 
         let results = index.search(&request("readme"), 20);
-        assert_eq!(result_paths(&results), vec!["/tmp/root/docs/readme.md.bak"]);
+        let expected = root
+            .join("docs/readme.md.bak")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(result_paths(&results), vec![expected.as_str()]);
     }
 
     #[test]
@@ -1659,7 +1663,8 @@ mod tests {
             vec![root.join("rename-old.md")],
         );
 
-        let history = HistoryScores::from_pairs([("path:/tmp/root/rename-new.md", 50)]);
+        let history_id = format!("path:{}", root.join("rename-new.md").to_string_lossy());
+        let history = HistoryScores::from_pairs([(history_id.as_str(), 50)]);
         for query in ["md", "alpha", "rename", "Tools"] {
             let request = request(query);
             let layered_results =

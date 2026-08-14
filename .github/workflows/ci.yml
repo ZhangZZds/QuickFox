@@ -60,9 +60,16 @@ jobs:
           npm run rust:clippy
 
       - name: Run tests
+        if: runner.os != 'Windows'
         run: |
           npm run test
           npm run rust:test
+
+      - name: Run tests (Windows, serialized watchers)
+        if: runner.os == 'Windows'
+        run: |
+          npm run test
+          npm run rust:test -- -- --test-threads=1
 
       - name: Build frontend
         run: npm run build

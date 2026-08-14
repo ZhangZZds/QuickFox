@@ -517,7 +517,8 @@ mod tests {
             .contains(private_path.to_string_lossy().as_ref()));
         assert!(failure
             .diagnostic
-            .contains(private_path.to_string_lossy().as_ref()));
+            .replace('\\', "/")
+            .contains(&private_path.to_string_lossy().replace('\\', "/")));
         assert_eq!(inbox.take_dirty_roots(), BTreeSet::from([private_root]));
         assert_eq!(
             inbox.take_degradation_code(),
