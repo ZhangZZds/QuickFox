@@ -12,9 +12,6 @@
 
 ## 流程
 
-- 非平凡功能、行为变化、架构变化必须先走 OpenSpec + Superpowers 流程。
-- 需求不清楚时先 brainstorming；需求清楚时先写 OpenSpec proposal。
-- 实现行为变化时按 TDD 执行：先写能失败的测试，再写实现。
 - 声称完成前必须执行 verification-before-completion，并给出实际验证结果。
 - 遇到 bug、测试失败或异常行为时，先系统化定位根因，再修复。
 

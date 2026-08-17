@@ -40,6 +40,8 @@
 - **WHEN** 文件或目录名称大小写与排除规则不同
 - **THEN** 扫描器仍跳过该文件或目录
 
+## ADDED Requirements
+
 ### Requirement: Windows 默认索引全部可用盘符
 
 Windows 上系统 SHALL 在首次创建默认索引配置时选择当前可用盘符根目录。默认 `balanced` 模式 MUST 先发布应用入口和用户热路径，再在后台补全盘符范围；盘符或目录失败 MUST 使用 partial/retry 语义，不得撤销默认配置。

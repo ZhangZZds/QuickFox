@@ -8,14 +8,13 @@ TBD - created by archiving change build-quickfox-launcher. Update Purpose after 
 
 ### Requirement: 默认索引用户主目录
 
-系统 SHALL 默认索引当前用户的主目录或 profile 目录，并只索引文件名、目录
-名和完整路径；系统 MUST 默认排除应用包内部、构建产物、缓存目录和系统隐藏
-噪音目录。
+系统 SHALL 在 macOS/Linux 默认索引当前用户的主目录，在 Windows 默认索引当前可用盘符根目录，并只索引文件名、目录名和完整路径；系统 MUST 默认排除应用包内部、构建产物、缓存目录和系统隐藏噪音目录。
 
 #### Scenario: 首次启动创建默认索引范围
 
 - **WHEN** 用户首次启动 QuickFox 且没有自定义索引配置
-- **THEN** 系统使用当前用户主目录作为默认索引根目录
+- **THEN** macOS/Linux 使用当前用户主目录作为默认索引根目录
+- **AND** Windows 使用当前可用盘符根目录作为默认索引根目录
 
 #### Scenario: 索引不读取文件内容
 
@@ -26,16 +25,6 @@ TBD - created by archiving change build-quickfox-launcher. Update Purpose after 
 
 - **WHEN** 系统扫描 macOS `.app` 应用包
 - **THEN** 系统将 `.app` 作为应用结果索引，并跳过 `.app/Contents` 内部文件
-
-#### Scenario: Windows 应用入口作为应用结果
-
-- **WHEN** 系统扫描 Windows `.exe` 或开始菜单 `.lnk` 入口
-- **THEN** 系统将其作为应用结果索引
-
-#### Scenario: Linux desktop 文件作为应用结果
-
-- **WHEN** 系统扫描 Linux `.desktop` 文件
-- **THEN** 系统将其作为应用结果索引
 
 ### Requirement: 可配置索引包含和排除规则
 
@@ -127,13 +116,13 @@ TBD - created by archiving change build-quickfox-launcher. Update Purpose after 
 
 ### Requirement: 后台构建索引
 
-The system SHALL preserve the currently searchable index while a background refresh runs, publish progress after each completed scan stage, and replace the searchable baseline only after the final staged result is successfully persisted. After Tauri setup completes, every available configured index root SHALL be scheduled for that background refresh even if the event-loop Ready callback is delayed or absent.
+The system SHALL preserve the currently searchable index while a background refresh runs, publish progress after each completed scan stage, and replace the searchable baseline only after the final staged result is successfully persisted. After Tauri setup completes, every available active root selected by the current performance mode SHALL be scheduled for that background refresh even if the event-loop Ready callback is delayed or absent.
 
 #### Scenario: Startup refresh runs without a Ready callback
 
 - **WHEN** a persisted baseline exists and QuickFox finishes setup with indexing enabled
 - **THEN** the persisted baseline remains searchable while refresh runs
-- **AND** all available configured roots are included in the scheduled refresh
+- **AND** all available active roots selected by the current performance mode are included in the scheduled refresh
 
 #### Scenario: Refresh fails after a quick index is available
 
@@ -145,7 +134,7 @@ The system SHALL preserve the currently searchable index while a background refr
 #### Scenario: A new file arrives while content indexing is pending
 
 - **WHEN** the durable filename/path baseline has been published and the optional content index is still building
-- **THEN** the runtime watcher SHALL already observe configured roots
+- **THEN** the runtime watcher SHALL already observe active roots selected by the current performance mode
 - **AND** a file created after that baseline becomes searchable by its filename or path without waiting for content indexing to finish
 - **AND** content installation SHALL reconcile watcher changes before it replaces its baseline
 
@@ -153,19 +142,19 @@ The system SHALL preserve the currently searchable index while a background refr
 
 - **WHEN** the native watcher reports changes under an excluded directory
 - **THEN** those events SHALL be rejected before entering the bounded runtime queue
-- **AND** they SHALL NOT cause an overflow recovery for otherwise valid configured-root changes
+- **AND** they SHALL NOT cause an overflow recovery for otherwise valid active-root changes
 
 #### Scenario: The native event uses a canonical alias of a configured root
 
 - **WHEN** the operating system reports an event through a canonical path alias such as macOS `/private/var` for a configured `/var` root
-- **THEN** QuickFox SHALL associate the event with the original configured root
-- **AND** exclusion patterns SHALL be evaluated only within that configured-root boundary
-- **AND** index and manifest entries SHALL retain one stable configured-root identity
+- **THEN** QuickFox SHALL associate the event with the original active root
+- **AND** exclusion patterns SHALL be evaluated only within that active-root boundary
+- **AND** index and manifest entries SHALL retain one stable root identity
 
 #### Scenario: The native watcher requests a rescan
 
 - **WHEN** the native backend requests a rescan without reporting a concrete backend failure
-- **THEN** QuickFox SHALL schedule targeted calibration for the affected configured roots
+- **THEN** QuickFox SHALL schedule targeted calibration for the affected active roots
 - **AND** any discovered differences SHALL be committed as an incremental delta
 - **AND** a successful calibration SHALL clear the affected degraded-root state without forcing a baseline refresh
 
@@ -413,8 +402,9 @@ active baseline 和最新 checkpoint。
 
 #### Scenario: 隐式排除 Windows 系统噪音
 
-- **WHEN** 系统构建默认扫描选项
-- **THEN** 排除规则包含 `Windows`、`System Volume Information`、`$Recycle.Bin`、`AppData` 等系统噪音目录
+- **WHEN** 系统构建 Windows 默认扫描选项
+- **THEN** 排除规则包含 `Windows`、`ProgramData`、`PerfLogs`、`System Volume Information`、`$Recycle.Bin`、`Recovery`、`AppData`、Windows 升级目录和虚拟内存文件
+- **AND** 排除规则不排除 `Users`、Desktop、Documents 等普通用户数据目录
 
 #### Scenario: 隐式排除构建和缓存目录
 
@@ -876,3 +866,63 @@ baseline 估算超过 8 GiB 时 SHALL 拒绝持久化并提示缩小索引目录
 - **THEN** 系统终止该 baseline 写入
 - **AND** 最近可用 baseline 保持不变
 - **AND** 索引状态提供可诊断失败信息
+
+### Requirement: 索引配置 revision 可取代且可取消
+
+系统 SHALL 为每个已保存索引语义分配单调递增的 desired revision；后台扫描、持久化和发布 MUST 校验 revision 身份，新 revision MUST 使旧 revision 在遍历过程中协作式取消并不得覆盖新状态。
+
+#### Scenario: 连续保存取代旧扫描
+
+- **WHEN** 用户在大目录扫描期间再次保存不同索引配置
+- **THEN** 旧扫描在 root 或 walker entry 取消边界停止
+- **AND** 系统只排队并最终发布最新 desired revision
+
+#### Scenario: 旧 revision 完成结果被丢弃
+
+- **WHEN** 旧 worker 在新配置保存后才返回扫描或持久化结果
+- **THEN** identity fence 拒绝该结果更新 runtime、baseline 或应用状态
+
+### Requirement: 索引配置应用允许部分 root 降级
+
+系统 SHALL 在单个 active root 不可访问或出现目录项失败时继续处理其他可用 root；只要存在可用搜索视图，失败 MUST 作为 degraded/partial 状态报告而不是回滚 desired config 或清空旧索引。
+
+#### Scenario: 一个盘符离线时其他范围继续
+
+- **WHEN** balanced 或 complete 模式包含多个 roots 且其中一个盘符离线
+- **THEN** 可访问 roots 继续扫描并保持或进入搜索视图
+- **AND** 离线 root 记录为 dirty 或 failed root
+- **AND** 设置页提供重试或修改范围的恢复动作
+
+#### Scenario: 所有新 roots 失败
+
+- **WHEN** 新 revision 没有任何可用 root
+- **THEN** 系统把该 revision 标记为应用失败
+- **AND** 最近可用旧索引继续参与搜索
+- **AND** 已保存的 desired config 不被回滚
+
+### Requirement: Windows 默认索引全部可用盘符
+
+Windows 上系统 SHALL 在首次创建默认索引配置时选择当前可用盘符根目录。默认 `balanced` 模式 MUST 先发布应用入口和用户热路径，再在后台补全盘符范围；盘符或目录失败 MUST 使用 partial/retry 语义，不得撤销默认配置。
+
+#### Scenario: Windows 存在 C 盘和 D 盘
+
+- **WHEN** 用户首次启动 QuickFox 且没有配置文件
+- **THEN** 默认 `include_dirs` 包含 `C:\` 和 `D:\`
+- **AND** 系统目录仍由隐式规则排除
+
+#### Scenario: 未发现可用盘符
+
+- **WHEN** Windows 盘符发现没有返回任何可用根目录
+- **THEN** 默认索引范围回退当前用户 profile
+
+#### Scenario: 现有配置仍是 v1.6.1 自动热路径默认
+
+- **WHEN** 现有 Windows 索引配置与 v1.6.1 自动生成的用户热路径范围及其余默认索引字段完全一致
+- **THEN** 系统将 `include_dirs` 迁移为当前可用盘符根目录
+- **AND** 任一索引字段已被用户修改时不执行该迁移
+
+#### Scenario: 单个默认盘符不可访问
+
+- **WHEN** 默认全盘索引中一个盘符或子目录不可访问而其他盘符可用
+- **THEN** 系统发布其他盘符的可用结果并报告 partial/dirty 状态
+- **AND** 默认盘符配置保持不变并提供重试/校准入口
