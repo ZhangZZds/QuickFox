@@ -23,8 +23,9 @@ quickfox.sqlite-shm
 
 ## 重建建议
 
-Windows 新配置默认索引当前可用盘符；系统会自动跳过 Windows、ProgramData、恢复/
-升级目录、回收站、卷元数据、AppData 和虚拟内存文件。v1.6.1 完全未修改过的自动
+Windows 新配置默认索引当前可用的本地固定磁盘；系统会自动跳过 Windows、ProgramData、
+Program Files、恢复/升级目录、回收站、卷元数据、AppData 和虚拟内存文件。应用入口
+单独从系统与用户开始菜单建立索引。v1.6.1 完全未修改过的自动
 热路径默认会迁移为盘符范围；如果你改过任一索引设置，程序会尊重现有配置。
 
 如果机器规模仍超过 8 GiB baseline 或 5 GiB 剩余空间保护线，可以保留
@@ -40,5 +41,12 @@ include_dirs = [
 performance_mode = "balanced"
 ```
 
-新版本会阻止第二个 QuickFox 实例，使用可恢复的分块 baseline 写入，回收失效完整
-批次，并在写入可能突破 8 GiB baseline 或 5 GiB 剩余空间保护线时停止。
+新版本会阻止第二个 QuickFox 实例。扫描期间每 2,048 条持续写入同一个
+`quickfox.sqlite` 的 staging 表，因此不需要额外索引文件；WAL/SHM 只在 SQLite 需要时
+出现，文件大小也不等于已扫描磁盘容量。
+
+Windows 会同时扫描最多 2 个完整盘符，并在每个目录完成后提交恢复断点。异常退出后，
+相同配置直接恢复已完成盘的可搜索预览，并从未完成目录继续，不再重扫整盘。每个盘符
+使用独立 watcher；一个盘临时离线不会关闭其他盘的增量更新。单个子目录读取失败时，
+旧 baseline 中的对应范围会保留并显示为“部分可用”。最终激活后回收失效完整批次，并在
+写入可能突破 8 GiB baseline 或 5 GiB 剩余空间保护线时停止。

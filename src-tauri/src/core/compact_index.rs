@@ -169,57 +169,11 @@ impl EntryTable {
         entries: Vec<IndexedEntry>,
         arena_limit: usize,
     ) -> Result<Self, CompactIndexBuildError> {
-        if entries.len() > u32::MAX as usize {
-            return Err(CompactIndexBuildError::TooManyEntries {
-                count: entries.len(),
-            });
-        }
-
-        let mut table = Self::default();
-        let mut arena = PackedArenaBuilder::with_limit(arena_limit);
-        let mut ids = EntryIdAllocator::default();
-
+        let mut builder = EntryTableBuilder::with_limit(arena_limit);
         for entry in entries {
-            let id = ids.next_id();
-            let depth = u32::try_from(entry.depth)
-                .map_err(|_| CompactIndexBuildError::DepthTooLarge { depth: entry.depth })?;
-            let path = arena.store(&entry.path)?;
-            let name = arena.store_path_slice_or_value(path, &entry.path, &entry.name)?;
-            let parent = arena.store_optional_path_slice(path, &entry.path, &entry.parent)?;
-            let extension = match entry.extension.as_deref() {
-                Some(extension) if !extension.is_empty() => {
-                    arena.store_path_slice_or_value(path, &entry.path, extension)?
-                }
-                _ => PackedTextRange::MISSING,
-            };
-            let root = arena.store_optional_path_slice(path, &entry.path, &entry.root)?;
-            let standard_search_text = build_search_text(&entry.name, &entry.path);
-            let search_text =
-                if entry.search_text.is_empty() || entry.search_text == standard_search_text {
-                    PackedTextRange::MISSING
-                } else {
-                    arena.store(&entry.search_text)?
-                };
-            table.entries.push(CompactEntry {
-                id,
-                path,
-                name,
-                kind: entry.kind,
-                parent,
-                extension,
-                depth,
-                root,
-                modified_ms: entry.modified_ms,
-                size_bytes: entry.size_bytes,
-                search_text,
-                content_index_state: entry.content_index_state,
-            });
+            builder.push(entry)?;
         }
-
-        table.entries.shrink_to_fit();
-        table.unique_value_count = arena.unique_value_count();
-        table.arena = arena.finish();
-        Ok(table)
+        Ok(builder.finish())
     }
 
     pub fn get(&self, id: EntryId) -> Option<&CompactEntry> {
@@ -319,6 +273,80 @@ impl EntryTable {
 
     pub fn all_ids(&self) -> Vec<EntryId> {
         self.entries.iter().map(|entry| entry.id).collect()
+    }
+}
+
+#[derive(Debug)]
+struct EntryTableBuilder {
+    table: EntryTable,
+    arena: PackedArenaBuilder,
+    ids: EntryIdAllocator,
+}
+
+impl EntryTableBuilder {
+    fn with_limit(arena_limit: usize) -> Self {
+        Self {
+            table: EntryTable::default(),
+            arena: PackedArenaBuilder::with_limit(arena_limit),
+            ids: EntryIdAllocator::default(),
+        }
+    }
+
+    fn push(&mut self, entry: IndexedEntry) -> Result<(), CompactIndexBuildError> {
+        if self.table.entries.len() >= u32::MAX as usize {
+            return Err(CompactIndexBuildError::TooManyEntries {
+                count: self.table.entries.len().saturating_add(1),
+            });
+        }
+        let id = self.ids.next_id();
+        let depth = u32::try_from(entry.depth)
+            .map_err(|_| CompactIndexBuildError::DepthTooLarge { depth: entry.depth })?;
+        let path = self.arena.store(&entry.path)?;
+        let name = self
+            .arena
+            .store_path_slice_or_value(path, &entry.path, &entry.name)?;
+        let parent = self
+            .arena
+            .store_optional_path_slice(path, &entry.path, &entry.parent)?;
+        let extension = match entry.extension.as_deref() {
+            Some(extension) if !extension.is_empty() => {
+                self.arena
+                    .store_path_slice_or_value(path, &entry.path, extension)?
+            }
+            _ => PackedTextRange::MISSING,
+        };
+        let root = self
+            .arena
+            .store_optional_path_slice(path, &entry.path, &entry.root)?;
+        let standard_search_text = build_search_text(&entry.name, &entry.path);
+        let search_text =
+            if entry.search_text.is_empty() || entry.search_text == standard_search_text {
+                PackedTextRange::MISSING
+            } else {
+                self.arena.store(&entry.search_text)?
+            };
+        self.table.entries.push(CompactEntry {
+            id,
+            path,
+            name,
+            kind: entry.kind,
+            parent,
+            extension,
+            depth,
+            root,
+            modified_ms: entry.modified_ms,
+            size_bytes: entry.size_bytes,
+            search_text,
+            content_index_state: entry.content_index_state,
+        });
+        Ok(())
+    }
+
+    fn finish(mut self) -> EntryTable {
+        self.table.entries.shrink_to_fit();
+        self.table.unique_value_count = self.arena.unique_value_count();
+        self.table.arena = self.arena.finish();
+        self.table
     }
 }
 
@@ -913,6 +941,27 @@ pub struct CompactCandidateIndex {
     build_id: usize,
 }
 
+#[derive(Debug)]
+pub(crate) struct CompactCandidateIndexBuilder {
+    table: EntryTableBuilder,
+}
+
+impl CompactCandidateIndexBuilder {
+    pub(crate) fn new() -> Self {
+        Self {
+            table: EntryTableBuilder::with_limit(MISSING_RANGE_START as usize - 1),
+        }
+    }
+
+    pub(crate) fn push(&mut self, entry: IndexedEntry) -> Result<(), CompactIndexBuildError> {
+        self.table.push(entry)
+    }
+
+    pub(crate) fn finish(self) -> Result<CompactCandidateIndex, CompactIndexBuildError> {
+        CompactCandidateIndex::try_from_table(self.table.finish())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CandidateRetrievalStats {
     pub indexed_entry_count: usize,
@@ -958,12 +1007,15 @@ impl CompactCandidateIndex {
         entries: Vec<IndexedEntry>,
         arena_limit: usize,
     ) -> Result<Self, CompactIndexBuildError> {
+        let table = EntryTable::try_from_entries_with_arena_limit(entries, arena_limit)?;
+        Self::try_from_table(table)
+    }
+
+    fn try_from_table(table: EntryTable) -> Result<Self, CompactIndexBuildError> {
         #[cfg(test)]
         let build_id = COMPACT_INDEX_BUILD_COUNT
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1);
-
-        let table = EntryTable::try_from_entries_with_arena_limit(entries, arena_limit)?;
         Ok(Self {
             name_ngrams: NameNgramIndex::build(&table)?,
             extensions: ExtensionIndex::build(&table),
@@ -1140,6 +1192,10 @@ impl CompactCandidateIndex {
 
     pub fn path_scope_ids(&self, key: &str, subtree: bool) -> Vec<EntryId> {
         self.path_prefixes.scope_ids(&self.table, key, subtree)
+    }
+
+    pub fn exact_path_ids(&self, path: &str) -> Vec<EntryId> {
+        self.exact_paths.lookup(&self.table, path)
     }
 
     pub fn unique_path_key_count(&self) -> usize {

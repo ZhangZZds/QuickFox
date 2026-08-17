@@ -335,9 +335,33 @@ pub struct IndexStatus {
     #[serde(default)]
     pub failures: usize,
     #[serde(default)]
+    pub roots: Vec<IndexRootStatus>,
+    #[serde(default)]
     pub incremental: RuntimeIncrementalStatus,
     #[serde(default)]
     pub config_apply: IndexConfigApplyStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum IndexRootState {
+    Queued,
+    Scanning,
+    Ready,
+    Degraded,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IndexRootStatus {
+    pub root: String,
+    pub stage: String,
+    pub state: IndexRootState,
+    pub scanned: usize,
+    pub accepted: usize,
+    pub skipped: usize,
+    pub failures: usize,
+    pub message: Option<String>,
 }
 
 fn default_index_availability() -> IndexAvailability {
@@ -367,6 +391,7 @@ impl Default for IndexLifecycle {
                 accepted: 0,
                 skipped: 0,
                 failures: 0,
+                roots: Vec::new(),
                 incremental: RuntimeIncrementalStatus::default(),
                 config_apply: IndexConfigApplyStatus::default(),
             },
@@ -391,6 +416,7 @@ impl IndexLifecycle {
                 accepted: 0,
                 skipped: 0,
                 failures: 0,
+                roots: Vec::new(),
                 incremental: RuntimeIncrementalStatus::default(),
                 config_apply: IndexConfigApplyStatus::default(),
             },
@@ -421,6 +447,7 @@ impl IndexLifecycle {
         self.status.accepted = 0;
         self.status.skipped = 0;
         self.status.failures = 0;
+        self.status.roots.clear();
         self.generation
     }
 
@@ -438,14 +465,118 @@ impl IndexLifecycle {
 
         let stage = stage.into();
         self.status.availability = availability_for_progress_stage(&stage, entry_count);
-        self.status.stage = stage;
-        self.status.current_root = current_root;
+        self.status.stage = stage.clone();
+        self.status.current_root = current_root.clone();
         self.status.scanned = stats.scanned;
         self.status.accepted = stats.accepted;
         self.status.skipped = stats.skipped;
         self.status.failures = stats.failures;
         self.status.entry_count = entry_count;
+        if let Some(root) = current_root {
+            self.update_root_status(root, stage, IndexRootState::Scanning, stats, None);
+        }
         true
+    }
+
+    pub fn queue_roots(
+        &mut self,
+        generation: u64,
+        roots: impl IntoIterator<Item = (String, String)>,
+    ) -> bool {
+        if generation != self.generation {
+            return false;
+        }
+        for (stage, root) in roots {
+            self.update_root_status(
+                root,
+                stage,
+                IndexRootState::Queued,
+                IndexScanStats::default(),
+                None,
+            );
+        }
+        true
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn complete_root(
+        &mut self,
+        generation: u64,
+        stage: impl Into<String>,
+        root: String,
+        stats: IndexScanStats,
+        degraded: bool,
+        message: Option<String>,
+        entry_count: usize,
+    ) -> bool {
+        if generation != self.generation {
+            return false;
+        }
+        let stage = stage.into();
+        self.status.stage = stage.clone();
+        self.status.current_root = Some(root.clone());
+        self.status.scanned = stats.scanned;
+        self.status.accepted = stats.accepted;
+        self.status.skipped = stats.skipped;
+        self.status.failures = stats.failures;
+        self.status.entry_count = entry_count;
+        self.update_root_status(
+            root,
+            stage,
+            if degraded {
+                IndexRootState::Degraded
+            } else {
+                IndexRootState::Ready
+            },
+            stats,
+            message,
+        );
+        true
+    }
+
+    pub fn begin_finalization(&mut self, generation: u64, available_entry_count: usize) -> bool {
+        if generation != self.generation {
+            return false;
+        }
+        self.status.stage = "finalizing".to_owned();
+        self.status.current_root = None;
+        self.status.entry_count = available_entry_count;
+        self.status.availability = if available_entry_count == 0 {
+            IndexAvailability::Unavailable
+        } else {
+            IndexAvailability::Completing
+        };
+        true
+    }
+
+    fn update_root_status(
+        &mut self,
+        root: String,
+        stage: String,
+        state: IndexRootState,
+        stats: IndexScanStats,
+        message: Option<String>,
+    ) {
+        let next = IndexRootStatus {
+            root: root.clone(),
+            stage,
+            state,
+            scanned: stats.scanned,
+            accepted: stats.accepted,
+            skipped: stats.skipped,
+            failures: stats.failures,
+            message,
+        };
+        if let Some(current) = self
+            .status
+            .roots
+            .iter_mut()
+            .find(|current| current.root == root)
+        {
+            *current = next;
+        } else {
+            self.status.roots.push(next);
+        }
     }
 
     pub fn complete_refresh(
@@ -471,6 +602,7 @@ impl IndexLifecycle {
             accepted: self.status.accepted,
             skipped: self.status.skipped,
             failures: self.status.failures,
+            roots: self.status.roots.clone(),
             incremental: self.status.incremental.clone(),
             config_apply: self.status.config_apply.clone(),
         };
@@ -639,6 +771,7 @@ mod tests {
             accepted: 7,
             skipped: 3,
             failures: 1,
+            roots: Vec::new(),
             incremental: RuntimeIncrementalStatus::default(),
             config_apply: IndexConfigApplyStatus::default(),
         };
@@ -694,6 +827,56 @@ mod tests {
             lifecycle.status().availability,
             IndexAvailability::Completing
         );
+    }
+
+    #[test]
+    fn index_lifecycle_tracks_each_root_without_losing_completed_roots() {
+        let mut lifecycle = IndexLifecycle::default();
+        let generation = lifecycle.start_refresh(false);
+        assert!(lifecycle.queue_roots(
+            generation,
+            [
+                ("configured-roots".to_owned(), "D:\\".to_owned()),
+                ("configured-roots".to_owned(), "C:\\".to_owned()),
+            ],
+        ));
+        assert!(lifecycle
+            .status()
+            .roots
+            .iter()
+            .all(|root| root.state == IndexRootState::Queued));
+        assert!(lifecycle.complete_root(
+            generation,
+            "configured-roots",
+            "D:\\".to_owned(),
+            IndexScanStats {
+                scanned: 100,
+                accepted: 90,
+                skipped: 10,
+                failures: 0,
+            },
+            false,
+            None,
+            90,
+        ));
+        assert!(lifecycle.update_progress(
+            generation,
+            "configured-roots",
+            Some("C:\\".to_owned()),
+            IndexScanStats {
+                scanned: 30,
+                accepted: 20,
+                skipped: 5,
+                failures: 1,
+            },
+            110,
+        ));
+
+        assert_eq!(lifecycle.status().roots.len(), 2);
+        assert_eq!(lifecycle.status().roots[0].root, "D:\\");
+        assert_eq!(lifecycle.status().roots[0].state, IndexRootState::Ready);
+        assert_eq!(lifecycle.status().roots[1].root, "C:\\");
+        assert_eq!(lifecycle.status().roots[1].state, IndexRootState::Scanning);
     }
 
     #[test]

@@ -632,6 +632,70 @@ input {
   gap: 8px;
 }
 
+.settings-root-status-list {
+  display: grid;
+  gap: 8px;
+  padding-top: 4px;
+}
+
+.settings-root-status-heading,
+.settings-root-status-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.settings-root-status-heading span {
+  color: #657168;
+  font-size: 12px;
+}
+
+.settings-root-status-row {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+  padding: 9px 10px;
+  border: 1px solid #e2e8e4;
+  border-radius: 7px;
+  background: #f7faf8;
+}
+
+.settings-root-status-title strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.settings-root-status-title span {
+  flex: none;
+  padding: 2px 7px;
+  border-radius: 999px;
+  color: #526158;
+  background: #e8efeb;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.settings-root-status-title span[data-state="ready"] {
+  color: #24633e;
+  background: #dff2e6;
+}
+
+.settings-root-status-title span[data-state="degraded"] {
+  color: #855d19;
+  background: #fff0ce;
+}
+
+.settings-root-status-row small {
+  color: #657168;
+}
+
+.settings-root-status-row .settings-root-status-error {
+  color: #855d19;
+}
+
 .settings-meta-row {
   display: grid;
   grid-template-columns: 110px minmax(0, 1fr);

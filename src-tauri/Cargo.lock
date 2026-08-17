@@ -3250,7 +3250,7 @@ dependencies = [
 
 [[package]]
 name = "quickfox"
-version = "1.6.2"
+version = "1.6.3"
 dependencies = [
  "arboard",
  "content_inspector",
@@ -3273,6 +3273,7 @@ dependencies = [
  "tauri-plugin-single-instance",
  "tempfile",
  "toml 0.8.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

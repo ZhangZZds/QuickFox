@@ -107,6 +107,7 @@ describe("tauriClient", () => {
     });
 
     await expect(indexStatus()).resolves.toMatchObject({
+      roots: [],
       incremental: defaultRuntimeIncrementalStatus(),
     });
   });
@@ -217,6 +218,7 @@ describe("tauriClient", () => {
 
     expect(handler).toHaveBeenCalledWith(
       expect.objectContaining({
+        roots: [],
         incremental: defaultRuntimeIncrementalStatus(),
         configApply: defaultIndexConfigApplyStatus(),
       }),

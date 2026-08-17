@@ -732,8 +732,13 @@ impl RuntimeIndexingService {
             if failed_root_count > 0 {
                 self.publish_calibration_failure(dirty_roots.len(), false);
             } else {
-                self.status.state = IncrementalState::Watching;
-                self.status.degradation_code = None;
+                self.status.state = if remaining_dirty_root_count == 0 {
+                    IncrementalState::Watching
+                } else {
+                    IncrementalState::Degraded
+                };
+                self.status.degradation_code = (remaining_dirty_root_count > 0)
+                    .then_some(IndexDegradationCode::CalibrationFailed);
                 self.status.pending_events = 0;
                 self.status.dirty_roots = remaining_dirty_root_count;
                 self.publish_status();
@@ -827,6 +832,10 @@ impl RuntimeIndexingService {
     }
 
     fn publish_calibration_failure(&mut self, dirty_root_count: usize, request_refresh: bool) {
+        // A calibration failure means this service cannot prove that its handoff captured
+        // every filesystem change. Keep that separate from whether another full refresh
+        // should be requested; a refresh already in progress must not loop forever.
+        self.recovery_required.store(true, Ordering::Release);
         self.status.state = IncrementalState::Degraded;
         self.status.degradation_code = Some(IndexDegradationCode::CalibrationFailed);
         self.status.pending_events = 0;
@@ -1704,7 +1713,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_not_found_scan_commits_successes_without_rejecting_handoff() {
+    fn partial_not_found_scan_commits_successes_and_requires_handoff_reconciliation() {
         let root = tempfile::tempdir().unwrap();
         let accepted = root.path().join("accepted.md");
         fs::write(&accepted, "accepted").unwrap();
@@ -1738,7 +1747,10 @@ mod tests {
                 )
             })
         });
-        assert_eq!(handle.handoff(), RuntimeIndexingHandoffOutcome::Clean);
+        assert_eq!(
+            handle.handoff(),
+            RuntimeIndexingHandoffOutcome::RecoveryRequired
+        );
         let events = events.lock().unwrap();
 
         assert_eq!(
@@ -1779,7 +1791,7 @@ mod tests {
     }
 
     #[test]
-    fn inaccessible_child_keeps_old_view_without_rejecting_handoff() {
+    fn inaccessible_child_keeps_old_view_and_requires_handoff_reconciliation() {
         let root = tempfile::tempdir().unwrap();
         let old_path = root.path().join("old.md");
         fs::write(&old_path, "old").unwrap();
@@ -1842,7 +1854,10 @@ mod tests {
                 )
             })
         });
-        assert_eq!(handle.handoff(), RuntimeIndexingHandoffOutcome::Clean);
+        assert_eq!(
+            handle.handoff(),
+            RuntimeIndexingHandoffOutcome::RecoveryRequired
+        );
 
         let events = events.lock().unwrap();
         assert!(events
@@ -1883,7 +1898,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_scan_failures_keep_root_dirty_without_full_refresh_loop() {
+    fn repeated_scan_failures_keep_root_dirty_without_refresh_event_loop() {
         let root = tempfile::tempdir().unwrap();
         let failure_result = || TargetedScanResult {
             failures: vec![IndexFailure {
@@ -1918,7 +1933,10 @@ mod tests {
                     > expected_failures
             });
         }
-        assert_eq!(handle.handoff(), RuntimeIndexingHandoffOutcome::Clean);
+        assert_eq!(
+            handle.handoff(),
+            RuntimeIndexingHandoffOutcome::RecoveryRequired
+        );
         let events = events.lock().unwrap();
 
         assert_eq!(

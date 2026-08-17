@@ -448,6 +448,7 @@ export function App({
     message: null,
     generation: 0,
     completedAtMs: null,
+    roots: [],
     incremental: {
       enabled: true,
       state: "preparing",
@@ -2027,7 +2028,7 @@ function incrementalStatusText(status?: RuntimeIncrementalStatus) {
       case "calibrationFailed":
         return "部分目录暂不可访问；可用索引已保留，后续会继续校准";
       case "fullRefreshFallback":
-        return "自动增量不可用，需要完整刷新索引";
+        return "自动增量暂不可用；现有搜索仍可用，后台正在恢复";
       default:
         return "自动增量已降级，正在恢复索引";
     }
@@ -2047,6 +2048,7 @@ function IndexAuxiliaryDetails({
   const configFilePath = appPaths.configFilePath ?? "未找到";
   const indexSnapshotPath = appPaths.indexSnapshotPath ?? "尚未创建";
   const progressSummary = indexProgressSummary(status);
+  const roots = status.roots ?? [];
 
   return (
     <div className="settings-auxiliary-list">
@@ -2059,7 +2061,7 @@ function IndexAuxiliaryDetails({
         <span>{status.stage || indexStatusLabel(status)}</span>
       </div>
       <div className="settings-meta-row">
-        <span>当前 root</span>
+        <span>当前扫描位置</span>
         <span>{status.currentRoot ?? "暂无"}</span>
       </div>
       <div className="settings-meta-row">
@@ -2078,8 +2080,61 @@ function IndexAuxiliaryDetails({
         <span>{status.kind === "failed" ? "失败摘要" : "状态摘要"}</span>
         <span title={status.message ?? undefined}>{status.message ?? "暂无失败"}</span>
       </div>
+      {roots.length > 0 ? (
+        <section aria-label="逐盘索引状态" className="settings-root-status-list">
+          <div className="settings-root-status-heading">
+            <strong>逐盘索引状态</strong>
+            <span>已完成的盘可立即搜索，不等待其他盘</span>
+          </div>
+          {roots.map((root) => (
+            <div className="settings-root-status-row" key={`${root.stage}:${root.root}`}>
+              <div className="settings-root-status-title">
+                <strong title={root.root}>{root.root}</strong>
+                <span data-state={root.state}>{indexRootStateLabel(root.state)}</span>
+              </div>
+              <small>
+                {indexStageLabel(root.stage)} · 已扫描 {root.scanned} · 收录 {root.accepted} · 跳过{" "}
+                {root.skipped} · 失败 {root.failures}
+              </small>
+              {root.message ? (
+                <small className="settings-root-status-error">{root.message}</small>
+              ) : null}
+            </div>
+          ))}
+        </section>
+      ) : null}
     </div>
   );
+}
+
+function indexRootStateLabel(state: NonNullable<IndexStatus["roots"]>[number]["state"]) {
+  switch (state) {
+    case "queued":
+      return "等待中";
+    case "scanning":
+      return "扫描中";
+    case "ready":
+      return "可搜索";
+    case "degraded":
+      return "部分可用";
+  }
+}
+
+function indexStageLabel(stage: string) {
+  switch (stage) {
+    case "applications":
+      return "应用程序";
+    case "user-hot-paths":
+      return "常用目录";
+    case "configured-roots":
+      return "索引目录";
+    case "remaining-drives":
+      return "其他磁盘";
+    case "finalizing":
+      return "正在合并索引";
+    default:
+      return stage || "文件索引";
+  }
 }
 
 function formatCompletedAt(timestampMs: number) {

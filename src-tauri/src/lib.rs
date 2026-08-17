@@ -15,8 +15,10 @@ use crate::core::index::{
 use crate::core::index_entry::{
     normalize_path_key, normalize_path_text_key, path_is_same_or_descendant_for_mode,
     ContentIndexState, IncrementalState, IndexDegradationCode, IndexScanStats, IndexedEntry,
-    IndexedEntryKind, PathComparisonMode, RuntimeIncrementalStatus, ScanEvent,
+    PathComparisonMode, RuntimeIncrementalStatus,
 };
+#[cfg(test)]
+use crate::core::index_entry::{IndexedEntryKind, ScanEvent};
 use crate::core::index_journal::recover_layered_index;
 #[cfg(test)]
 use crate::core::index_refresh_orchestrator::RuntimeCalibrationSession;
@@ -50,9 +52,10 @@ use crate::core::runtime_indexing::{
 };
 use crate::core::search::{HistoryScores, QueryParser, QueryParserConfig, Ranker, SearchResult};
 use crate::core::storage::SqliteStorage;
+#[cfg(test)]
+use crate::core::targeted_index_scanner::baseline_manifest_from_entries;
 use crate::core::targeted_index_scanner::{
-    baseline_manifest_from_entries, DirectoryFingerprint, StdFileSystemProbe, TargetedIndexScanner,
-    TargetedScanResult,
+    DirectoryFingerprint, StdFileSystemProbe, TargetedIndexScanner, TargetedScanResult,
 };
 use keytap::{EventKind, Key, Tap};
 use serde::Serialize;
@@ -61,8 +64,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 use std::thread;
-#[cfg(test)]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tauri::image::Image;
 use tauri::{Emitter, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 use tauri_plugin_opener::OpenerExt;
@@ -83,6 +85,81 @@ struct QuickFoxRuntime {
     incremental_status: RuntimeIncrementalStatus,
     manifest_ready: bool,
     index_refresh: IndexRefreshControl,
+}
+
+#[derive(Debug)]
+struct IndexRefreshRootPreview {
+    root: PathBuf,
+    index: SearchIndex,
+}
+
+struct RefreshSearchView<'a> {
+    active: &'a LayeredSearchIndex,
+    previews: &'a std::collections::BTreeMap<String, IndexRefreshRootPreview>,
+}
+
+impl FileSearchIndex for RefreshSearchView<'_> {
+    fn search_files(
+        &self,
+        query: &crate::core::search::QueryRequest,
+        limit: usize,
+    ) -> Vec<SearchResult> {
+        if self.previews.is_empty() {
+            return self.active.search_files(query, limit);
+        }
+        let expanded_limit = limit.saturating_mul(self.previews.len().saturating_add(1));
+        let roots = self
+            .previews
+            .values()
+            .map(|preview| preview.root.as_path())
+            .collect::<Vec<_>>();
+        let mut merged = self
+            .active
+            .search_files(query, expanded_limit)
+            .into_iter()
+            .filter(|result| {
+                result.id.strip_prefix("path:").is_none_or(|path| {
+                    let path = Path::new(path);
+                    !roots.iter().any(|root| {
+                        path_is_same_or_descendant_for_mode(
+                            root,
+                            path,
+                            PathComparisonMode::native(),
+                        )
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        for preview in self.previews.values() {
+            merged.extend(
+                preview
+                    .index
+                    .search_files(query, expanded_limit)
+                    .into_iter()
+                    .filter(|result| !result.id.starts_with("feedback:")),
+            );
+        }
+        merged.sort_by(|left, right| {
+            right
+                .score
+                .cmp(&left.score)
+                .then_with(|| left.title.cmp(&right.title))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        let mut seen_ids = std::collections::BTreeSet::new();
+        merged.retain(|result| seen_ids.insert(result.id.clone()));
+        merged.truncate(limit);
+        merged
+    }
+
+    fn indexed_entry_count(&self) -> usize {
+        self.active.indexed_entry_count().saturating_add(
+            self.previews
+                .values()
+                .map(|preview| preview.index.indexed_entry_count())
+                .sum::<usize>(),
+        )
+    }
 }
 
 type ContentDeltaJob = Box<dyn FnOnce() + Send + 'static>;
@@ -214,6 +291,7 @@ struct IndexRefreshControl {
     root_monitor: Option<RootAvailabilityMonitorHandle>,
     watcher_calibration_required: bool,
     last_refresh_reason: Option<BaselineRefreshReason>,
+    root_previews: std::collections::BTreeMap<String, IndexRefreshRootPreview>,
 }
 
 impl IndexRefreshControl {
@@ -236,6 +314,7 @@ impl IndexRefreshControl {
             root_monitor: None,
             watcher_calibration_required: false,
             last_refresh_reason: None,
+            root_previews: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -246,7 +325,6 @@ struct IndexRefreshStart {
 }
 
 struct IndexRefreshHandoff {
-    tail_deltas: Vec<CommittedIndexDelta>,
     manifest: Vec<crate::core::targeted_index_scanner::DirectoryFingerprint>,
     authoritative_generation: u64,
     post_install_calibration_required: bool,
@@ -254,16 +332,19 @@ struct IndexRefreshHandoff {
 
 #[derive(Debug, Default)]
 struct IndexRefreshAccumulator {
+    #[cfg(test)]
     entries_by_path: std::collections::BTreeMap<String, IndexedEntry>,
     summary: IndexReport,
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 struct IndexRefreshPayload {
     entries: Vec<IndexedEntry>,
     summary: IndexReport,
 }
 
+#[cfg(test)]
 impl From<IndexReport> for IndexRefreshPayload {
     fn from(mut report: IndexReport) -> Self {
         let entries = std::mem::take(&mut report.entries);
@@ -274,6 +355,7 @@ impl From<IndexReport> for IndexRefreshPayload {
     }
 }
 
+#[cfg(test)]
 fn index_refresh_payload_has_no_usable_root(payload: &IndexRefreshPayload) -> bool {
     if !payload.entries.is_empty() || payload.summary.failures.is_empty() {
         return false;
@@ -317,11 +399,13 @@ impl IndexRefreshAccumulator {
                 .saturating_add(stage_report.scan_stats.failures),
         };
 
+        #[cfg(test)]
         for entry in stage_report.entries {
             self.entries_by_path.insert(entry.path.clone(), entry);
         }
     }
 
+    #[cfg(test)]
     fn progress_payload(&self) -> IndexRefreshPayload {
         IndexRefreshPayload {
             entries: self.entries(),
@@ -329,6 +413,7 @@ impl IndexRefreshAccumulator {
         }
     }
 
+    #[cfg(test)]
     fn final_payload(self) -> IndexRefreshPayload {
         IndexRefreshPayload {
             entries: self.entries_by_path.into_values().collect(),
@@ -336,6 +421,7 @@ impl IndexRefreshAccumulator {
         }
     }
 
+    #[cfg(test)]
     fn entries(&self) -> Vec<IndexedEntry> {
         self.entries_by_path.values().cloned().collect()
     }
@@ -378,9 +464,13 @@ fn search(
             .runtime
             .lock()
             .expect("quickfox runtime lock poisoned");
+        let search_view = RefreshSearchView {
+            active: &runtime.index,
+            previews: &runtime.index_refresh.root_previews,
+        };
         let results = perform_search_with_index_status(
             &runtime.config,
-            &runtime.index,
+            &search_view,
             &runtime.index_status(),
             &query,
         );
@@ -2209,6 +2299,7 @@ fn begin_runtime_index_refresh(runtime: &mut QuickFoxRuntime) -> Option<IndexRef
         return None;
     }
     let has_existing_index = runtime.index.entry_count() > 0;
+    runtime.index_refresh.root_previews.clear();
     runtime.index_refresh.config_apply_state = crate::core::index::IndexConfigApplyState::Applying;
     runtime.index_refresh.config_apply_error = None;
     let lifecycle_generation = runtime.index_lifecycle.start_refresh(has_existing_index);
@@ -2326,7 +2417,18 @@ fn windows_v161_default_index_dirs_from_home(
 
 #[cfg(target_os = "windows")]
 fn windows_existing_drive_roots() -> Vec<String> {
-    windows_drive_roots_from_letters('C'..='Z', |root| PathBuf::from(root).is_dir())
+    use windows_sys::Win32::Storage::FileSystem::{GetDriveTypeW, GetLogicalDrives};
+    use windows_sys::Win32::System::WindowsProgramming::DRIVE_FIXED;
+
+    let drive_mask = unsafe { GetLogicalDrives() };
+    ('C'..='Z')
+        .filter(|letter| drive_mask & (1 << (*letter as u32 - 'A' as u32)) != 0)
+        .filter_map(|letter| {
+            let root = format!("{letter}:\\");
+            let wide_root = [letter as u16, ':' as u16, '\\' as u16, 0];
+            (unsafe { GetDriveTypeW(wide_root.as_ptr()) } == DRIVE_FIXED).then_some(root)
+        })
+        .collect()
 }
 
 #[cfg(any(target_os = "windows", test))]
@@ -2501,6 +2603,11 @@ fn build_scan_options(config: &QuickFoxConfig) -> IndexScanOptions {
         }
     }
 
+    #[cfg(target_os = "windows")]
+    let respect_project_ignores = false;
+    #[cfg(not(target_os = "windows"))]
+    let respect_project_ignores = config.index.respect_project_ignores;
+
     IndexScanOptions {
         include_dirs: config
             .index
@@ -2510,7 +2617,7 @@ fn build_scan_options(config: &QuickFoxConfig) -> IndexScanOptions {
             .collect(),
         exclude_dirs,
         exclude_patterns,
-        respect_project_ignores: config.index.respect_project_ignores,
+        respect_project_ignores,
     }
 }
 
@@ -2521,15 +2628,27 @@ fn build_scan_plans(config: &QuickFoxConfig) -> Vec<IndexScanPlan> {
 
     let applications = existing_paths(application_index_roots());
     if !applications.is_empty() {
-        plans.push(scan_plan_for_stage(
-            "applications",
-            10,
-            applications,
-            &options,
-        ));
+        plans.extend(
+            applications
+                .into_iter()
+                .map(|root| scan_plan_for_stage("applications", 10, vec![root], &options)),
+        );
     }
 
-    let configured_roots = unique_pathbufs(options.include_dirs.clone());
+    #[allow(unused_mut)]
+    let mut configured_roots = unique_pathbufs(options.include_dirs.clone());
+    #[cfg(target_os = "windows")]
+    {
+        let system_drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_owned());
+        let system_drive = system_drive
+            .trim_end_matches(['/', '\\'])
+            .to_ascii_lowercase();
+        configured_roots.sort_by_key(|root| {
+            root.to_string_lossy()
+                .trim_end_matches(['/', '\\'])
+                .eq_ignore_ascii_case(&system_drive)
+        });
+    }
     let hot_paths = existing_paths(user_hot_path_roots())
         .into_iter()
         .filter(|path| {
@@ -2537,12 +2656,11 @@ fn build_scan_plans(config: &QuickFoxConfig) -> Vec<IndexScanPlan> {
         })
         .collect::<Vec<_>>();
     if !hot_paths.is_empty() {
-        plans.push(scan_plan_for_stage(
-            "user-hot-paths",
-            20,
-            hot_paths,
-            &options,
-        ));
+        plans.extend(
+            hot_paths
+                .into_iter()
+                .map(|root| scan_plan_for_stage("user-hot-paths", 20, vec![root], &options)),
+        );
     }
 
     if mode != IndexPerformanceMode::Fast && !configured_roots.is_empty() {
@@ -2637,15 +2755,24 @@ fn schedule_startup_indexing_in_setup<R: tauri::Runtime>(
         if let Err(error) = rebuild_recovered_content_index_and_publish(&worker_app, &state) {
             record_startup_content_rebuild_failure(&worker_app, &error);
         }
-        let enabled = state
-            .runtime
-            .lock()
-            .expect("quickfox runtime lock poisoned")
-            .config
-            .index
-            .watcher_enabled;
+        let (enabled, can_resume_incremental) = {
+            let runtime = state
+                .runtime
+                .lock()
+                .expect("quickfox runtime lock poisoned");
+            let roots = runtime_watch_roots(&runtime.config, &runtime.index);
+            (
+                runtime.config.index.watcher_enabled,
+                runtime_incremental_start_allowed(&runtime, &roots),
+            )
+        };
         if enabled {
-            if let Err(error) = start_background_index_refresh(worker_app.clone(), &state) {
+            let result = if can_resume_incremental {
+                restart_runtime_incremental_indexing(worker_app.clone(), &state)
+            } else {
+                start_background_index_refresh(worker_app.clone(), &state).map(|_| ())
+            };
+            if let Err(error) = result {
                 record_startup_index_refresh_failure(&worker_app, &error);
             }
         }
@@ -2741,11 +2868,14 @@ fn application_index_roots() -> Vec<PathBuf> {
                     .join("Programs"),
             );
         }
-        if let Ok(program_files) = std::env::var("ProgramFiles") {
-            roots.push(PathBuf::from(program_files));
-        }
-        if let Ok(program_files_x86) = std::env::var("ProgramFiles(x86)") {
-            roots.push(PathBuf::from(program_files_x86));
+        if let Ok(app_data) = std::env::var("APPDATA") {
+            roots.push(
+                PathBuf::from(app_data)
+                    .join("Microsoft")
+                    .join("Windows")
+                    .join("Start Menu")
+                    .join("Programs"),
+            );
         }
     }
 
@@ -2801,8 +2931,9 @@ fn existing_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
 
 fn unique_pathbufs(paths: Vec<PathBuf>) -> Vec<PathBuf> {
     let mut unique = Vec::new();
+    let mut keys = std::collections::BTreeSet::new();
     for path in paths {
-        if !unique.iter().any(|existing| existing == &path) {
+        if keys.insert(normalize_path_key(&path)) {
             unique.push(path);
         }
     }
@@ -2816,6 +2947,8 @@ fn implicit_exclude_patterns() -> Vec<String> {
         "System Volume Information",
         "Windows",
         "ProgramData",
+        "Program Files",
+        "Program Files (x86)",
         "PerfLogs",
         "Documents and Settings",
         "Recovery",
@@ -2960,6 +3093,265 @@ fn index_unavailable_message(status: &IndexStatus) -> String {
     }
 }
 
+#[derive(Debug)]
+struct IndexRootScanOutcome {
+    stage_name: String,
+    root_path: PathBuf,
+    root_text: String,
+    report: IndexReport,
+    entry_count: usize,
+    preview_index: SearchIndex,
+}
+
+#[derive(Debug)]
+enum IndexRootScanError {
+    Superseded,
+    Failed(String),
+}
+
+fn windows_parallel_volume_plan(plan: &IndexScanPlan) -> bool {
+    cfg!(target_os = "windows")
+        && matches!(
+            plan.stage.as_ref().map(|stage| stage.name.as_str()),
+            Some("configured-roots" | "remaining-drives")
+        )
+}
+
+fn scan_refresh_plan_to_staging(
+    storage: &SqliteStorage,
+    identity: &IndexRefreshIdentity,
+    plan: IndexScanPlan,
+    is_cancelled: impl Fn() -> bool,
+    mut on_progress: impl FnMut(IndexScanStats, usize) -> Result<(), String>,
+) -> Result<IndexRootScanOutcome, IndexRootScanError> {
+    let stage_name = plan
+        .stage
+        .as_ref()
+        .map(|stage| stage.name.clone())
+        .unwrap_or_else(|| "configured-roots".to_owned());
+    let root_path = plan
+        .include_roots
+        .first()
+        .cloned()
+        .ok_or_else(|| IndexRootScanError::Failed("索引扫描计划缺少根目录".to_owned()))?;
+    let root_text = root_path.to_string_lossy().into_owned();
+    let resumable_scan = !plan.respect_project_ignores;
+    let root_resume = if resumable_scan {
+        storage.prepare_index_staging_root(
+            &identity.config_fingerprint,
+            &root_path,
+            current_time_ms(),
+        )
+    } else {
+        storage
+            .reset_index_staging_root(&identity.config_fingerprint, &root_path)
+            .map(|_| crate::core::storage::IndexStagingRootResume {
+                pending_directories: vec![root_path.clone()],
+                completed_stats: IndexScanStats::default(),
+            })
+    }
+    .map_err(|error| {
+        IndexRootScanError::Failed(format!("无法准备索引暂存目录 {root_text}: {error}"))
+    })?;
+    if is_cancelled() {
+        return Err(IndexRootScanError::Superseded);
+    }
+
+    let initial_entry_count = storage
+        .index_staging_entry_count(&identity.config_fingerprint)
+        .unwrap_or(root_resume.completed_stats.accepted);
+    on_progress(root_resume.completed_stats.clone(), initial_entry_count)
+        .map_err(IndexRootScanError::Failed)?;
+
+    let scanner = IndexScanner;
+    let mut last_progress = Instant::now();
+    let fingerprint = identity.config_fingerprint.clone();
+    let mut append_batch = |entries: &[IndexedEntry], stats: &IndexScanStats| {
+        storage
+            .append_index_staging_entries(&fingerprint, entries, current_time_ms())
+            .map_err(std::io::Error::other)?;
+        if last_progress.elapsed() >= Duration::from_millis(500) {
+            last_progress = Instant::now();
+            let entry_count = storage
+                .index_staging_entry_count(&fingerprint)
+                .unwrap_or(stats.accepted);
+            on_progress(stats.clone(), entry_count).map_err(std::io::Error::other)?;
+        }
+        Ok(())
+    };
+    let scan_result = if resumable_scan {
+        scanner.scan_plan_resumable_cancellable_streaming(
+            plan,
+            root_resume.pending_directories,
+            root_resume.completed_stats,
+            &is_cancelled,
+            &mut append_batch,
+            |checkpoint| {
+                storage
+                    .checkpoint_index_staging_directory(
+                        &fingerprint,
+                        &checkpoint.root,
+                        &checkpoint.directory,
+                        &checkpoint.discovered_directories,
+                        &checkpoint.stats,
+                        checkpoint
+                            .failure
+                            .as_ref()
+                            .map(|failure| failure.message.as_str()),
+                        current_time_ms(),
+                    )
+                    .map_err(std::io::Error::other)?;
+                if checkpoint.failure.is_some() {
+                    storage
+                        .preserve_active_baseline_paths_in_staging(
+                            &fingerprint,
+                            std::slice::from_ref(&checkpoint.directory),
+                        )
+                        .map_err(std::io::Error::other)?;
+                }
+                Ok(())
+            },
+        )
+    } else {
+        scanner.scan_plan_cancellable_streaming(plan, &is_cancelled, &mut append_batch)
+    };
+    if is_cancelled() {
+        return Err(IndexRootScanError::Superseded);
+    }
+    let report = scan_result.map_err(|error| IndexRootScanError::Failed(error.to_string()))?;
+    let failed_paths = report
+        .failures
+        .iter()
+        .map(|failure| PathBuf::from(&failure.root))
+        .collect::<Vec<_>>();
+    storage
+        .preserve_active_baseline_paths_in_staging(&fingerprint, &failed_paths)
+        .and_then(|_| {
+            storage.mark_index_staging_root(
+                &fingerprint,
+                &root_path,
+                &stage_name,
+                !failed_paths.is_empty(),
+                current_time_ms(),
+            )
+        })
+        .map_err(|error| {
+            IndexRootScanError::Failed(format!("无法提交目录索引结果 {root_text}: {error}"))
+        })?;
+    let entry_count = storage
+        .index_staging_entry_count(&fingerprint)
+        .unwrap_or(report.scan_stats.accepted);
+    let preview_index = storage
+        .build_search_index_for_staging_root(&fingerprint, &root_path)
+        .map_err(|error| {
+            IndexRootScanError::Failed(format!("无法构建目录搜索视图 {root_text}: {error}"))
+        })?;
+    Ok(IndexRootScanOutcome {
+        stage_name,
+        root_path,
+        root_text,
+        report,
+        entry_count,
+        preview_index,
+    })
+}
+
+fn emit_index_refresh_scan_progress<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    identity: &IndexRefreshIdentity,
+    stage: String,
+    root: String,
+    stats: IndexScanStats,
+    entry_count: usize,
+) -> Result<(), String> {
+    let app_for_state = app.clone();
+    let progress_identity = identity.clone();
+    app.run_on_main_thread(move || {
+        let state = app_for_state.state::<QuickFoxAppState>();
+        if let Some(status) = apply_index_refresh_stage_for_identity(
+            &state,
+            &progress_identity,
+            stage,
+            Some(root),
+            stats,
+            entry_count,
+        ) {
+            let _ = app_for_state.emit("quickfox://index-status", status);
+        }
+    })
+    .map_err(|error| error.to_string())
+}
+
+fn publish_index_root_scan_outcome<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    identity: &IndexRefreshIdentity,
+    outcome: IndexRootScanOutcome,
+) -> Result<IndexReport, String> {
+    let root_stats = outcome.report.scan_stats.clone();
+    let root_degraded = !outcome.report.failures.is_empty();
+    let root_message = root_degraded.then(|| {
+        format!(
+            "{} 个位置暂不可访问，已保留最近可用结果",
+            outcome.report.failures.len()
+        )
+    });
+    let app_for_state = app.clone();
+    let progress_identity = identity.clone();
+    let stage = outcome.stage_name.clone();
+    let root = outcome.root_text.clone();
+    let entry_count = outcome.entry_count;
+    let root_preview = outcome.preview_index;
+    app.run_on_main_thread(move || {
+        let state = app_for_state.state::<QuickFoxAppState>();
+        if let Some(status) = apply_index_refresh_root_completion_for_identity(
+            &state,
+            &progress_identity,
+            stage,
+            root,
+            root_stats,
+            root_degraded,
+            root_message,
+            entry_count,
+            root_preview,
+        ) {
+            let _ = app_for_state.emit("quickfox://index-status", status);
+        }
+    })
+    .map_err(|error| error.to_string())?;
+    Ok(outcome.report)
+}
+
+fn publish_index_refresh_scan_failure<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    identity: &IndexRefreshIdentity,
+    message: String,
+) -> Result<(), String> {
+    let app_for_state = app.clone();
+    let failure_identity = identity.clone();
+    app.run_on_main_thread(move || {
+        let state = app_for_state.state::<QuickFoxAppState>();
+        if let Some(status) =
+            apply_failed_index_refresh_for_identity(&state, &failure_identity, message)
+        {
+            if finish_current_index_refresh(&state, &failure_identity) {
+                let _ = start_background_index_refresh(app_for_state.clone(), &state);
+                return;
+            }
+            let index_remains_available = !matches!(
+                status.availability,
+                crate::core::index::IndexAvailability::Unavailable
+            );
+            let _ = app_for_state.emit("quickfox://index-status", status);
+            if index_remains_available {
+                let _ = restart_runtime_incremental_indexing(app_for_state.clone(), &state);
+            }
+        } else if finish_superseded_index_refresh(&state, &failure_identity) {
+            let _ = start_background_index_refresh(app_for_state.clone(), &state);
+        }
+    })
+    .map_err(|error| error.to_string())
+}
+
 fn start_background_index_refresh<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: &QuickFoxAppState,
@@ -3042,6 +3434,22 @@ fn start_background_index_refresh_with_spawner<R: tauri::Runtime>(
             return Err(message);
         }
     };
+    let staging = match baseline_storage
+        .open_or_create_index_staging(&identity.config_fingerprint, current_time_ms())
+    {
+        Ok(staging) => staging,
+        Err(error) => {
+            let message = format!("无法创建索引暂存区: {error}");
+            record_index_refresh_runtime_failure(
+                state,
+                &identity,
+                RuntimeRestartFailureKind::Storage,
+            );
+            let _ = apply_failed_index_refresh_for_identity(state, &identity, message.clone());
+            let _ = finish_current_index_refresh(state, &identity);
+            return Err(message);
+        }
+    };
     let status = {
         state
             .runtime
@@ -3061,30 +3469,270 @@ fn start_background_index_refresh_with_spawner<R: tauri::Runtime>(
             let mut accumulator = IndexRefreshAccumulator::default();
             let mut update_result = Ok(());
             let mut scan_failed = false;
-
-            for plan in build_scan_plans(&config) {
+            let mut completed_roots = staging
+                .completed_roots
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>();
+            let scan_plans = build_scan_plans(&config);
+            for plan in &scan_plans {
+                let Some(root_path) = plan.include_roots.first().cloned() else {
+                    continue;
+                };
+                if !completed_roots.contains(&normalize_path_key(&root_path)) {
+                    continue;
+                }
+                let root_text = root_path.to_string_lossy().into_owned();
                 let stage_name = plan
                     .stage
                     .as_ref()
                     .map(|stage| stage.name.clone())
                     .unwrap_or_else(|| "configured-roots".to_owned());
-                let current_root = plan
-                    .include_roots
-                    .first()
-                    .map(|root| root.to_string_lossy().into_owned());
-                let stage_stats = IndexScanStats::default();
-                let stage_entry_count = accumulator.entries_by_path.len();
+                let preview_index = match baseline_storage
+                    .build_search_index_for_staging_root(&identity.config_fingerprint, &root_path)
+                {
+                    Ok(index) => index,
+                    Err(error) => {
+                        let _ = publish_index_refresh_scan_failure(
+                            &app,
+                            &identity,
+                            format!("无法恢复已完成目录的搜索视图 {root_text}: {error}"),
+                        );
+                        return;
+                    }
+                };
+                let root_entry_count = preview_index.entry_count();
+                let report = IndexReport {
+                    scan_stats: IndexScanStats {
+                        scanned: root_entry_count,
+                        accepted: root_entry_count,
+                        skipped: 0,
+                        failures: 0,
+                    },
+                    ..IndexReport::default()
+                };
+                let outcome = IndexRootScanOutcome {
+                    stage_name,
+                    root_path,
+                    root_text,
+                    report,
+                    entry_count: baseline_storage
+                        .index_staging_entry_count(&identity.config_fingerprint)
+                        .unwrap_or(root_entry_count),
+                    preview_index,
+                };
+                match publish_index_root_scan_outcome(&app, &identity, outcome) {
+                    Ok(report) => accumulator.merge(report),
+                    Err(error) => {
+                        let _ = publish_index_refresh_scan_failure(&app, &identity, error);
+                        return;
+                    }
+                }
+            }
+
+            let queued_roots = scan_plans
+                .iter()
+                .filter_map(|plan| {
+                    let root = plan.include_roots.first()?;
+                    (!completed_roots.contains(&normalize_path_key(root))).then(|| {
+                        (
+                            plan.stage
+                                .as_ref()
+                                .map(|stage| stage.name.clone())
+                                .unwrap_or_else(|| "configured-roots".to_owned()),
+                            root.to_string_lossy().into_owned(),
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+            if !queued_roots.is_empty() {
+                let queue_app = app.clone();
+                let queue_identity = identity.clone();
+                if app
+                    .run_on_main_thread(move || {
+                        let state = queue_app.state::<QuickFoxAppState>();
+                        if let Some(status) = apply_index_refresh_queued_roots_for_identity(
+                            &state,
+                            &queue_identity,
+                            queued_roots,
+                        ) {
+                            let _ = queue_app.emit("quickfox://index-status", status);
+                        }
+                    })
+                    .is_err()
+                {
+                    let _ = publish_index_refresh_scan_failure(
+                        &app,
+                        &identity,
+                        "无法发布索引目录排队状态".to_owned(),
+                    );
+                    return;
+                }
+            }
+            let parallel_plans = scan_plans
+                .iter()
+                .filter(|plan| windows_parallel_volume_plan(plan))
+                .filter(|plan| {
+                    plan.include_roots
+                        .first()
+                        .is_some_and(|root| !completed_roots.contains(&normalize_path_key(root)))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+
+            for plan_group in parallel_plans.chunks(2) {
+                let group_error = thread::scope(|scope| {
+                    let (result_sender, result_receiver) = mpsc::channel();
+                    for plan in plan_group.iter().cloned() {
+                        let result_sender = result_sender.clone();
+                        let worker_storage = baseline_storage.reopen();
+                        let worker_app = app.clone();
+                        let worker_identity = identity.clone();
+                        scope.spawn(move || {
+                            let result = match worker_storage {
+                                Ok(storage) => {
+                                    let stage = plan
+                                        .stage
+                                        .as_ref()
+                                        .map(|stage| stage.name.clone())
+                                        .unwrap_or_else(|| "configured-roots".to_owned());
+                                    let root = plan
+                                        .include_roots
+                                        .first()
+                                        .map(|root| root.to_string_lossy().into_owned())
+                                        .unwrap_or_default();
+                                    scan_refresh_plan_to_staging(
+                                        &storage,
+                                        &worker_identity,
+                                        plan,
+                                        || {
+                                            !index_refresh_identity_is_current_in_state(
+                                                &worker_app.state::<QuickFoxAppState>(),
+                                                &worker_identity,
+                                            )
+                                        },
+                                        |stats, entry_count| {
+                                            emit_index_refresh_scan_progress(
+                                                &worker_app,
+                                                &worker_identity,
+                                                stage.clone(),
+                                                root.clone(),
+                                                stats,
+                                                entry_count,
+                                            )
+                                        },
+                                    )
+                                }
+                                Err(error) => Err(IndexRootScanError::Failed(format!(
+                                    "无法创建并行索引数据库连接: {error}"
+                                ))),
+                            };
+                            let _ = result_sender.send(result);
+                        });
+                    }
+                    drop(result_sender);
+
+                    let mut group_error = None;
+                    for result in result_receiver {
+                        match result {
+                            Ok(outcome) => {
+                                let root_key = normalize_path_key(&outcome.root_path);
+                                match publish_index_root_scan_outcome(&app, &identity, outcome) {
+                                    Ok(report) => {
+                                        completed_roots.insert(root_key);
+                                        accumulator.merge(report);
+                                    }
+                                    Err(error) => {
+                                        group_error = Some(IndexRootScanError::Failed(error));
+                                    }
+                                }
+                            }
+                            Err(error) => group_error = Some(error),
+                        }
+                    }
+                    group_error
+                });
+                if let Some(error) = group_error {
+                    match error {
+                        IndexRootScanError::Superseded => {
+                            schedule_pending_refresh_after_superseded(
+                                app.clone(),
+                                identity.clone(),
+                            );
+                        }
+                        IndexRootScanError::Failed(message) => {
+                            let _ = publish_index_refresh_scan_failure(&app, &identity, message);
+                        }
+                    }
+                    return;
+                }
+            }
+
+            for plan in scan_plans {
+                let stage_name = plan
+                    .stage
+                    .as_ref()
+                    .map(|stage| stage.name.clone())
+                    .unwrap_or_else(|| "configured-roots".to_owned());
+                let current_root = plan.include_roots.first().cloned();
+                let Some(current_root_path) = current_root else {
+                    continue;
+                };
+                let current_root_key = normalize_path_key(&current_root_path);
+                let current_root_text = current_root_path.to_string_lossy().into_owned();
+                if completed_roots.contains(&current_root_key) {
+                    continue;
+                }
+                let resumable_scan = !plan.respect_project_ignores;
+                let root_resume = if resumable_scan {
+                    baseline_storage.prepare_index_staging_root(
+                        &identity.config_fingerprint,
+                        &current_root_path,
+                        current_time_ms(),
+                    )
+                } else {
+                    baseline_storage
+                        .reset_index_staging_root(&identity.config_fingerprint, &current_root_path)
+                        .map(|_| crate::core::storage::IndexStagingRootResume {
+                            pending_directories: vec![current_root_path.clone()],
+                            completed_stats: IndexScanStats::default(),
+                        })
+                };
+                let root_resume = match root_resume {
+                    Ok(resume) => resume,
+                    Err(error) => {
+                        scan_failed = true;
+                        let message = format!("无法准备索引暂存目录: {error}");
+                        let app_for_state = app.clone();
+                        let failure_identity = identity.clone();
+                        update_result = app.run_on_main_thread(move || {
+                            let state = app_for_state.state::<QuickFoxAppState>();
+                            if let Some(status) = apply_failed_index_refresh_for_identity(
+                                &state,
+                                &failure_identity,
+                                message,
+                            ) {
+                                let _ = app_for_state.emit("quickfox://index-status", status);
+                            }
+                        });
+                        break;
+                    }
+                };
+                let stage_stats = root_resume.completed_stats.clone();
+                let stage_entry_count = baseline_storage
+                    .index_staging_entry_count(&identity.config_fingerprint)
+                    .unwrap_or(accumulator.summary.scan_stats.accepted);
                 let app_for_stage = app.clone();
                 let stage_state = app_for_stage.clone();
                 let stage_identity = identity.clone();
                 let stage_for_status = stage_name.clone();
+                let stage_root_text = current_root_text.clone();
                 update_result = app_for_stage.run_on_main_thread(move || {
                     let state = stage_state.state::<QuickFoxAppState>();
                     if let Some(status) = apply_index_refresh_stage_for_identity(
                         &state,
                         &stage_identity,
                         stage_for_status,
-                        current_root,
+                        Some(stage_root_text),
                         stage_stats,
                         stage_entry_count,
                     ) {
@@ -3095,9 +3743,100 @@ fn start_background_index_refresh_with_spawner<R: tauri::Runtime>(
                     break;
                 }
                 let cancellation_state = app.state::<QuickFoxAppState>();
-                let scan_result = scanner.scan_plan_cancellable(plan, || {
-                    !index_refresh_identity_is_current_in_state(&cancellation_state, &identity)
-                });
+                let progress_app = app.clone();
+                let progress_identity = identity.clone();
+                let progress_stage = stage_name.clone();
+                let progress_root = current_root_text.clone();
+                let progress_fingerprint = identity.config_fingerprint.clone();
+                let mut last_progress = Instant::now();
+                let initial_root_accepted = root_resume.completed_stats.accepted;
+                let initial_staging_entry_count = stage_entry_count;
+                let mut append_batch = |entries: &[IndexedEntry], stats: &IndexScanStats| {
+                    baseline_storage
+                        .append_index_staging_entries(
+                            &progress_fingerprint,
+                            entries,
+                            current_time_ms(),
+                        )
+                        .map_err(std::io::Error::other)?;
+                    if last_progress.elapsed() >= Duration::from_millis(500) {
+                        last_progress = Instant::now();
+                        let status_app = progress_app.clone();
+                        let status_identity = progress_identity.clone();
+                        let status_stage = progress_stage.clone();
+                        let status_root = progress_root.clone();
+                        let status_stats = stats.clone();
+                        progress_app
+                            .run_on_main_thread(move || {
+                                let state = status_app.state::<QuickFoxAppState>();
+                                if let Some(status) = apply_index_refresh_stage_for_identity(
+                                    &state,
+                                    &status_identity,
+                                    status_stage,
+                                    Some(status_root),
+                                    status_stats.clone(),
+                                    initial_staging_entry_count.saturating_add(
+                                        status_stats.accepted.saturating_sub(initial_root_accepted),
+                                    ),
+                                ) {
+                                    let _ = status_app.emit("quickfox://index-status", status);
+                                }
+                            })
+                            .map_err(std::io::Error::other)?;
+                    }
+                    Ok(())
+                };
+                let scan_result = if resumable_scan {
+                    let checkpoint_fingerprint = identity.config_fingerprint.clone();
+                    scanner.scan_plan_resumable_cancellable_streaming(
+                        plan,
+                        root_resume.pending_directories,
+                        root_resume.completed_stats,
+                        || {
+                            !index_refresh_identity_is_current_in_state(
+                                &cancellation_state,
+                                &identity,
+                            )
+                        },
+                        &mut append_batch,
+                        |checkpoint| {
+                            baseline_storage
+                                .checkpoint_index_staging_directory(
+                                    &checkpoint_fingerprint,
+                                    &checkpoint.root,
+                                    &checkpoint.directory,
+                                    &checkpoint.discovered_directories,
+                                    &checkpoint.stats,
+                                    checkpoint
+                                        .failure
+                                        .as_ref()
+                                        .map(|failure| failure.message.as_str()),
+                                    current_time_ms(),
+                                )
+                                .map_err(std::io::Error::other)?;
+                            if checkpoint.failure.is_some() {
+                                baseline_storage
+                                    .preserve_active_baseline_paths_in_staging(
+                                        &checkpoint_fingerprint,
+                                        std::slice::from_ref(&checkpoint.directory),
+                                    )
+                                    .map_err(std::io::Error::other)?;
+                            }
+                            Ok(())
+                        },
+                    )
+                } else {
+                    scanner.scan_plan_cancellable_streaming(
+                        plan,
+                        || {
+                            !index_refresh_identity_is_current_in_state(
+                                &cancellation_state,
+                                &identity,
+                            )
+                        },
+                        &mut append_batch,
+                    )
+                };
                 let completed_at_ms = current_time_ms();
                 let app_for_update = app.clone();
                 let refresh_state = app.state::<QuickFoxAppState>();
@@ -3107,35 +3846,95 @@ fn start_background_index_refresh_with_spawner<R: tauri::Runtime>(
                 }
                 match scan_result {
                     Ok(stage_report) => {
-                        accumulator.merge(stage_report);
-                        if should_persist_index_checkpoint(&stage_name, false) {
-                            let checkpoint_entries = accumulator.entries();
-                            if !persist_checkpoint_for_identity(
-                                &refresh_state,
-                                &identity,
-                                completed_at_ms,
-                                &checkpoint_entries,
-                            ) {
-                                schedule_pending_refresh_after_superseded(
-                                    app.clone(),
-                                    identity.clone(),
-                                );
-                                return;
-                            }
+                        let failed_paths = stage_report
+                            .failures
+                            .iter()
+                            .map(|failure| PathBuf::from(&failure.root))
+                            .collect::<Vec<_>>();
+                        if let Err(error) = baseline_storage
+                            .preserve_active_baseline_paths_in_staging(
+                                &identity.config_fingerprint,
+                                &failed_paths,
+                            )
+                            .and_then(|_| {
+                                baseline_storage.mark_index_staging_root(
+                                    &identity.config_fingerprint,
+                                    &current_root_path,
+                                    &stage_name,
+                                    !failed_paths.is_empty(),
+                                    completed_at_ms,
+                                )
+                            })
+                        {
+                            scan_failed = true;
+                            let message = format!("无法提交目录索引结果: {error}");
+                            let app_for_state = app_for_update.clone();
+                            let failure_identity = identity.clone();
+                            update_result = app_for_update.run_on_main_thread(move || {
+                                let state = app_for_state.state::<QuickFoxAppState>();
+                                if let Some(status) = apply_failed_index_refresh_for_identity(
+                                    &state,
+                                    &failure_identity,
+                                    message,
+                                ) {
+                                    let _ = app_for_state.emit("quickfox://index-status", status);
+                                }
+                            });
+                            break;
                         }
-                        let progress_payload = accumulator.progress_payload();
-                        let current_root =
-                            last_finished_root_for_stage(&progress_payload.summary, &stage_name);
+                        let root_stats = stage_report.scan_stats.clone();
+                        let root_message = (!stage_report.failures.is_empty()).then(|| {
+                            format!(
+                                "{} 个位置暂不可访问，已保留最近可用结果",
+                                stage_report.failures.len()
+                            )
+                        });
+                        accumulator.merge(stage_report);
+                        let progress_entry_count = baseline_storage
+                            .index_staging_entry_count(&identity.config_fingerprint)
+                            .unwrap_or(root_stats.accepted);
+                        let root_preview = match baseline_storage
+                            .build_search_index_for_staging_root(
+                                &identity.config_fingerprint,
+                                &current_root_path,
+                            ) {
+                            Ok(index) => index,
+                            Err(error) => {
+                                scan_failed = true;
+                                let message = format!("无法构建目录搜索视图: {error}");
+                                let app_for_state = app_for_update.clone();
+                                let failure_identity = identity.clone();
+                                update_result = app_for_update.run_on_main_thread(move || {
+                                    let state = app_for_state.state::<QuickFoxAppState>();
+                                    if let Some(status) = apply_failed_index_refresh_for_identity(
+                                        &state,
+                                        &failure_identity,
+                                        message,
+                                    ) {
+                                        let _ =
+                                            app_for_state.emit("quickfox://index-status", status);
+                                    }
+                                });
+                                break;
+                            }
+                        };
                         let app_for_state = app_for_update.clone();
                         let progress_identity = identity.clone();
+                        let completed_stage = stage_name.clone();
+                        let completed_root = current_root_text.clone();
+                        let root_degraded = !failed_paths.is_empty();
                         update_result = app_for_update.run_on_main_thread(move || {
                             let state = app_for_state.state::<QuickFoxAppState>();
-                            if let Some(status) = apply_index_refresh_progress_for_identity(
+                            if let Some(status) = apply_index_refresh_root_completion_for_identity(
                                 &state,
                                 &progress_identity,
-                                stage_name,
-                                current_root,
-                                progress_payload,
+                                completed_stage,
+                                completed_root,
+                                root_stats,
+                                root_degraded,
+                                root_message,
+                                progress_entry_count,
+                                root_preview,
                             ) {
                                 let _ = app_for_state.emit("quickfox://index-status", status);
                             }
@@ -3188,13 +3987,36 @@ fn start_background_index_refresh_with_spawner<R: tauri::Runtime>(
             if update_result.is_ok() && !scan_failed {
                 let completed_at_ms = current_time_ms();
                 let app_for_update = app.clone();
-                let mut final_payload = accumulator.final_payload();
+                let staging_batch_id = match baseline_storage
+                    .complete_index_staging(&identity.config_fingerprint, completed_at_ms)
+                {
+                    Ok(batch_id) => batch_id,
+                    Err(error) => {
+                        let message = format!("无法完成索引暂存提交: {error}");
+                        let app_for_state = app.clone();
+                        let failure_identity = identity.clone();
+                        let _ = app.run_on_main_thread(move || {
+                            let state = app_for_state.state::<QuickFoxAppState>();
+                            if let Some(status) = apply_failed_index_refresh_for_identity(
+                                &state,
+                                &failure_identity,
+                                message,
+                            ) {
+                                let _ = app_for_state.emit("quickfox://index-status", status);
+                            }
+                            let _ = finish_current_index_refresh(&state, &failure_identity);
+                        });
+                        return;
+                    }
+                };
+                let final_summary = accumulator.summary;
+                let scan_failures = final_summary.failures.clone();
                 let handoff_state = app.state::<QuickFoxAppState>();
-                let (handoff, handoff_error) = match prepare_index_refresh_handoff(
+                let (mut handoff, handoff_error) = match prepare_index_refresh_handoff(
                     &handoff_state,
                     &identity,
                     &config,
-                    &final_payload.entries,
+                    staging_batch_id,
                     baseline_generation,
                 ) {
                     Ok(Some(handoff)) => (Some(handoff), None),
@@ -3211,49 +4033,73 @@ fn start_background_index_refresh_with_spawner<R: tauri::Runtime>(
                         (None, Some(error))
                     }
                 };
-                let tail_deltas = handoff
-                    .as_ref()
-                    .map(|handoff| handoff.tail_deltas.clone())
-                    .unwrap_or_default();
-                let post_install_calibration_required = handoff
-                    .as_ref()
-                    .is_some_and(|handoff| handoff.post_install_calibration_required);
+                if let Some(handoff) = handoff.as_mut() {
+                    invalidate_manifest_for_failed_paths(&mut handoff.manifest, &scan_failures);
+                }
+                let post_install_calibration_required = !scan_failures.is_empty()
+                    || handoff
+                        .as_ref()
+                        .is_some_and(|handoff| handoff.post_install_calibration_required);
                 let authoritative_generation = handoff
                     .as_ref()
                     .map(|handoff| handoff.authoritative_generation)
                     .unwrap_or(baseline_generation);
-                let content_entries =
-                    entries_after_committed_deltas(final_payload.entries.clone(), &tail_deltas);
-                final_payload.entries = content_entries.clone();
-                let scan_failures = final_payload.summary.failures.clone();
-                let should_build_content_index =
-                    should_build_content_index_for_config(&config, &content_entries);
+                let should_build_content_index = !content_index_roots(&config).is_empty();
+                if handoff.is_some() {
+                    let finalization_state = app.state::<QuickFoxAppState>();
+                    let Some((previews, status)) = take_index_refresh_previews_for_finalization(
+                        &finalization_state,
+                        &identity,
+                    ) else {
+                        schedule_pending_refresh_after_superseded(app.clone(), identity.clone());
+                        return;
+                    };
+                    // Release per-root compact previews on the worker before building the combined
+                    // compact baseline. The active baseline remains searchable during this short
+                    // finalization window, avoiding a multi-gigabyte transient memory peak.
+                    drop(previews);
+                    let _ = app.emit("quickfox://index-status", status);
+                }
+                let final_index = if handoff.is_some() {
+                    baseline_storage
+                        .build_search_index_for_batch(staging_batch_id)
+                        .map_err(|error| format!("无法从暂存数据库构建搜索索引: {error}"))
+                } else {
+                    Err(handoff_error
+                        .clone()
+                        .unwrap_or_else(|| "runtime index handoff preparation failed".to_owned()))
+                };
                 let persistence_state = app.state::<QuickFoxAppState>();
-                let mut persistence =
-                    if let Some(handoff) = &handoff {
+                let mut persistence = match (handoff.as_ref(), final_index) {
+                    (Some(handoff), Ok(index)) => {
                         let manifest = handoff.manifest.clone();
-                        persist_index_refresh_for_identity(
+                        let baseline_config_fingerprint = identity.config_fingerprint.clone();
+                        let entry_count = index.entry_count();
+                        persist_prebuilt_index_refresh_for_identity(
                             &persistence_state,
                             &identity,
-                            completed_at_ms,
-                            final_payload,
-                            authoritative_generation,
-                            move |completed_at_ms, entries, baseline_generation, _| {
-                                persist_and_activate_baseline_with_manifest(
-                                    completed_at_ms,
-                                    entries,
-                                    baseline_generation,
+                            index,
+                            final_summary,
+                            entry_count,
+                            move |_| {
+                                activate_staged_baseline_with_manifest(
+                                    staging_batch_id,
+                                    authoritative_generation,
                                     &manifest,
+                                    &baseline_config_fingerprint,
                                 )
                             },
                         )
-                    } else {
+                    }
+                    (_, Err(error)) => BaselinePersistenceOutcome::Failed(error),
+                    (None, Ok(_)) => {
                         BaselinePersistenceOutcome::Failed(handoff_error.unwrap_or_else(|| {
                             "runtime index handoff preparation failed".to_owned()
                         }))
-                    };
+                    }
+                };
                 let baseline_persistence_completed =
-                    matches!(persistence, BaselinePersistenceOutcome::Completed(_));
+                    matches!(persistence, BaselinePersistenceOutcome::Prepared { .. });
                 let app_for_state = app_for_update.clone();
                 let persistence_identity = identity.clone();
                 let persistence_tail_deltas = if baseline_persistence_completed {
@@ -3342,32 +4188,58 @@ fn start_background_index_refresh_with_spawner<R: tauri::Runtime>(
                         schedule_pending_refresh_after_superseded(app.clone(), identity.clone());
                         return;
                     }
-                    let content_progress_report = IndexReport {
-                        failures: Vec::new(),
-                        scan_stats: IndexScanStats {
-                            scanned: content_entries.len(),
-                            accepted: content_entries.len(),
-                            skipped: 0,
-                            failures: 0,
-                        },
-                        scan_events: Vec::new(),
-                        ..Default::default()
+                    let mut content_entries = match baseline_storage
+                        .load_index_entries_for_path_scopes(
+                            staging_batch_id,
+                            &content_index_roots(&config),
+                        ) {
+                        Ok(entries) => entries,
+                        Err(error) => {
+                            let message = format!("无法读取内容索引目录: {error}");
+                            let app_for_state = app.clone();
+                            let failure_identity = identity.clone();
+                            let _ = app.run_on_main_thread(move || {
+                                let state = app_for_state.state::<QuickFoxAppState>();
+                                if let Some(status) = apply_failed_index_refresh_for_identity(
+                                    &state,
+                                    &failure_identity,
+                                    message,
+                                ) {
+                                    let _ = app_for_state.emit("quickfox://index-status", status);
+                                }
+                                let _ = finish_current_index_refresh(&state, &failure_identity);
+                            });
+                            return;
+                        }
                     };
-                    let content_progress_payload = IndexRefreshPayload {
-                        entries: content_entries.clone(),
-                        summary: content_progress_report,
+                    let content_stats = IndexScanStats {
+                        scanned: content_entries.len(),
+                        accepted: content_entries.len(),
+                        skipped: 0,
+                        failures: 0,
                     };
+                    let baseline_entry_count = baseline_storage
+                        .index_batch_entry_count(staging_batch_id)
+                        .unwrap_or_else(|_| {
+                            content_state
+                                .runtime
+                                .lock()
+                                .expect("quickfox runtime lock poisoned")
+                                .index
+                                .entry_count()
+                        });
                     let app_for_update = app.clone();
                     let app_for_state = app_for_update.clone();
                     let content_progress_identity = identity.clone();
                     update_result = app_for_update.run_on_main_thread(move || {
                         let state = app_for_state.state::<QuickFoxAppState>();
-                        if let Some(status) = apply_index_refresh_progress_for_identity(
+                        if let Some(status) = apply_index_refresh_stage_for_identity(
                             &state,
                             &content_progress_identity,
                             "content-index".to_owned(),
                             None,
-                            content_progress_payload,
+                            content_stats,
+                            baseline_entry_count,
                         ) {
                             let _ = app_for_state.emit("quickfox://index-status", status);
                         }
@@ -3375,94 +4247,68 @@ fn start_background_index_refresh_with_spawner<R: tauri::Runtime>(
 
                     if update_result.is_ok() {
                         let content_completed_at_ms = current_time_ms();
-                        let persistence_state = app.state::<QuickFoxAppState>();
-                        let (content_index, mut persistence) =
-                            match build_search_index_with_content_for_config(
-                                &config,
-                                content_entries,
-                            ) {
-                                Ok(content_index) => {
-                                    let content_payload = IndexRefreshPayload {
-                                        entries: content_index.materialized_entries(),
-                                        summary: IndexReport {
-                                            failures: scan_failures.clone(),
-                                            ..Default::default()
-                                        },
-                                    };
-                                    let manifest = handoff
-                                        .as_ref()
-                                        .map(|handoff| handoff.manifest.clone())
-                                        .unwrap_or_default();
-                                    let persistence = persist_index_refresh_for_identity(
-                                        &persistence_state,
-                                        &identity,
-                                        content_completed_at_ms,
-                                        content_payload,
-                                        authoritative_generation,
-                                        move |completed_at_ms, entries, baseline_generation, _| {
-                                            persist_and_activate_baseline_with_manifest(
-                                                completed_at_ms,
-                                                entries,
-                                                baseline_generation,
-                                                &manifest,
-                                            )
-                                        },
-                                    );
-                                    (Some(content_index), persistence)
-                                }
-                                Err(error) => (
-                                    None,
-                                    BaselinePersistenceOutcome::Failed(format!(
-                                        "content index build failed: {error}"
-                                    )),
-                                ),
-                            };
-                        let app_for_update = app.clone();
-                        let app_for_state = app_for_update.clone();
-                        let content_identity = identity.clone();
-                        let content_tail_deltas =
-                            if matches!(persistence, BaselinePersistenceOutcome::Completed(_)) {
+                        let content_build = ContentIndex::build(
+                            &mut content_entries,
+                            content_index_options(&config),
+                        )
+                        .map_err(|error| format!("content index build failed: {error}"));
+                        let content_build = match content_build {
+                            Ok(mut content_index) => {
                                 match finalize_durable_refresh_successor(
-                                    &persistence_state,
+                                    &content_state,
                                     &identity,
                                     authoritative_generation,
                                 ) {
-                                    Ok(tail) => tail,
-                                    Err(error) => {
-                                        persistence = BaselinePersistenceOutcome::Failed(error);
-                                        Vec::new()
+                                    Ok(content_tail_deltas) => {
+                                        match reconcile_content_index_tail(
+                                            &config,
+                                            &mut content_index,
+                                            &mut content_entries,
+                                            &content_tail_deltas,
+                                        ) {
+                                            Ok(content_tail_entries) => {
+                                                if let Err(error) = baseline_storage
+                                                    .update_index_batch_content_states(
+                                                        staging_batch_id,
+                                                        &content_entries,
+                                                    )
+                                                {
+                                                    Err(format!("无法保存内容索引状态: {error}"))
+                                                } else {
+                                                    Ok((
+                                                        content_index,
+                                                        content_tail_entries,
+                                                        content_tail_deltas,
+                                                    ))
+                                                }
+                                            }
+                                            Err(error) => Err(format!(
+                                                "content index tail reconciliation failed: {error}"
+                                            )),
+                                        }
                                     }
+                                    Err(error) => Err(error),
                                 }
-                            } else {
-                                Vec::new()
-                            };
+                            }
+                            Err(error) => Err(error),
+                        };
+                        let app_for_update = app.clone();
+                        let app_for_state = app_for_update.clone();
+                        let content_identity = identity.clone();
                         update_result = app_for_update.run_on_main_thread(move || {
                             let state = app_for_state.state::<QuickFoxAppState>();
-                            match persistence {
-                                BaselinePersistenceOutcome::Completed(payload) => {
-                                    let Some(content_index) = content_index else {
-                                        if let Some(status) =
-                                            apply_failed_index_refresh_for_identity(
-                                                &state,
-                                                &content_identity,
-                                                "content index build completed without an index"
-                                                    .to_owned(),
-                                            )
-                                        {
-                                            let _ = app_for_state
-                                                .emit("quickfox://index-status", status);
-                                        }
-                                        return;
-                                    };
+                            match content_build {
+                                Ok((content_index, content_tail_entries, content_tail_deltas)) => {
                                     if let Some(status) =
-                                        apply_completed_content_index_refresh_for_identity(
+                                        apply_completed_content_attachment_for_identity(
                                             &state,
                                             &content_identity,
                                             authoritative_generation,
                                             content_index,
-                                            payload,
-                                            content_completed_at_ms,
+                                            &content_entries,
+                                            &content_tail_entries,
                                             &content_tail_deltas,
+                                            content_completed_at_ms,
                                         )
                                     {
                                         let partial_apply = matches!(
@@ -3504,7 +4350,7 @@ fn start_background_index_refresh_with_spawner<R: tauri::Runtime>(
                                         );
                                     }
                                 }
-                                BaselinePersistenceOutcome::Failed(error) => {
+                                Err(error) => {
                                     if let Some(status) = apply_failed_index_refresh_for_identity(
                                         &state,
                                         &content_identity,
@@ -3538,14 +4384,6 @@ fn start_background_index_refresh_with_spawner<R: tauri::Runtime>(
                                         &state,
                                         &content_identity,
                                     ) {
-                                        let _ = start_background_index_refresh(
-                                            app_for_state.clone(),
-                                            &state,
-                                        );
-                                    }
-                                }
-                                BaselinePersistenceOutcome::Superseded => {
-                                    if finish_superseded_index_refresh(&state, &content_identity) {
                                         let _ = start_background_index_refresh(
                                             app_for_state.clone(),
                                             &state,
@@ -3855,15 +4693,15 @@ fn schedule_pending_refresh_after_superseded<R: tauri::Runtime>(
     }
 }
 
-fn persist_and_activate_baseline_with_manifest(
-    completed_at_ms: i64,
-    entries: &[IndexedEntry],
+fn activate_staged_baseline_with_manifest(
+    baseline_id: i64,
     baseline_generation: u64,
     manifest: &[DirectoryFingerprint],
+    config_fingerprint: &str,
 ) -> Result<(), String> {
     let storage = storage_store().ok_or_else(|| "index storage is unavailable".to_owned())?;
-    let baseline_id = storage
-        .save_completed_index_batch(completed_at_ms, entries)
+    storage
+        .set_index_batch_config_fingerprint(baseline_id, config_fingerprint)
         .map_err(|error| error.to_string())?;
     storage
         .activate_baseline_with_manifest_and_clear_incremental_state(
@@ -3882,7 +4720,7 @@ fn prepare_index_refresh_handoff(
     state: &QuickFoxAppState,
     identity: &IndexRefreshIdentity,
     config: &QuickFoxConfig,
-    entries: &[IndexedEntry],
+    staged_batch_id: i64,
     scan_start_generation: u64,
 ) -> Result<Option<IndexRefreshHandoff>, String> {
     let handoff_parts = {
@@ -3925,14 +4763,10 @@ fn prepare_index_refresh_handoff(
         }
     };
     if let Some(previous) = previous {
-        if previous.handoff() == RuntimeIndexingHandoffOutcome::RecoveryRequired {
-            record_index_refresh_runtime_failure(
-                state,
-                identity,
-                RuntimeRestartFailureKind::Handoff,
-            );
-            return Err("runtime index handoff requires a recovery scan".to_owned());
-        }
+        // The previous service's recovery flag is the reason this full refresh exists.
+        // The standby capture, which started before the scan, is the authority for the
+        // scan-to-install window and decides whether post-install reconciliation is needed.
+        let _ = previous.handoff();
     }
 
     let capture_storage = storage_store().ok_or_else(|| {
@@ -4013,15 +4847,15 @@ fn prepare_index_refresh_handoff(
         record_index_refresh_runtime_failure(state, identity, RuntimeRestartFailureKind::Storage);
         "index journal storage is unavailable".to_owned()
     })?;
-    let (tail_deltas, manifest) =
-        load_full_refresh_handoff_snapshot(&storage, scan_start_generation, &roots, entries)
-            .inspect_err(|_| {
-                record_index_refresh_runtime_failure(
-                    state,
-                    identity,
-                    RuntimeRestartFailureKind::Storage,
-                );
-            })?;
+    let (tail_deltas, manifest) = load_full_refresh_handoff_snapshot_for_batch(
+        &storage,
+        scan_start_generation,
+        &roots,
+        staged_batch_id,
+    )
+    .inspect_err(|_| {
+        record_index_refresh_runtime_failure(state, identity, RuntimeRestartFailureKind::Storage);
+    })?;
 
     Ok(Some(IndexRefreshHandoff {
         authoritative_generation: authoritative_install_generation(
@@ -4031,7 +4865,6 @@ fn prepare_index_refresh_handoff(
                 .map(|delta| delta.generation)
                 .collect::<Vec<_>>(),
         ),
-        tail_deltas,
         manifest,
         post_install_calibration_required,
     }))
@@ -4180,6 +5013,39 @@ fn finalize_durable_refresh_successor_with_storage(
         .map_err(|error| error.to_string())
 }
 
+fn load_full_refresh_handoff_snapshot_for_batch(
+    storage: &SqliteStorage,
+    scan_start_generation: u64,
+    roots: &[PathBuf],
+    staged_batch_id: i64,
+) -> Result<(Vec<CommittedIndexDelta>, Vec<DirectoryFingerprint>), String> {
+    let tail_deltas = storage
+        .committed_index_deltas_after(scan_start_generation)
+        .map_err(|error| error.to_string())?;
+    storage
+        .apply_index_deltas_to_batch(staged_batch_id, &tail_deltas, current_time_ms())
+        .map_err(|error| error.to_string())?;
+    let mut manifest_by_path: std::collections::BTreeMap<String, DirectoryFingerprint> = storage
+        .index_manifest_for_batch(staged_batch_id, roots)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(|row| (normalize_path_text_key(&row.path), row))
+        .collect();
+    let touched_paths: Vec<PathBuf> = tail_deltas
+        .iter()
+        .flat_map(|delta| {
+            delta
+                .upserts
+                .iter()
+                .map(|entry| PathBuf::from(&entry.path))
+                .chain(delta.removals.iter().cloned())
+        })
+        .collect();
+    refresh_tail_touched_manifest_fingerprints(&mut manifest_by_path, &touched_paths, roots);
+    Ok((tail_deltas, manifest_by_path.into_values().collect()))
+}
+
+#[cfg(test)]
 fn load_full_refresh_handoff_snapshot(
     storage: &SqliteStorage,
     scan_start_generation: u64,
@@ -4272,6 +5138,24 @@ fn baseline_manifest_after_committed_deltas(
     manifest_by_path.into_values().collect()
 }
 
+fn invalidate_manifest_for_failed_paths(
+    manifest: &mut Vec<DirectoryFingerprint>,
+    failures: &[crate::core::index_entry::IndexFailure],
+) {
+    let mode = PathComparisonMode::native();
+    for failure in failures {
+        let failed_path = Path::new(&failure.root);
+        manifest.retain(|row| {
+            !path_is_same_or_descendant_for_mode(failed_path, Path::new(&row.path), mode)
+        });
+        for row in manifest.iter_mut().filter(|row| {
+            path_is_same_or_descendant_for_mode(Path::new(&row.path), failed_path, mode)
+        }) {
+            row.modified_ms = None;
+        }
+    }
+}
+
 fn prepare_refresh_standby_capture(
     state: &QuickFoxAppState,
     identity: &IndexRefreshIdentity,
@@ -4326,7 +5210,13 @@ fn refresh_capture_roots(
 
 #[derive(Debug)]
 enum BaselinePersistenceOutcome {
+    #[cfg(test)]
     Completed(IndexRefreshPayload),
+    Prepared {
+        index: Box<SearchIndex>,
+        summary: IndexReport,
+        entry_count: usize,
+    },
     Failed(String),
     Superseded,
 }
@@ -4341,6 +5231,7 @@ enum BaselinePersistenceApplicationOutcome {
     Superseded,
 }
 
+#[cfg(test)]
 fn persist_index_refresh_with(
     completed_at_ms: i64,
     payload: IndexRefreshPayload,
@@ -4364,6 +5255,7 @@ fn persist_index_refresh_with(
     }
 }
 
+#[cfg(test)]
 fn persist_index_refresh_for_identity(
     state: &QuickFoxAppState,
     identity: &IndexRefreshIdentity,
@@ -4393,6 +5285,44 @@ fn persist_index_refresh_for_identity(
         &config,
         persist,
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn persist_prebuilt_index_refresh_for_identity(
+    state: &QuickFoxAppState,
+    identity: &IndexRefreshIdentity,
+    index: SearchIndex,
+    summary: IndexReport,
+    entry_count: usize,
+    persist: impl FnOnce(&QuickFoxConfig) -> Result<(), String>,
+) -> BaselinePersistenceOutcome {
+    let _fence = state
+        .index_refresh_fence
+        .lock()
+        .expect("index refresh fence poisoned");
+    let config = {
+        let runtime = state
+            .runtime
+            .lock()
+            .expect("quickfox runtime lock poisoned");
+        if !index_refresh_identity_is_current(&runtime, identity) {
+            return BaselinePersistenceOutcome::Superseded;
+        }
+        runtime.config.clone()
+    };
+    if entry_count == 0 && !summary.failures.is_empty() {
+        return BaselinePersistenceOutcome::Failed(
+            "all active index roots failed; keeping the last available index".to_owned(),
+        );
+    }
+    match persist(&config) {
+        Ok(()) => BaselinePersistenceOutcome::Prepared {
+            index: Box::new(index),
+            summary,
+            entry_count,
+        },
+        Err(error) => BaselinePersistenceOutcome::Failed(error),
+    }
 }
 
 fn index_refresh_identity_is_current(
@@ -4456,67 +5386,6 @@ fn finish_current_index_refresh(state: &QuickFoxAppState, identity: &IndexRefres
             || runtime.index_refresh.config_fingerprint != identity.config_fingerprint)
 }
 
-fn persist_checkpoint_for_identity(
-    state: &QuickFoxAppState,
-    identity: &IndexRefreshIdentity,
-    completed_at_ms: i64,
-    entries: &[IndexedEntry],
-) -> bool {
-    let _fence = state
-        .index_refresh_fence
-        .lock()
-        .expect("index refresh fence poisoned");
-    if !index_refresh_identity_is_current(
-        &state
-            .runtime
-            .lock()
-            .expect("quickfox runtime lock poisoned"),
-        identity,
-    ) {
-        return false;
-    }
-    if let Some(storage) = storage_store() {
-        match storage.save_completed_index_batch(completed_at_ms, entries) {
-            Ok(checkpoint_id) => {
-                if let Err(error) = storage.prune_index_batches_after_checkpoint(checkpoint_id) {
-                    eprintln!("QuickFox obsolete checkpoint cleanup failed: {error}");
-                }
-            }
-            Err(error) => eprintln!("QuickFox index checkpoint persistence failed: {error}"),
-        }
-    }
-    true
-}
-
-fn apply_index_refresh_progress_for_identity(
-    state: &QuickFoxAppState,
-    identity: &IndexRefreshIdentity,
-    stage: String,
-    current_root: Option<String>,
-    payload: IndexRefreshPayload,
-) -> Option<IndexStatus> {
-    let _fence = state
-        .index_refresh_fence
-        .lock()
-        .expect("index refresh fence poisoned");
-    if !index_refresh_identity_is_current(
-        &state
-            .runtime
-            .lock()
-            .expect("quickfox runtime lock poisoned"),
-        identity,
-    ) {
-        return None;
-    }
-    apply_index_refresh_progress(
-        state,
-        identity.lifecycle_generation,
-        stage,
-        current_root,
-        payload,
-    )
-}
-
 fn apply_index_refresh_stage_for_identity(
     state: &QuickFoxAppState,
     identity: &IndexRefreshIdentity,
@@ -4544,6 +5413,107 @@ fn apply_index_refresh_stage_for_identity(
     {
         return None;
     }
+    Some(runtime.index_status())
+}
+
+fn apply_index_refresh_queued_roots_for_identity(
+    state: &QuickFoxAppState,
+    identity: &IndexRefreshIdentity,
+    roots: Vec<(String, String)>,
+) -> Option<IndexStatus> {
+    let _fence = state
+        .index_refresh_fence
+        .lock()
+        .expect("index refresh fence poisoned");
+    let mut runtime = state
+        .runtime
+        .lock()
+        .expect("quickfox runtime lock poisoned");
+    if !index_refresh_identity_is_current(&runtime, identity)
+        || !runtime
+            .index_lifecycle
+            .queue_roots(identity.lifecycle_generation, roots)
+    {
+        return None;
+    }
+    Some(runtime.index_status())
+}
+
+fn take_index_refresh_previews_for_finalization(
+    state: &QuickFoxAppState,
+    identity: &IndexRefreshIdentity,
+) -> Option<(
+    std::collections::BTreeMap<String, IndexRefreshRootPreview>,
+    IndexStatus,
+)> {
+    let _fence = state
+        .index_refresh_fence
+        .lock()
+        .expect("index refresh fence poisoned");
+    let mut runtime = state
+        .runtime
+        .lock()
+        .expect("quickfox runtime lock poisoned");
+    let available_entry_count = runtime.index.entry_count();
+    if !index_refresh_identity_is_current(&runtime, identity)
+        || !runtime
+            .index_lifecycle
+            .begin_finalization(identity.lifecycle_generation, available_entry_count)
+    {
+        return None;
+    }
+    let previews = std::mem::take(&mut runtime.index_refresh.root_previews);
+    Some((previews, runtime.index_status()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_index_refresh_root_completion_for_identity(
+    state: &QuickFoxAppState,
+    identity: &IndexRefreshIdentity,
+    stage: String,
+    root: String,
+    stats: IndexScanStats,
+    degraded: bool,
+    message: Option<String>,
+    entry_count: usize,
+    preview_index: SearchIndex,
+) -> Option<IndexStatus> {
+    let _fence = state
+        .index_refresh_fence
+        .lock()
+        .expect("index refresh fence poisoned");
+    let mut runtime = state
+        .runtime
+        .lock()
+        .expect("quickfox runtime lock poisoned");
+    if !index_refresh_identity_is_current(&runtime, identity)
+        || !runtime.index_lifecycle.complete_root(
+            identity.lifecycle_generation,
+            stage,
+            root.clone(),
+            stats,
+            degraded,
+            message,
+            entry_count,
+        )
+    {
+        return None;
+    }
+    let completed_root = PathBuf::from(&root);
+    runtime.index_refresh.root_previews.retain(|_, preview| {
+        !path_is_same_or_descendant_for_mode(
+            &completed_root,
+            &preview.root,
+            PathComparisonMode::native(),
+        )
+    });
+    runtime.index_refresh.root_previews.insert(
+        normalize_path_text_key(&root),
+        IndexRefreshRootPreview {
+            root: completed_root,
+            index: preview_index,
+        },
+    );
     Some(runtime.index_status())
 }
 
@@ -4629,6 +5599,51 @@ fn apply_baseline_persistence_outcome_for_identity(
     }
     let persistence_failed = matches!(&outcome, BaselinePersistenceOutcome::Failed(_));
     let mut application = match outcome {
+        BaselinePersistenceOutcome::Prepared {
+            index,
+            summary,
+            entry_count,
+        } => {
+            let mut runtime = state
+                .runtime
+                .lock()
+                .expect("quickfox runtime lock poisoned");
+            let installed = runtime.index.replace_baseline_with_authoritative_tail(
+                *index,
+                baseline_generation,
+                tail_deltas,
+            );
+            if installed {
+                runtime.index_refresh.search_view_epoch =
+                    runtime.index_refresh.search_view_epoch.saturating_add(1);
+                runtime.index_refresh.root_previews.clear();
+            }
+            let lifecycle_completed = !complete_lifecycle
+                || runtime.index_lifecycle.complete_refresh(
+                    identity.lifecycle_generation,
+                    entry_count,
+                    completed_at_ms,
+                );
+            if installed {
+                runtime.manifest_ready = true;
+                runtime.index_refresh.watcher_calibration_required = false;
+                runtime.last_report = summary;
+            }
+            let completed = installed && lifecycle_completed;
+            if completed {
+                let summary = runtime.last_report.clone();
+                record_index_config_apply_completion(
+                    &mut runtime,
+                    identity.config_revision,
+                    &summary,
+                );
+            }
+            Some(BaselinePersistenceApplication {
+                status: runtime.index_status(),
+                completed,
+            })
+        }
+        #[cfg(test)]
         BaselinePersistenceOutcome::Completed(payload) => {
             let mut runtime = state
                 .runtime
@@ -4661,6 +5676,7 @@ fn apply_baseline_persistence_outcome_for_identity(
             if installed {
                 runtime.index_refresh.search_view_epoch =
                     runtime.index_refresh.search_view_epoch.saturating_add(1);
+                runtime.index_refresh.root_previews.clear();
             }
             let lifecycle_completed = !complete_lifecycle
                 || runtime.index_lifecycle.complete_refresh(
@@ -4719,69 +5735,124 @@ fn apply_baseline_persistence_outcome_for_identity(
     BaselinePersistenceApplicationOutcome::Applied(application.map(Box::new))
 }
 
-fn apply_completed_content_index_refresh_for_identity(
+#[allow(clippy::too_many_arguments)]
+fn apply_completed_content_attachment_for_identity(
     state: &QuickFoxAppState,
     identity: &IndexRefreshIdentity,
     baseline_generation: u64,
-    content_index: SearchIndex,
-    payload: IndexRefreshPayload,
-    completed_at_ms: i64,
+    content_index: ContentIndex,
+    content_entries: &[IndexedEntry],
+    content_tail_entries: &[(u64, Vec<IndexedEntry>)],
     tail_deltas: &[CommittedIndexDelta],
+    completed_at_ms: i64,
 ) -> Option<IndexStatus> {
     let _fence = state
         .index_refresh_fence
         .lock()
         .expect("index refresh fence poisoned");
-    if !index_refresh_identity_is_current(
-        &state
-            .runtime
-            .lock()
-            .expect("quickfox runtime lock poisoned"),
-        identity,
-    ) {
-        return None;
-    }
-    if tail_deltas.is_empty() {
-        return apply_completed_content_index_refresh(
-            state,
-            identity.lifecycle_generation,
-            baseline_generation,
-            content_index,
-            payload,
-            completed_at_ms,
-        );
-    }
     let mut runtime = state
         .runtime
         .lock()
         .expect("quickfox runtime lock poisoned");
-    let entry_count = payload.entries.len();
-    let installed = runtime.index.replace_baseline_with_authoritative_tail(
-        content_index,
-        baseline_generation,
-        tail_deltas,
-    );
-    if installed {
-        runtime.index_refresh.search_view_epoch =
-            runtime.index_refresh.search_view_epoch.saturating_add(1);
+    if !index_refresh_identity_is_current(&runtime, identity) {
+        return None;
     }
-    if !installed
-        || !runtime.index_lifecycle.complete_refresh(
-            identity.lifecycle_generation,
-            entry_count,
-            completed_at_ms,
-        )
-    {
+    for delta in tail_deltas {
+        runtime.index.apply_delta(delta.clone());
+    }
+    if !runtime.index.attach_baseline_content_index(
+        baseline_generation,
+        content_index.clone(),
+        content_entries,
+    ) {
+        return None;
+    }
+    for (generation, entries) in content_tail_entries {
+        let _ = runtime
+            .index
+            .publish_content_delta(*generation, entries, content_index.clone());
+    }
+    runtime.index_refresh.search_view_epoch =
+        runtime.index_refresh.search_view_epoch.saturating_add(1);
+    let entry_count = runtime.index.entry_count();
+    if !runtime.index_lifecycle.complete_refresh(
+        identity.lifecycle_generation,
+        entry_count,
+        completed_at_ms,
+    ) {
         return None;
     }
     runtime.manifest_ready = true;
     runtime.index_refresh.watcher_calibration_required = false;
-    runtime.last_report = payload.summary;
     let summary = runtime.last_report.clone();
     record_index_config_apply_completion(&mut runtime, identity.config_revision, &summary);
     Some(runtime.index_status())
 }
 
+fn reconcile_content_index_tail(
+    config: &QuickFoxConfig,
+    content_index: &mut ContentIndex,
+    content_entries: &mut Vec<IndexedEntry>,
+    tail_deltas: &[CommittedIndexDelta],
+) -> Result<Vec<(u64, Vec<IndexedEntry>)>, String> {
+    let roots = content_index_roots(config);
+    let options = content_index_options(config);
+    let mut updated_by_generation = Vec::new();
+    for delta in tail_deltas {
+        for removal in &delta.removals {
+            let removed_paths = content_entries
+                .iter()
+                .filter(|entry| {
+                    path_is_same_or_descendant_for_mode(
+                        removal,
+                        Path::new(&entry.path),
+                        PathComparisonMode::native(),
+                    )
+                })
+                .map(|entry| entry.path.clone())
+                .collect::<Vec<_>>();
+            for path in &removed_paths {
+                content_index
+                    .remove_path(path)
+                    .map_err(|error| error.to_string())?;
+            }
+            content_entries.retain(|entry| {
+                !path_is_same_or_descendant_for_mode(
+                    removal,
+                    Path::new(&entry.path),
+                    PathComparisonMode::native(),
+                )
+            });
+        }
+        let mut updated = Vec::new();
+        for source in &delta.upserts {
+            if !roots
+                .iter()
+                .any(|root| Path::new(&source.path).starts_with(root))
+            {
+                continue;
+            }
+            let mut entry = source.clone();
+            content_index
+                .update_entry(
+                    &mut entry,
+                    &options,
+                    &crate::core::content_index::PlainTextExtractor,
+                )
+                .map_err(|error| error.to_string())?;
+            let key = normalize_path_text_key(&entry.path);
+            content_entries.retain(|existing| normalize_path_text_key(&existing.path) != key);
+            content_entries.push(entry.clone());
+            updated.push(entry);
+        }
+        if !updated.is_empty() {
+            updated_by_generation.push((delta.generation, updated));
+        }
+    }
+    Ok(updated_by_generation)
+}
+
+#[cfg(test)]
 fn entries_after_committed_deltas(
     entries: Vec<IndexedEntry>,
     deltas: &[CommittedIndexDelta],
@@ -4834,22 +5905,26 @@ fn entries_after_committed_deltas(
 fn apply_baseline_persistence_outcome(
     state: &QuickFoxAppState,
     generation: u64,
-    baseline_generation: u64,
+    _baseline_generation: u64,
     outcome: BaselinePersistenceOutcome,
-    completed_at_ms: i64,
+    _completed_at_ms: i64,
 ) -> Option<BaselinePersistenceApplication> {
     match outcome {
+        #[cfg(test)]
         BaselinePersistenceOutcome::Completed(payload) => apply_completed_index_refresh(
             state,
             generation,
-            baseline_generation,
+            _baseline_generation,
             payload,
-            completed_at_ms,
+            _completed_at_ms,
         )
         .map(|status| BaselinePersistenceApplication {
             status,
             completed: true,
         }),
+        BaselinePersistenceOutcome::Prepared { .. } => {
+            unreachable!("prebuilt baselines require refresh identity fencing")
+        }
         BaselinePersistenceOutcome::Failed(error) => {
             apply_failed_index_refresh(state, generation, error).map(|status| {
                 BaselinePersistenceApplication {
@@ -4884,6 +5959,7 @@ fn should_restart_after_baseline_persistence(
     runtime_incremental_start_allowed(&runtime, &roots)
 }
 
+#[cfg(test)]
 fn apply_completed_index_refresh(
     state: &QuickFoxAppState,
     generation: u64,
@@ -4912,45 +5988,6 @@ fn apply_completed_index_refresh(
         runtime
             .index
             .replace_baseline_with_authoritative_tail(baseline, baseline_generation, &[]);
-    if installed {
-        runtime.index_refresh.search_view_epoch =
-            runtime.index_refresh.search_view_epoch.saturating_add(1);
-    }
-    if !installed
-        || !runtime
-            .index_lifecycle
-            .complete_refresh(generation, entry_count, completed_at_ms)
-    {
-        return None;
-    }
-    runtime.manifest_ready = true;
-    runtime.index_refresh.watcher_calibration_required = false;
-    runtime.last_report = payload.summary;
-    let config_revision = runtime.index_refresh.config_revision;
-    let summary = runtime.last_report.clone();
-    record_index_config_apply_completion(&mut runtime, config_revision, &summary);
-    Some(runtime.index_status())
-}
-
-fn apply_completed_content_index_refresh(
-    state: &QuickFoxAppState,
-    generation: u64,
-    baseline_generation: u64,
-    content_index: SearchIndex,
-    payload: impl Into<IndexRefreshPayload>,
-    completed_at_ms: i64,
-) -> Option<IndexStatus> {
-    let payload = payload.into();
-    let mut runtime = state
-        .runtime
-        .lock()
-        .expect("quickfox runtime lock poisoned");
-    let entry_count = payload.entries.len();
-    let installed = runtime.index.replace_baseline_with_authoritative_tail(
-        content_index,
-        baseline_generation,
-        &[],
-    );
     if installed {
         runtime.index_refresh.search_view_epoch =
             runtime.index_refresh.search_view_epoch.saturating_add(1);
@@ -5742,6 +6779,7 @@ fn stop_runtime_incremental_indexing(state: &QuickFoxAppState) {
     }
 }
 
+#[cfg(test)]
 fn apply_index_refresh_progress(
     state: &QuickFoxAppState,
     generation: u64,
@@ -5813,6 +6851,7 @@ fn apply_failed_index_refresh(
     }
 }
 
+#[cfg(test)]
 fn last_finished_root_for_stage(report: &IndexReport, stage: &str) -> Option<String> {
     report
         .scan_events
@@ -5832,6 +6871,7 @@ fn last_finished_root_for_stage(report: &IndexReport, stage: &str) -> Option<Str
         })
 }
 
+#[cfg(test)]
 fn should_persist_index_checkpoint(stage: &str, is_final: bool) -> bool {
     is_final || stage == "user-hot-paths"
 }
@@ -5848,14 +6888,31 @@ fn build_runtime_with_startup_calibration(
     config: QuickFoxConfig,
     storage: &SqliteStorage,
 ) -> QuickFoxRuntime {
+    let expected_fingerprint = index_semantic_config_fingerprint(&config);
+    let baseline_matches_config = storage
+        .active_index_config_fingerprint()
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some(expected_fingerprint.as_str());
     let recovery = recover_layered_index(storage);
-    build_runtime_from_recovery(config, recovery)
+    let mut runtime = build_runtime_from_recovery(config, recovery);
+    if !baseline_matches_config {
+        runtime.manifest_ready = false;
+        runtime.index_refresh.config_apply_state =
+            crate::core::index::IndexConfigApplyState::Applying;
+        runtime.index_refresh.config_apply_error =
+            Some("当前索引来自旧配置，正在刷新所选磁盘".to_owned());
+        runtime.incremental_status.state = IncrementalState::Preparing;
+    }
+    runtime
 }
 
 fn build_runtime_from_recovery(
     config: QuickFoxConfig,
     mut recovery: crate::core::index_journal::IndexRecovery,
 ) -> QuickFoxRuntime {
+    let expected_manifest_roots = active_index_roots(&config);
     let mut lifecycle = if recovery.baseline_available() {
         IndexLifecycle::from_ready(recovery.baseline_entry_count(), current_time_ms())
     } else {
@@ -5866,7 +6923,7 @@ fn build_runtime_from_recovery(
         incremental_status.state = IncrementalState::Degraded;
         incremental_status.degradation_code = Some(code);
     }
-    let manifest_ready = !config.index.watcher_enabled && recovery.manifest_ready();
+    let manifest_ready = recovery.manifest_covers_roots(&expected_manifest_roots);
     if incremental_status.degradation_code.is_none() {
         incremental_status.state = if config.index.watcher_enabled {
             IncrementalState::Preparing
@@ -6223,7 +7280,13 @@ impl QuickFoxRuntime {
 
     fn index_status(&self) -> IndexStatus {
         let mut status = self.index_lifecycle.status().clone();
-        status.entry_count = self.index.entry_count();
+        let preview_entry_count = self
+            .index_refresh
+            .root_previews
+            .values()
+            .map(|preview| preview.index.entry_count())
+            .sum::<usize>();
+        status.entry_count = self.index.entry_count().max(preview_entry_count);
         status.incremental = self.incremental_status.clone();
         status.config_apply = crate::core::index::IndexConfigApplyStatus {
             state: self.index_refresh.config_apply_state,
@@ -8604,6 +9667,49 @@ mod tests {
             application.status.availability,
             crate::core::index::IndexAvailability::Unavailable
         );
+    }
+
+    #[test]
+    fn failed_subtree_is_removed_from_manifest_and_its_ancestors_are_forced_stale() {
+        let mut manifest = vec![
+            DirectoryFingerprint {
+                path: "/root".to_owned(),
+                parent: None,
+                root: "/root".to_owned(),
+                modified_ms: Some(1),
+            },
+            DirectoryFingerprint {
+                path: "/root/locked".to_owned(),
+                parent: Some("/root".to_owned()),
+                root: "/root".to_owned(),
+                modified_ms: Some(2),
+            },
+            DirectoryFingerprint {
+                path: "/root/locked/nested".to_owned(),
+                parent: Some("/root/locked".to_owned()),
+                root: "/root".to_owned(),
+                modified_ms: Some(3),
+            },
+            DirectoryFingerprint {
+                path: "/root/available".to_owned(),
+                parent: Some("/root".to_owned()),
+                root: "/root".to_owned(),
+                modified_ms: Some(4),
+            },
+        ];
+
+        invalidate_manifest_for_failed_paths(
+            &mut manifest,
+            &[crate::core::index_entry::IndexFailure {
+                root: "/root/locked".to_owned(),
+                message: "access denied".to_owned(),
+            }],
+        );
+
+        assert_eq!(manifest.len(), 2);
+        assert_eq!(manifest[0].path, "/root");
+        assert_eq!(manifest[0].modified_ms, None);
+        assert_eq!(manifest[1].path, "/root/available");
     }
 
     #[test]
@@ -12125,6 +13231,7 @@ mod tests {
             accepted: 0,
             skipped: 0,
             failures: 0,
+            roots: Vec::new(),
             incremental: crate::core::index_entry::RuntimeIncrementalStatus::default(),
             config_apply: crate::core::index::IndexConfigApplyStatus::default(),
         };

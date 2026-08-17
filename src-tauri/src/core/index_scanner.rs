@@ -8,6 +8,7 @@ use crate::core::index_entry::{
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::gitignore::{gitconfig_excludes_path, Gitignore, GitignoreBuilder};
 use ignore::{DirEntry, Match, WalkBuilder};
+use std::collections::VecDeque;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -42,6 +43,15 @@ pub struct IndexScanPlan {
     pub exclude_patterns: Vec<String>,
     pub respect_project_ignores: bool,
     pub stage: Option<IndexScanStage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexDirectoryScanCheckpoint {
+    pub root: PathBuf,
+    pub directory: PathBuf,
+    pub discovered_directories: Vec<PathBuf>,
+    pub stats: IndexScanStats,
+    pub failure: Option<IndexFailure>,
 }
 
 #[derive(Debug, Clone)]
@@ -634,8 +644,219 @@ impl IgnoreScanner {
         plan: IndexScanPlan,
         is_cancelled: impl Fn() -> bool,
     ) -> Result<IndexReport, std::io::Error> {
+        self.scan_cancellable_inner(plan, is_cancelled, true, |_, _| Ok(()))
+    }
+
+    pub fn scan_cancellable_streaming(
+        &self,
+        plan: IndexScanPlan,
+        is_cancelled: impl Fn() -> bool,
+        on_batch: impl FnMut(&[IndexedEntry], &IndexScanStats) -> Result<(), std::io::Error>,
+    ) -> Result<IndexReport, std::io::Error> {
+        self.scan_cancellable_inner(plan, is_cancelled, false, on_batch)
+    }
+
+    pub fn scan_resumable_cancellable_streaming(
+        &self,
+        plan: IndexScanPlan,
+        pending_directories: Vec<PathBuf>,
+        completed_stats: IndexScanStats,
+        is_cancelled: impl Fn() -> bool,
+        mut on_batch: impl FnMut(&[IndexedEntry], &IndexScanStats) -> Result<(), std::io::Error>,
+        mut on_directory: impl FnMut(&IndexDirectoryScanCheckpoint) -> Result<(), std::io::Error>,
+    ) -> Result<IndexReport, std::io::Error> {
+        const STREAM_BATCH_SIZE: usize = 2_048;
+        if plan.respect_project_ignores {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "resumable scanning requires project ignore handling to be disabled",
+            ));
+        }
+        let rules = IndexPathRules::from_plan(&plan)?;
+        let Some(root) = rules.roots.first().cloned() else {
+            return Ok(IndexReport::default());
+        };
+        if rules.roots.len() != 1 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "resumable scanning accepts exactly one configured root",
+            ));
+        }
+
+        let root_label = path_to_string(&root);
+        let stage_name = plan.stage.as_ref().map(|stage| stage.name.clone());
+        let mut report = IndexReport {
+            scan_stats: completed_stats,
+            ..IndexReport::default()
+        };
+        report.scan_events.push(ScanEvent::RootStarted {
+            root: root_label.clone(),
+            stage: stage_name.clone(),
+        });
+        if !root.is_dir() {
+            let failure = IndexFailure {
+                root: root_label.clone(),
+                message: "index root is not a readable directory".to_owned(),
+            };
+            push_failure(&mut report, failure.clone());
+            on_directory(&IndexDirectoryScanCheckpoint {
+                root: root.clone(),
+                directory: root.clone(),
+                discovered_directories: Vec::new(),
+                stats: IndexScanStats {
+                    failures: 1,
+                    ..IndexScanStats::default()
+                },
+                failure: Some(failure),
+            })?;
+            report.scan_events.push(ScanEvent::RootFinished {
+                root: root_label,
+                stage: stage_name,
+                stats: report.scan_stats.clone(),
+            });
+            return Ok(report);
+        }
+
+        let mut queue = VecDeque::from(pending_directories);
+        let mut queued_keys: HashSet<String> = queue.iter().map(normalize_path_key).collect();
+        let mut pending_entries = Vec::with_capacity(STREAM_BATCH_SIZE);
+        while let Some(directory) = queue.pop_front() {
+            if is_cancelled() {
+                break;
+            }
+            queued_keys.remove(&normalize_path_key(&directory));
+            let mut directory_stats = IndexScanStats::default();
+            let mut discovered_directories = Vec::new();
+            let mut directory_failure = None;
+            let read_dir = match fs::read_dir(&directory) {
+                Ok(read_dir) => read_dir,
+                Err(error) => {
+                    directory_failure = Some(IndexFailure {
+                        root: path_to_string(&directory),
+                        message: error.to_string(),
+                    });
+                    report.scan_stats.failures = report.scan_stats.failures.saturating_add(1);
+                    directory_stats.failures = 1;
+                    let failure = directory_failure.clone().expect("directory failure set");
+                    report.scan_events.push(ScanEvent::Failure(failure.clone()));
+                    report.failures.push(failure);
+                    on_directory(&IndexDirectoryScanCheckpoint {
+                        root: root.clone(),
+                        directory,
+                        discovered_directories,
+                        stats: directory_stats,
+                        failure: directory_failure,
+                    })?;
+                    continue;
+                }
+            };
+
+            for entry in read_dir {
+                if is_cancelled() {
+                    break;
+                }
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        directory_failure = Some(IndexFailure {
+                            root: path_to_string(&directory),
+                            message: error.to_string(),
+                        });
+                        break;
+                    }
+                };
+                let path = entry.path();
+                if rules.is_excluded(&path) {
+                    report.scan_stats.skipped = report.scan_stats.skipped.saturating_add(1);
+                    directory_stats.skipped = directory_stats.skipped.saturating_add(1);
+                    continue;
+                }
+                let file_type = match entry.file_type() {
+                    Ok(file_type) => file_type,
+                    Err(error) => {
+                        directory_failure = Some(IndexFailure {
+                            root: path_to_string(&path),
+                            message: error.to_string(),
+                        });
+                        break;
+                    }
+                };
+                report.scan_stats.scanned = report.scan_stats.scanned.saturating_add(1);
+                directory_stats.scanned = directory_stats.scanned.saturating_add(1);
+                let kind = if is_application_path(&path) {
+                    IndexedEntryKind::Application
+                } else if file_type.is_dir() {
+                    IndexedEntryKind::Directory
+                } else if file_type.is_file() {
+                    IndexedEntryKind::File
+                } else {
+                    report.scan_stats.skipped = report.scan_stats.skipped.saturating_add(1);
+                    directory_stats.skipped = directory_stats.skipped.saturating_add(1);
+                    continue;
+                };
+                pending_entries.push(IndexedEntry::from_path_metadata(&path, &root, kind));
+                report.scan_stats.accepted = report.scan_stats.accepted.saturating_add(1);
+                directory_stats.accepted = directory_stats.accepted.saturating_add(1);
+                if file_type.is_dir() && !is_application_path(&path) {
+                    discovered_directories.push(path);
+                }
+                if pending_entries.len() >= STREAM_BATCH_SIZE {
+                    on_batch(&pending_entries, &report.scan_stats)?;
+                    pending_entries.clear();
+                }
+            }
+
+            if is_cancelled() {
+                break;
+            }
+            if let Some(failure) = directory_failure.clone() {
+                pending_entries.clear();
+                directory_stats.failures = directory_stats.failures.saturating_add(1);
+                report.scan_stats.failures = report.scan_stats.failures.saturating_add(1);
+                report.scan_events.push(ScanEvent::Failure(failure.clone()));
+                report.failures.push(failure);
+                discovered_directories.clear();
+            } else if !pending_entries.is_empty() {
+                on_batch(&pending_entries, &report.scan_stats)?;
+                pending_entries.clear();
+            }
+
+            discovered_directories.sort_by_key(|directory| normalize_path_key(directory));
+            discovered_directories
+                .dedup_by(|left, right| normalize_path_key(left) == normalize_path_key(right));
+            on_directory(&IndexDirectoryScanCheckpoint {
+                root: root.clone(),
+                directory: directory.clone(),
+                discovered_directories: discovered_directories.clone(),
+                stats: directory_stats,
+                failure: directory_failure,
+            })?;
+            for discovered in discovered_directories {
+                if queued_keys.insert(normalize_path_key(&discovered)) {
+                    queue.push_back(discovered);
+                }
+            }
+        }
+
+        report.scan_events.push(ScanEvent::RootFinished {
+            root: root_label,
+            stage: stage_name,
+            stats: report.scan_stats.clone(),
+        });
+        Ok(report)
+    }
+
+    fn scan_cancellable_inner(
+        &self,
+        plan: IndexScanPlan,
+        is_cancelled: impl Fn() -> bool,
+        retain_entries: bool,
+        mut on_batch: impl FnMut(&[IndexedEntry], &IndexScanStats) -> Result<(), std::io::Error>,
+    ) -> Result<IndexReport, std::io::Error> {
+        const STREAM_BATCH_SIZE: usize = 2_048;
         let rules = IndexPathRules::from_plan(&plan)?;
         let mut report = IndexReport::default();
+        let mut pending_entries = Vec::with_capacity(STREAM_BATCH_SIZE);
 
         for root in rules.roots.clone() {
             if is_cancelled() {
@@ -694,8 +915,16 @@ impl IgnoreScanner {
                         }
                         report.scan_stats.scanned += 1;
                         if let Some(indexed_entry) = indexed_entry_from_dir_entry(&entry, &root) {
-                            report.entries.push(indexed_entry);
+                            pending_entries.push(indexed_entry);
                             report.scan_stats.accepted += 1;
+                            if pending_entries.len() >= STREAM_BATCH_SIZE {
+                                on_batch(&pending_entries, &report.scan_stats)?;
+                                if retain_entries {
+                                    report.entries.append(&mut pending_entries);
+                                } else {
+                                    pending_entries.clear();
+                                }
+                            }
                         } else {
                             report.scan_stats.skipped += 1;
                         }
@@ -709,6 +938,15 @@ impl IgnoreScanner {
                         };
                         push_failure(&mut report, failure);
                     }
+                }
+            }
+
+            if !pending_entries.is_empty() {
+                on_batch(&pending_entries, &report.scan_stats)?;
+                if retain_entries {
+                    report.entries.append(&mut pending_entries);
+                } else {
+                    pending_entries.clear();
                 }
             }
 
@@ -1439,6 +1677,103 @@ mod tests {
         assert!(rules.is_forced_or_user_excluded(&user_excluded.join("nested/file.md")));
         assert!(rules.is_forced_or_user_excluded(&root.join("nested/cache.tmp")));
         assert!(!rules.is_forced_or_user_excluded(&root.join("nested/keep.md")));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn streaming_scan_flushes_entries_without_retaining_a_second_snapshot() {
+        let root = temp_dir("streaming-scan");
+        fs::write(root.join("a.md"), "a").unwrap();
+        fs::write(root.join("b.md"), "b").unwrap();
+        let mut streamed_paths = Vec::new();
+
+        let report = IgnoreScanner::default()
+            .scan_cancellable_streaming(
+                IndexScanPlan {
+                    include_roots: vec![root.clone()],
+                    respect_project_ignores: false,
+                    ..IndexScanPlan::default()
+                },
+                || false,
+                |entries, _| {
+                    streamed_paths.extend(entries.iter().map(|entry| entry.path.clone()));
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        assert!(report.entries.is_empty());
+        assert_eq!(report.scan_stats.accepted, 2);
+        assert_eq!(streamed_paths.len(), 2);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resumable_scan_continues_from_the_persisted_directory_frontier() {
+        let root = temp_dir("resumable-directory-frontier");
+        let child = root.join("large-folder");
+        fs::create_dir_all(&child).unwrap();
+        fs::write(root.join("top.md"), "top").unwrap();
+        fs::write(child.join("nested.md"), "nested").unwrap();
+        let cancelled = std::cell::Cell::new(false);
+        let mut first_paths = Vec::new();
+        let mut child_frontier = Vec::new();
+        let mut completed_stats = IndexScanStats::default();
+
+        IgnoreScanner::default()
+            .scan_resumable_cancellable_streaming(
+                IndexScanPlan {
+                    include_roots: vec![root.clone()],
+                    respect_project_ignores: false,
+                    ..IndexScanPlan::default()
+                },
+                vec![root.clone()],
+                IndexScanStats::default(),
+                || cancelled.get(),
+                |entries, _| {
+                    first_paths.extend(entries.iter().map(|entry| entry.path.clone()));
+                    Ok(())
+                },
+                |checkpoint| {
+                    if checkpoint.directory == root {
+                        child_frontier = checkpoint.discovered_directories.clone();
+                        completed_stats = checkpoint.stats.clone();
+                        cancelled.set(true);
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        assert!(first_paths.iter().any(|path| path.ends_with("top.md")));
+        assert_eq!(child_frontier, vec![child.clone()]);
+        let mut resumed_paths = Vec::new();
+        let report = IgnoreScanner::default()
+            .scan_resumable_cancellable_streaming(
+                IndexScanPlan {
+                    include_roots: vec![root.clone()],
+                    respect_project_ignores: false,
+                    ..IndexScanPlan::default()
+                },
+                child_frontier,
+                completed_stats,
+                || false,
+                |entries, _| {
+                    resumed_paths.extend(entries.iter().map(|entry| entry.path.clone()));
+                    Ok(())
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+
+        assert_eq!(
+            resumed_paths,
+            vec![child.join("nested.md").to_string_lossy()]
+        );
+        assert_eq!(report.scan_stats.accepted, 3);
+        assert!(report.entries.is_empty());
 
         let _ = fs::remove_dir_all(root);
     }

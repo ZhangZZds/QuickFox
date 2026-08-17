@@ -666,7 +666,9 @@ describe("App", () => {
 
     render(<App initialView="settings" />);
 
-    expect(await screen.findByText("自动增量不可用，需要完整刷新索引")).toBeInTheDocument();
+    expect(
+      await screen.findByText("自动增量暂不可用；现有搜索仍可用，后台正在恢复"),
+    ).toBeInTheDocument();
     expect(screen.queryByText(/校准 0 个索引目录/)).not.toBeInTheDocument();
   });
 
@@ -1906,6 +1908,28 @@ describe("App", () => {
       accepted: 90,
       skipped: 20,
       failures: 1,
+      roots: [
+        {
+          root: "D:\\",
+          stage: "configured-roots",
+          state: "ready",
+          scanned: 80,
+          accepted: 70,
+          skipped: 10,
+          failures: 0,
+          message: null,
+        },
+        {
+          root: "C:\\",
+          stage: "configured-roots",
+          state: "degraded",
+          scanned: 40,
+          accepted: 20,
+          skipped: 10,
+          failures: 1,
+          message: "1 个位置暂不可访问，已保留最近可用结果",
+        },
+      ],
     });
 
     render(<App initialView="settings" />);
@@ -1920,6 +1944,11 @@ describe("App", () => {
     expect(indexSection).toHaveTextContent("收录 90");
     expect(indexSection).toHaveTextContent("跳过 20");
     expect(indexSection).toHaveTextContent("失败 1");
+    const roots = screen.getByRole("region", { name: "逐盘索引状态" });
+    expect(roots).toHaveTextContent("D:\\");
+    expect(roots).toHaveTextContent("可搜索");
+    expect(roots).toHaveTextContent("C:\\");
+    expect(roots).toHaveTextContent("部分可用");
   });
 
   it("shows the index settings as a layered workspace", async () => {

@@ -220,6 +220,17 @@ export function defaultIndexConfigApplyStatus(): IndexConfigApplyStatus {
   };
 }
 
+export type IndexRootStatus = {
+  root: string;
+  stage: string;
+  state: "queued" | "scanning" | "ready" | "degraded";
+  scanned: number;
+  accepted: number;
+  skipped: number;
+  failures: number;
+  message?: string | null;
+};
+
 export type IndexStatus = {
   kind: "unbuilt" | "building" | "ready" | "refreshing" | "failed";
   availability?: "unavailable" | "quickAvailable" | "completing" | "contentIndexing" | "complete";
@@ -233,6 +244,7 @@ export type IndexStatus = {
   accepted?: number;
   skipped?: number;
   failures?: number;
+  roots?: IndexRootStatus[];
   incremental: RuntimeIncrementalStatus;
   configApply?: IndexConfigApplyStatus;
 };
@@ -249,6 +261,7 @@ function normalizeIndexStatus(status: IndexStatusPayload): IndexStatus {
   const configApply = status.configApply;
   return {
     ...status,
+    roots: status.roots ?? [],
     incremental: {
       enabled: incremental?.enabled ?? defaults.enabled,
       state: incremental?.state ?? defaults.state,

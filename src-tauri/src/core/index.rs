@@ -1,7 +1,9 @@
 //! File and directory indexing will live here.
 
 use crate::core::actions::Action;
-use crate::core::compact_index::{CompactCandidateIndex, EntryId};
+use crate::core::compact_index::{
+    CompactCandidateIndex, CompactCandidateIndexBuilder, CompactIndexBuildError, EntryId,
+};
 use crate::core::content_index::{
     ContentIndex, ContentIndexOptions, ContentPathFilter, ContentSearchError, ContentSearchHit,
     PlainTextExtractor,
@@ -11,10 +13,12 @@ use crate::core::file_query::FileQuery;
 use crate::core::index_entry::{path_is_same_or_descendant_for_mode, PathComparisonMode};
 pub use crate::core::index_entry::{
     ContentIndexState, IndexAvailability, IndexConfigApplyState, IndexConfigApplyStatus,
-    IndexFailure, IndexLifecycle, IndexReport, IndexScanOptions, IndexStatus, IndexStatusKind,
-    IndexedEntry, IndexedEntryKind,
+    IndexFailure, IndexLifecycle, IndexReport, IndexRootState, IndexRootStatus, IndexScanOptions,
+    IndexStatus, IndexStatusKind, IndexedEntry, IndexedEntryKind,
 };
-use crate::core::index_scanner::{FileSystemScanner, IgnoreScanner, IndexScanPlan};
+use crate::core::index_scanner::{
+    FileSystemScanner, IgnoreScanner, IndexDirectoryScanCheckpoint, IndexScanPlan,
+};
 use crate::core::search::{QueryRequest, SearchMode, SearchResult, SearchResultKind};
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
@@ -56,6 +60,40 @@ impl IndexScanner {
     ) -> Result<IndexReport, std::io::Error> {
         IgnoreScanner::default().scan_cancellable(plan, is_cancelled)
     }
+
+    pub fn scan_plan_cancellable_streaming(
+        &self,
+        plan: IndexScanPlan,
+        is_cancelled: impl Fn() -> bool,
+        on_batch: impl FnMut(
+            &[IndexedEntry],
+            &crate::core::index_entry::IndexScanStats,
+        ) -> Result<(), std::io::Error>,
+    ) -> Result<IndexReport, std::io::Error> {
+        IgnoreScanner::default().scan_cancellable_streaming(plan, is_cancelled, on_batch)
+    }
+
+    pub fn scan_plan_resumable_cancellable_streaming(
+        &self,
+        plan: IndexScanPlan,
+        pending_directories: Vec<std::path::PathBuf>,
+        completed_stats: crate::core::index_entry::IndexScanStats,
+        is_cancelled: impl Fn() -> bool,
+        on_batch: impl FnMut(
+            &[IndexedEntry],
+            &crate::core::index_entry::IndexScanStats,
+        ) -> Result<(), std::io::Error>,
+        on_directory: impl FnMut(&IndexDirectoryScanCheckpoint) -> Result<(), std::io::Error>,
+    ) -> Result<IndexReport, std::io::Error> {
+        IgnoreScanner::default().scan_resumable_cancellable_streaming(
+            plan,
+            pending_directories,
+            completed_stats,
+            is_cancelled,
+            on_batch,
+            on_directory,
+        )
+    }
 }
 
 #[derive(Debug, Default)]
@@ -67,6 +105,35 @@ pub struct SearchIndex {
     content_entry_lookup_probe_count: AtomicUsize,
     #[cfg(test)]
     content_visibility_entry_scan_count: AtomicUsize,
+}
+
+#[derive(Debug)]
+pub(crate) struct SearchIndexBuilder {
+    candidates: CompactCandidateIndexBuilder,
+}
+
+impl SearchIndexBuilder {
+    pub(crate) fn new() -> Self {
+        Self {
+            candidates: CompactCandidateIndexBuilder::new(),
+        }
+    }
+
+    pub(crate) fn push(&mut self, entry: IndexedEntry) -> Result<(), CompactIndexBuildError> {
+        self.candidates.push(entry)
+    }
+
+    pub(crate) fn finish(self) -> Result<SearchIndex, CompactIndexBuildError> {
+        Ok(SearchIndex {
+            content_entry_index_by_path: None,
+            compact_candidates: self.candidates.finish()?,
+            content_index: None,
+            #[cfg(test)]
+            content_entry_lookup_probe_count: AtomicUsize::new(0),
+            #[cfg(test)]
+            content_visibility_entry_scan_count: AtomicUsize::new(0),
+        })
+    }
 }
 
 enum ContentSearchVisibility {
@@ -294,8 +361,29 @@ impl SearchIndex {
     }
 
     pub(crate) fn attach_content_index(&mut self, content_index: ContentIndex) {
+        let entries = self.materialized_entries();
+        self.attach_content_index_for_entries(content_index, &entries);
+    }
+
+    pub(crate) fn attach_content_index_for_entries(
+        &mut self,
+        content_index: ContentIndex,
+        entries: &[IndexedEntry],
+    ) {
+        self.content_entry_index_by_path = Some(
+            entries
+                .iter()
+                .filter(|entry| entry.content_index_state == ContentIndexState::Indexed)
+                .filter_map(|entry| {
+                    self.compact_candidates
+                        .exact_path_ids(&entry.path)
+                        .into_iter()
+                        .next()
+                        .map(|id| (entry.path.clone(), id.as_usize()))
+                })
+                .collect(),
+        );
         self.content_index = Some(content_index);
-        self.rebuild_content_entry_lookup();
     }
 
     pub(crate) fn detach_content_index(&mut self) -> Option<ContentIndex> {

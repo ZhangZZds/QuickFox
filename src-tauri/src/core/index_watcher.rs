@@ -254,7 +254,7 @@ impl WatcherFailure {
 
 #[derive(Debug)]
 pub struct RuntimeIndexWatcher {
-    _watcher: RecommendedWatcher,
+    _watchers: Vec<RecommendedWatcher>,
     _registration_probe: tempfile::TempDir,
     watched_roots: Vec<PathBuf>,
     inbox: Option<WatchEventInbox>,
@@ -294,65 +294,116 @@ impl RuntimeIndexWatcher {
                 error.to_string(),
             )
         })?;
-        let owned_probe_path = registration_probe.path().to_path_buf();
-        let probe_path = owned_probe_path
-            .canonicalize()
-            .map_err(|error| WatcherFailure::new(owned_probe_path.clone(), error.to_string()))?;
-        let (registration_ack, registration_ack_receiver) = mpsc::channel();
-        let callback_probe = probe_path.clone();
-        let mut watcher = notify::recommended_watcher(move |result: notify::Result<Event>| {
-            if result.as_ref().is_ok_and(|event| {
-                event
-                    .paths
-                    .iter()
-                    .any(|path| path.starts_with(&callback_probe))
-            }) {
-                let _ = registration_ack.send(());
-                return;
+        let mut watchers = Vec::with_capacity(roots.len());
+        let mut latest_failure = None;
+        for (root_index, root) in roots.iter().enumerate() {
+            let owned_probe_path = registration_probe.path().join(format!("root-{root_index}"));
+            if let Err(error) = fs::create_dir(&owned_probe_path) {
+                let failure = WatcherFailure::new(root.clone(), error.to_string());
+                callback_sender.record_failure(failure.clone());
+                latest_failure = Some(failure);
+                continue;
             }
-            dispatch_notify_result(result, &callback_sender);
-        })
-        .map_err(|error| WatcherFailure::new(PathBuf::new(), error.to_string()))?;
-
-        // notify 8.2.0 acknowledges inotify/ReadDirectoryChanges commands, while FSEvents can still
-        // miss a mutation immediately after stream startup. The final watched path is therefore an
-        // app-owned probe on the same native backend stream; returning requires observing its event.
-        // Re-audit this same-stream registration contract on notify upgrades.
-        for root in &roots {
-            watcher
-                .watch(root, RecursiveMode::Recursive)
-                .map_err(|error| WatcherFailure::new(root.clone(), error.to_string()))?;
-        }
-        watcher
-            .watch(&probe_path, RecursiveMode::Recursive)
-            .map_err(|error| WatcherFailure::new(probe_path.clone(), error.to_string()))?;
-        let deadline = std::time::Instant::now() + Duration::from_secs(3);
-        let mut attempt = 0_u64;
-        loop {
-            let probe_file = owned_probe_path.join(format!("ack-{attempt}"));
-            fs::write(&probe_file, attempt.to_le_bytes())
-                .map_err(|error| WatcherFailure::new(probe_path.clone(), error.to_string()))?;
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
-                return Err(WatcherFailure::new(
-                    probe_path,
-                    "native watcher registration acknowledgement timed out",
-                ));
-            }
-            match registration_ack_receiver.recv_timeout(remaining.min(Duration::from_millis(50))) {
-                Ok(()) => break,
-                Err(RecvTimeoutError::Timeout) => attempt = attempt.saturating_add(1),
-                Err(RecvTimeoutError::Disconnected) => {
-                    return Err(WatcherFailure::new(
-                        probe_path,
-                        "native watcher registration acknowledgement disconnected",
-                    ));
+            let probe_path = match owned_probe_path.canonicalize() {
+                Ok(path) => path,
+                Err(error) => {
+                    let failure = WatcherFailure::new(root.clone(), error.to_string());
+                    callback_sender.record_failure(failure.clone());
+                    latest_failure = Some(failure);
+                    continue;
                 }
+            };
+            let (registration_ack, registration_ack_receiver) = mpsc::channel();
+            let callback_probe = probe_path.clone();
+            let root_sender = callback_sender.clone();
+            let mut watcher =
+                match notify::recommended_watcher(move |result: notify::Result<Event>| {
+                    if result.as_ref().is_ok_and(|event| {
+                        event
+                            .paths
+                            .iter()
+                            .any(|path| path.starts_with(&callback_probe))
+                    }) {
+                        let _ = registration_ack.send(());
+                        return;
+                    }
+                    dispatch_notify_result(result, &root_sender);
+                }) {
+                    Ok(watcher) => watcher,
+                    Err(error) => {
+                        let failure = WatcherFailure::new(root.clone(), error.to_string());
+                        callback_sender.record_failure(failure.clone());
+                        latest_failure = Some(failure);
+                        continue;
+                    }
+                };
+
+            // Each root owns an independent native watcher. A registration or runtime failure on
+            // one volume therefore cannot tear down event delivery for another volume.
+            if let Err(error) = watcher.watch(root, RecursiveMode::Recursive) {
+                let failure = WatcherFailure::new(root.clone(), error.to_string());
+                callback_sender.record_failure(failure.clone());
+                latest_failure = Some(failure);
+                continue;
             }
+            if let Err(error) = watcher.watch(&probe_path, RecursiveMode::Recursive) {
+                let failure = WatcherFailure::new(root.clone(), error.to_string());
+                callback_sender.record_failure(failure.clone());
+                latest_failure = Some(failure);
+                continue;
+            }
+
+            // The app-owned probe is registered on the same native backend as this root. Returning
+            // requires observing its event, so startup cannot silently lose immediate mutations.
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            let mut attempt = 0_u64;
+            let acknowledged = loop {
+                let probe_file = owned_probe_path.join(format!("ack-{attempt}"));
+                if let Err(error) = fs::write(&probe_file, attempt.to_le_bytes()) {
+                    let failure = WatcherFailure::new(root.clone(), error.to_string());
+                    callback_sender.record_failure(failure.clone());
+                    latest_failure = Some(failure);
+                    break false;
+                }
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    let failure = WatcherFailure::new(
+                        root.clone(),
+                        "native watcher registration acknowledgement timed out",
+                    );
+                    callback_sender.record_failure(failure.clone());
+                    latest_failure = Some(failure);
+                    break false;
+                }
+                match registration_ack_receiver
+                    .recv_timeout(remaining.min(Duration::from_millis(50)))
+                {
+                    Ok(()) => break true,
+                    Err(RecvTimeoutError::Timeout) => attempt = attempt.saturating_add(1),
+                    Err(RecvTimeoutError::Disconnected) => {
+                        let failure = WatcherFailure::new(
+                            root.clone(),
+                            "native watcher registration acknowledgement disconnected",
+                        );
+                        callback_sender.record_failure(failure.clone());
+                        latest_failure = Some(failure);
+                        break false;
+                    }
+                }
+            };
+            if acknowledged {
+                watchers.push(watcher);
+            }
+        }
+
+        if watchers.is_empty() && !roots.is_empty() {
+            return Err(latest_failure.unwrap_or_else(|| {
+                WatcherFailure::new(PathBuf::new(), "no native watcher could be initialized")
+            }));
         }
 
         Ok(Self {
-            _watcher: watcher,
+            _watchers: watchers,
             _registration_probe: registration_probe,
             watched_roots: roots,
             inbox: Some(inbox),
@@ -671,6 +722,41 @@ mod tests {
         };
 
         assert!(observed, "immediate post-registration mutation was missed");
+    }
+
+    #[test]
+    fn one_unavailable_root_does_not_disable_another_native_watcher() {
+        let available = tempfile::tempdir().unwrap();
+        let available = available.path().canonicalize().unwrap();
+        let unavailable = available.join("offline-volume");
+        let created = available.join("still-observed.txt");
+        let mut watcher =
+            RuntimeIndexWatcher::watch_roots(vec![available.clone(), unavailable.clone()]).unwrap();
+        let inbox = watcher.take_inbox().unwrap();
+        let failure = inbox
+            .take_failure()
+            .expect("offline root should be reported");
+        assert_eq!(failure.root, unavailable);
+
+        fs::write(&created, "observed").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let observed = loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break false;
+            }
+            match inbox.recv_timeout(remaining) {
+                Ok(IndexWatchEvent::Create(path) | IndexWatchEvent::Write(path))
+                    if path == created || created.starts_with(&path) =>
+                {
+                    break true;
+                }
+                Ok(_) => {}
+                Err(_) => break false,
+            }
+        };
+
+        assert!(observed, "available root stopped after another root failed");
     }
 
     #[test]

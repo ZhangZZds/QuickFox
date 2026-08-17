@@ -71,12 +71,22 @@ url = "https://duckduckgo.com/?q={query}"
 - Windows 首次配置默认使用当前可用盘符根目录并保持 `balanced`；系统目录排除规则必须同时进入 baseline、watcher 和 calibration，且不能排除 `Users` 普通数据
 - `fast` / `balanced` / `complete` 必须产生可测试的扫描计划差异：`fast` 只扫应用入口和热路径，`balanced` 先快速可用再后台补全配置目录，`complete` 覆盖完整配置范围和可用盘符
 - baseline、standby/runtime watcher、calibration 必须复用同一 active-root 计划；旧 revision 的全量 walk 必须在条目边界可取消，单 root 失败必须允许其他 root 形成 partial 结果
-- 阶段边界只在快速可用检查点和最终完成检查点写完整 SQLite 快照；中间补全阶段只更新内存索引和状态，避免反复写不断增长的聚合 batch
+- 大目录扫描必须流式写入单个 SQLite staging batch，不得在 scanner、进度 payload 和最终
+  baseline 中同时保留多份完整条目；Windows 全盘扫描按目录提交恢复断点，C/D 等盘符
+  最多并行 2 个，每个 root 完成后立即发布可搜索预览，最终通过状态切换原子激活
+- 单个 root 或子目录失败时必须保留对应 active baseline 的 last-known-good 范围并标记
+  degraded；不能用不完整扫描结果删除旧条目，也不能让旧 runtime 的 recovery 原因否决已完成刷新
+- 每个 active root 使用独立原生 watcher；一个盘符离线、注册失败或运行失败只能把该 root
+  标记为 dirty/degraded，不能关闭其他盘符的增量监听
+- active baseline 必须记录索引语义配置指纹；启动时只有指纹匹配且 manifest 覆盖当前 roots
+  才能直接恢复 watcher，否则保持旧搜索可用并在后台刷新
 - 内容索引必须晚于基础 name/path 索引；`content:` 在内容索引准备中应返回明确反馈，不能伪装成 name/path 命中
 - 后台刷新完成后用新批次替换内存索引，旧 generation 的刷新结果不能覆盖新请求
 - 搜索路径不得为每次查询 clone 完整 `SearchIndex`；FileProvider 应借用或共享运行时索引，并保持大索引查询候选数有上限
 - 文件 Provider 必须在索引不可用时降级为反馈，不影响计算器、网页搜索和命令 Provider
 - 新增索引字段、状态或存储迁移时，需要同时补 Rust storage/index 测试和设置页状态测试
+- 设置页必须展示逐 root 的 queued/scanning/ready/degraded 状态；不要用单个全局 spinner
+  隐藏已经完成的盘，也不要把“现有搜索可用、后台恢复中”描述成安装失败
 
 短期索引性能边界：
 

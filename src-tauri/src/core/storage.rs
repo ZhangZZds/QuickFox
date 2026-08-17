@@ -1,9 +1,9 @@
 //! SQLite storage will live here.
 
-use crate::core::index::{IndexedEntry, IndexedEntryKind};
+use crate::core::index::{IndexedEntry, IndexedEntryKind, SearchIndex, SearchIndexBuilder};
 use crate::core::index_entry::{
     build_search_text, normalize_path_key_for_mode, normalize_path_text_key_for_mode,
-    path_is_same_or_descendant_for_mode, ContentIndexState, PathComparisonMode,
+    path_is_same_or_descendant_for_mode, ContentIndexState, IndexScanStats, PathComparisonMode,
 };
 use crate::core::layered_index::CommittedIndexDelta;
 #[cfg(test)]
@@ -12,7 +12,7 @@ use crate::core::targeted_index_scanner::{
     DirectoryFingerprint, FileSystemEntryKind, KnownIndexedChild,
 };
 use rusqlite::types::Value;
-use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -21,6 +21,71 @@ const BASELINE_WRITE_CHUNK_SIZE: usize = 2_048;
 const BASELINE_DELETE_CHUNK_SIZE: usize = 4_096;
 const MIN_FREE_DISK_RESERVE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 const MAX_BASELINE_ESTIMATED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+fn non_negative_usize(value: i64) -> usize {
+    usize::try_from(value.max(0)).unwrap_or(usize::MAX)
+}
+
+fn delete_index_entry_scope(
+    connection: &Connection,
+    batch_id: i64,
+    path_key: &str,
+) -> Result<(), StorageError> {
+    connection.execute(
+        r#"
+        DELETE FROM index_entries
+        WHERE batch_id = ?1
+          AND (
+              path_key = ?2
+              OR (?2 = '/' AND substr(path_key, 1, 1) = '/')
+              OR (?2 <> '/' AND substr(path_key, 1, length(?2) + 1) = ?2 || '/')
+          )
+        "#,
+        params![batch_id, path_key],
+    )?;
+    Ok(())
+}
+
+fn indexed_entry_from_storage_row(row: &Row<'_>) -> rusqlite::Result<IndexedEntry> {
+    let path: String = row.get(0)?;
+    let name: String = row.get(1)?;
+    let search_text: String = row.get(9)?;
+    Ok(IndexedEntry {
+        path: path.clone(),
+        name: name.clone(),
+        kind: index_kind_from_storage(row.get::<_, String>(2)?.as_str()),
+        parent: row.get(3)?,
+        extension: row.get(4)?,
+        depth: row.get::<_, i64>(5)?.max(0) as usize,
+        root: row.get(6)?,
+        modified_ms: row.get(7)?,
+        size_bytes: row.get::<_, Option<i64>>(8)?.map(|size| size.max(0) as u64),
+        search_text: if search_text.is_empty() {
+            build_search_text(&name, &path)
+        } else {
+            search_text
+        },
+        content_index_state: content_index_state_from_storage(row.get::<_, String>(10)?.as_str()),
+    })
+}
+
+fn build_search_index_from_rows(
+    rows: impl Iterator<Item = rusqlite::Result<IndexedEntry>>,
+) -> Result<SearchIndex, StorageError> {
+    let mut builder = SearchIndexBuilder::new();
+    for row in rows {
+        builder.push(row?).map_err(|error| {
+            StorageError::InvalidJournal(format!(
+                "compact index build failed while streaming SQLite rows: {error:?}"
+            ))
+        })?;
+    }
+    builder.finish().map_err(|error| {
+        StorageError::InvalidJournal(format!(
+            "compact index build failed while finalizing SQLite rows: {error:?}"
+        ))
+    })
+}
 
 const TARGETED_DIRECT_JOURNAL_SQL: &str = r#"
     SELECT batches.generation, entries.ordinal, entries.operation, entries.path, entries.entry_json
@@ -51,6 +116,18 @@ pub struct IndexSnapshot {
     pub completed_at_ms: i64,
     pub entries: Vec<IndexedEntry>,
     pub needs_full_refresh: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexStagingState {
+    pub batch_id: i64,
+    pub completed_roots: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexStagingRootResume {
+    pub pending_directories: Vec<PathBuf>,
+    pub completed_stats: IndexScanStats,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,7 +229,7 @@ impl SqliteStorage {
             comparison_mode,
         };
         storage.migrate()?;
-        storage.discard_incomplete_index_batches()?;
+        storage.discard_orphaned_index_batches()?;
         Ok(storage)
     }
 
@@ -188,6 +265,51 @@ impl SqliteStorage {
                 entry_count INTEGER NOT NULL,
                 status TEXT NOT NULL DEFAULT 'completed'
                     CHECK (status IN ('building', 'completed'))
+            );
+
+            CREATE TABLE IF NOT EXISTS index_refresh_staging (
+                config_fingerprint TEXT PRIMARY KEY NOT NULL,
+                batch_id INTEGER NOT NULL UNIQUE,
+                started_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                FOREIGN KEY (batch_id) REFERENCES index_batches(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS index_refresh_staging_roots (
+                config_fingerprint TEXT NOT NULL,
+                root_key TEXT NOT NULL,
+                root TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                state TEXT NOT NULL CHECK (state IN ('completed', 'degraded')),
+                PRIMARY KEY (config_fingerprint, root_key),
+                FOREIGN KEY (config_fingerprint)
+                    REFERENCES index_refresh_staging(config_fingerprint) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS index_refresh_staging_directories (
+                config_fingerprint TEXT NOT NULL,
+                root_key TEXT NOT NULL,
+                directory_key TEXT NOT NULL,
+                directory TEXT NOT NULL,
+                state TEXT NOT NULL CHECK (state IN ('queued', 'completed', 'failed')),
+                scanned INTEGER NOT NULL DEFAULT 0,
+                accepted INTEGER NOT NULL DEFAULT 0,
+                skipped INTEGER NOT NULL DEFAULT 0,
+                failures INTEGER NOT NULL DEFAULT 0,
+                failure_message TEXT,
+                updated_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (config_fingerprint, root_key, directory_key),
+                FOREIGN KEY (config_fingerprint)
+                    REFERENCES index_refresh_staging(config_fingerprint) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_index_refresh_staging_directories_state
+                ON index_refresh_staging_directories(config_fingerprint, root_key, state);
+
+            CREATE TABLE IF NOT EXISTS index_baseline_metadata (
+                batch_id INTEGER PRIMARY KEY NOT NULL,
+                config_fingerprint TEXT NOT NULL,
+                FOREIGN KEY (batch_id) REFERENCES index_batches(id) ON DELETE CASCADE
             );
 
             CREATE TABLE IF NOT EXISTS index_entries (
@@ -287,8 +409,8 @@ impl SqliteStorage {
         }
         let user_version: i64 =
             transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if user_version < 3 {
-            transaction.pragma_update(None, "user_version", 3)?;
+        if user_version < 4 {
+            transaction.pragma_update(None, "user_version", 4)?;
         }
         transaction.commit()?;
         Ok(())
@@ -307,7 +429,7 @@ impl SqliteStorage {
         Ok(())
     }
 
-    fn discard_incomplete_index_batches(&self) -> Result<(), StorageError> {
+    fn discard_orphaned_index_batches(&self) -> Result<(), StorageError> {
         loop {
             let removed = self.connection.execute(
                 r#"
@@ -317,6 +439,10 @@ impl SqliteStorage {
                     FROM index_entries AS entries
                     JOIN index_batches AS batches ON batches.id = entries.batch_id
                     WHERE batches.status = 'building'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM index_refresh_staging AS staging
+                          WHERE staging.batch_id = batches.id
+                      )
                     LIMIT ?1
                 )
                 "#,
@@ -326,8 +452,17 @@ impl SqliteStorage {
                 break;
             }
         }
-        self.connection
-            .execute("DELETE FROM index_batches WHERE status = 'building'", [])?;
+        self.connection.execute(
+            r#"
+                DELETE FROM index_batches
+                WHERE status = 'building'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM index_refresh_staging AS staging
+                      WHERE staging.batch_id = index_batches.id
+                  )
+                "#,
+            [],
+        )?;
         Ok(())
     }
 
@@ -1481,6 +1616,862 @@ impl SqliteStorage {
             .optional()?)
     }
 
+    pub fn open_or_create_index_staging(
+        &self,
+        config_fingerprint: &str,
+        started_at_ms: i64,
+    ) -> Result<IndexStagingState, StorageError> {
+        let existing = self
+            .connection
+            .query_row(
+                r#"
+                SELECT staging.batch_id
+                FROM index_refresh_staging AS staging
+                JOIN index_batches AS batches ON batches.id = staging.batch_id
+                WHERE staging.config_fingerprint = ?1 AND batches.status = 'building'
+                "#,
+                params![config_fingerprint],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        if let Some(batch_id) = existing {
+            let mut statement = self.connection.prepare(
+                r#"
+                SELECT root_key
+                FROM index_refresh_staging_roots
+                WHERE config_fingerprint = ?1 AND state = 'completed'
+                ORDER BY root_key
+                "#,
+            )?;
+            let roots = statement.query_map(params![config_fingerprint], |row| row.get(0))?;
+            let mut completed_roots = Vec::new();
+            for root in roots {
+                completed_roots.push(root?);
+            }
+            return Ok(IndexStagingState {
+                batch_id,
+                completed_roots,
+            });
+        }
+
+        let transaction = self.connection.unchecked_transaction()?;
+        transaction.execute("DELETE FROM index_refresh_staging", [])?;
+        transaction.execute(
+            r#"
+            INSERT INTO index_batches (completed_at_ms, entry_count, status)
+            VALUES (?1, 0, 'building')
+            "#,
+            params![started_at_ms],
+        )?;
+        let batch_id = transaction.last_insert_rowid();
+        transaction.execute(
+            r#"
+            INSERT INTO index_refresh_staging
+                (config_fingerprint, batch_id, started_at_ms, updated_at_ms)
+            VALUES (?1, ?2, ?3, ?3)
+            "#,
+            params![config_fingerprint, batch_id, started_at_ms],
+        )?;
+        transaction.commit()?;
+        self.discard_orphaned_index_batches()?;
+        Ok(IndexStagingState {
+            batch_id,
+            completed_roots: Vec::new(),
+        })
+    }
+
+    pub fn append_index_staging_entries(
+        &self,
+        config_fingerprint: &str,
+        entries: &[IndexedEntry],
+        updated_at_ms: i64,
+    ) -> Result<(), StorageError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let batch_id = self.index_staging_batch_id(config_fingerprint)?;
+        let transaction = self.connection.unchecked_transaction()?;
+        {
+            let mut statement = transaction.prepare(
+                r#"
+                INSERT INTO index_entries
+                    (
+                        batch_id, path, name, kind, search_text, updated_at_ms,
+                        parent, extension, depth, root, modified_ms, size_bytes,
+                        content_index_state, path_key, root_key, parent_key
+                    )
+                VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+                    ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16
+                )
+                ON CONFLICT(batch_id, path) DO UPDATE SET
+                    name = excluded.name,
+                    kind = excluded.kind,
+                    search_text = excluded.search_text,
+                    updated_at_ms = excluded.updated_at_ms,
+                    parent = excluded.parent,
+                    extension = excluded.extension,
+                    depth = excluded.depth,
+                    root = excluded.root,
+                    modified_ms = excluded.modified_ms,
+                    size_bytes = excluded.size_bytes,
+                    content_index_state = excluded.content_index_state,
+                    path_key = excluded.path_key,
+                    root_key = excluded.root_key,
+                    parent_key = excluded.parent_key
+                "#,
+            )?;
+            for entry in entries {
+                statement.execute(params![
+                    batch_id,
+                    entry.path,
+                    entry.name,
+                    index_kind_to_storage(&entry.kind),
+                    "",
+                    updated_at_ms,
+                    nullable_text(&entry.parent),
+                    entry.extension.as_deref(),
+                    entry.depth as i64,
+                    nullable_text(&entry.root),
+                    entry.modified_ms,
+                    entry.size_bytes.map(|size| size as i64),
+                    content_index_state_to_storage(&entry.content_index_state),
+                    normalize_path_text_key_for_mode(&entry.path, self.comparison_mode),
+                    normalize_path_text_key_for_mode(&entry.root, self.comparison_mode),
+                    normalize_path_text_key_for_mode(&entry.parent, self.comparison_mode),
+                ])?;
+            }
+        }
+        transaction.execute(
+            "UPDATE index_refresh_staging SET updated_at_ms = ?2 WHERE config_fingerprint = ?1",
+            params![config_fingerprint, updated_at_ms],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn reset_index_staging_root(
+        &self,
+        config_fingerprint: &str,
+        root: &Path,
+    ) -> Result<(), StorageError> {
+        let batch_id = self.index_staging_batch_id(config_fingerprint)?;
+        let root_key = normalize_path_key_for_mode(root, self.comparison_mode);
+        let transaction = self.connection.unchecked_transaction()?;
+        transaction.execute(
+            "DELETE FROM index_entries WHERE batch_id = ?1 AND root_key = ?2",
+            params![batch_id, root_key],
+        )?;
+        transaction.execute(
+            "DELETE FROM index_refresh_staging_roots WHERE config_fingerprint = ?1 AND root_key = ?2",
+            params![config_fingerprint, root_key],
+        )?;
+        transaction.execute(
+            "DELETE FROM index_refresh_staging_directories WHERE config_fingerprint = ?1 AND root_key = ?2",
+            params![config_fingerprint, root_key],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn prepare_index_staging_root(
+        &self,
+        config_fingerprint: &str,
+        root: &Path,
+        updated_at_ms: i64,
+    ) -> Result<IndexStagingRootResume, StorageError> {
+        let batch_id = self.index_staging_batch_id(config_fingerprint)?;
+        let root_key = normalize_path_key_for_mode(root, self.comparison_mode);
+        let root_text = root.to_string_lossy().into_owned();
+        let transaction = self.connection.unchecked_transaction()?;
+        let directory_count: i64 = transaction.query_row(
+            r#"
+            SELECT COUNT(*)
+            FROM index_refresh_staging_directories
+            WHERE config_fingerprint = ?1 AND root_key = ?2
+            "#,
+            params![config_fingerprint, root_key],
+            |row| row.get(0),
+        )?;
+
+        if directory_count == 0 {
+            transaction.execute(
+                "DELETE FROM index_entries WHERE batch_id = ?1 AND root_key = ?2",
+                params![batch_id, root_key],
+            )?;
+            transaction.execute(
+                "DELETE FROM index_refresh_staging_roots WHERE config_fingerprint = ?1 AND root_key = ?2",
+                params![config_fingerprint, root_key],
+            )?;
+            transaction.execute(
+                r#"
+                INSERT INTO index_refresh_staging_directories
+                    (
+                        config_fingerprint, root_key, directory_key, directory, state,
+                        scanned, accepted, skipped, failures, failure_message, updated_at_ms
+                    )
+                VALUES (?1, ?2, ?2, ?3, 'queued', 0, 0, 0, 0, NULL, ?4)
+                "#,
+                params![config_fingerprint, root_key, root_text, updated_at_ms],
+            )?;
+        } else {
+            let mut retry_statement = transaction.prepare(
+                r#"
+                SELECT directory_key
+                FROM index_refresh_staging_directories
+                WHERE config_fingerprint = ?1 AND root_key = ?2 AND state != 'completed'
+                ORDER BY directory_key
+                "#,
+            )?;
+            let retry_rows = retry_statement
+                .query_map(params![config_fingerprint, root_key], |row| {
+                    row.get::<_, String>(0)
+                })?;
+            let mut retry_keys = Vec::new();
+            for row in retry_rows {
+                retry_keys.push(row?);
+            }
+            drop(retry_statement);
+
+            // A process can stop after flushing part of the currently queued directory but before
+            // its completion checkpoint. Remove that incomplete scope before retrying it. Completed
+            // descendants cannot exist below a queued directory because children are enqueued only
+            // when the parent checkpoint commits.
+            for retry_key in &retry_keys {
+                delete_index_entry_scope(&transaction, batch_id, retry_key)?;
+            }
+            transaction.execute(
+                r#"
+                UPDATE index_refresh_staging_directories
+                SET state = 'queued',
+                    scanned = 0,
+                    accepted = 0,
+                    skipped = 0,
+                    failures = 0,
+                    failure_message = NULL,
+                    updated_at_ms = ?3
+                WHERE config_fingerprint = ?1 AND root_key = ?2 AND state != 'completed'
+                "#,
+                params![config_fingerprint, root_key, updated_at_ms],
+            )?;
+            transaction.execute(
+                "DELETE FROM index_refresh_staging_roots WHERE config_fingerprint = ?1 AND root_key = ?2",
+                params![config_fingerprint, root_key],
+            )?;
+        }
+
+        let completed_stats = transaction.query_row(
+            r#"
+            SELECT
+                COALESCE(SUM(scanned), 0),
+                COALESCE(SUM(accepted), 0),
+                COALESCE(SUM(skipped), 0),
+                COALESCE(SUM(failures), 0)
+            FROM index_refresh_staging_directories
+            WHERE config_fingerprint = ?1 AND root_key = ?2 AND state = 'completed'
+            "#,
+            params![config_fingerprint, root_key],
+            |row| {
+                Ok(IndexScanStats {
+                    scanned: non_negative_usize(row.get::<_, i64>(0)?),
+                    accepted: non_negative_usize(row.get::<_, i64>(1)?),
+                    skipped: non_negative_usize(row.get::<_, i64>(2)?),
+                    failures: non_negative_usize(row.get::<_, i64>(3)?),
+                })
+            },
+        )?;
+        let mut pending_statement = transaction.prepare(
+            r#"
+            SELECT directory
+            FROM index_refresh_staging_directories
+            WHERE config_fingerprint = ?1 AND root_key = ?2 AND state = 'queued'
+            ORDER BY length(directory_key), directory_key
+            "#,
+        )?;
+        let pending_rows = pending_statement
+            .query_map(params![config_fingerprint, root_key], |row| {
+                row.get::<_, String>(0)
+            })?;
+        let mut pending_directories = Vec::new();
+        for row in pending_rows {
+            pending_directories.push(PathBuf::from(row?));
+        }
+        drop(pending_statement);
+        transaction.execute(
+            "UPDATE index_refresh_staging SET updated_at_ms = ?2 WHERE config_fingerprint = ?1",
+            params![config_fingerprint, updated_at_ms],
+        )?;
+        transaction.commit()?;
+        Ok(IndexStagingRootResume {
+            pending_directories,
+            completed_stats,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn checkpoint_index_staging_directory(
+        &self,
+        config_fingerprint: &str,
+        root: &Path,
+        directory: &Path,
+        discovered_directories: &[PathBuf],
+        stats: &IndexScanStats,
+        failure_message: Option<&str>,
+        updated_at_ms: i64,
+    ) -> Result<(), StorageError> {
+        let _ = self.index_staging_batch_id(config_fingerprint)?;
+        let root_key = normalize_path_key_for_mode(root, self.comparison_mode);
+        let directory_key = normalize_path_key_for_mode(directory, self.comparison_mode);
+        let transaction = self.connection.unchecked_transaction()?;
+        for discovered in discovered_directories {
+            transaction.execute(
+                r#"
+                INSERT OR IGNORE INTO index_refresh_staging_directories
+                    (
+                        config_fingerprint, root_key, directory_key, directory, state,
+                        scanned, accepted, skipped, failures, failure_message, updated_at_ms
+                    )
+                VALUES (?1, ?2, ?3, ?4, 'queued', 0, 0, 0, 0, NULL, ?5)
+                "#,
+                params![
+                    config_fingerprint,
+                    root_key,
+                    normalize_path_key_for_mode(discovered, self.comparison_mode),
+                    discovered.to_string_lossy(),
+                    updated_at_ms,
+                ],
+            )?;
+        }
+        let updated = transaction.execute(
+            r#"
+            UPDATE index_refresh_staging_directories
+            SET state = ?4,
+                scanned = ?5,
+                accepted = ?6,
+                skipped = ?7,
+                failures = ?8,
+                failure_message = ?9,
+                updated_at_ms = ?10
+            WHERE config_fingerprint = ?1 AND root_key = ?2 AND directory_key = ?3
+            "#,
+            params![
+                config_fingerprint,
+                root_key,
+                directory_key,
+                if failure_message.is_some() {
+                    "failed"
+                } else {
+                    "completed"
+                },
+                stats.scanned as i64,
+                stats.accepted as i64,
+                stats.skipped as i64,
+                stats.failures as i64,
+                failure_message,
+                updated_at_ms,
+            ],
+        )?;
+        if updated != 1 {
+            return Err(StorageError::InvalidJournal(
+                "index staging directory checkpoint disappeared".to_owned(),
+            ));
+        }
+        transaction.execute(
+            "UPDATE index_refresh_staging SET updated_at_ms = ?2 WHERE config_fingerprint = ?1",
+            params![config_fingerprint, updated_at_ms],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn preserve_active_baseline_paths_in_staging(
+        &self,
+        config_fingerprint: &str,
+        paths: &[PathBuf],
+    ) -> Result<(), StorageError> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let batch_id = self.index_staging_batch_id(config_fingerprint)?;
+        let active_baseline_id = self
+            .runtime_state()?
+            .and_then(|state| state.active_baseline_id);
+        let Some(active_baseline_id) = active_baseline_id else {
+            return Ok(());
+        };
+        let transaction = self.connection.unchecked_transaction()?;
+        for path in paths {
+            let path_key = normalize_path_key_for_mode(path, self.comparison_mode);
+            delete_index_entry_scope(&transaction, batch_id, &path_key)?;
+            transaction.execute(
+                r#"
+                INSERT OR IGNORE INTO index_entries
+                    (
+                        batch_id, path, name, kind, search_text, updated_at_ms,
+                        parent, extension, depth, root, modified_ms, size_bytes,
+                        content_index_state, path_key, root_key, parent_key
+                    )
+                SELECT
+                    ?1, path, name, kind, search_text, updated_at_ms,
+                    parent, extension, depth, root, modified_ms, size_bytes,
+                    content_index_state, path_key, root_key, parent_key
+                FROM index_entries
+                WHERE batch_id = ?2
+                  AND (
+                      path_key = ?3
+                      OR (?3 = '/' AND substr(path_key, 1, 1) = '/')
+                      OR (?3 <> '/' AND substr(path_key, 1, length(?3) + 1) = ?3 || '/')
+                  )
+                "#,
+                params![batch_id, active_baseline_id, path_key],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn mark_index_staging_root(
+        &self,
+        config_fingerprint: &str,
+        root: &Path,
+        stage: &str,
+        degraded: bool,
+        updated_at_ms: i64,
+    ) -> Result<(), StorageError> {
+        let _ = self.index_staging_batch_id(config_fingerprint)?;
+        self.connection.execute(
+            r#"
+            INSERT INTO index_refresh_staging_roots
+                (config_fingerprint, root_key, root, stage, state)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(config_fingerprint, root_key) DO UPDATE SET
+                root = excluded.root,
+                stage = excluded.stage,
+                state = excluded.state
+            "#,
+            params![
+                config_fingerprint,
+                normalize_path_key_for_mode(root, self.comparison_mode),
+                root.to_string_lossy(),
+                stage,
+                if degraded { "degraded" } else { "completed" },
+            ],
+        )?;
+        self.connection.execute(
+            "UPDATE index_refresh_staging SET updated_at_ms = ?2 WHERE config_fingerprint = ?1",
+            params![config_fingerprint, updated_at_ms],
+        )?;
+        self.connection.execute(
+            r#"
+            UPDATE index_batches
+            SET entry_count = (SELECT COUNT(*) FROM index_entries WHERE batch_id = ?1)
+            WHERE id = ?1 AND status = 'building'
+            "#,
+            params![self.index_staging_batch_id(config_fingerprint)?],
+        )?;
+        Ok(())
+    }
+
+    pub fn complete_index_staging(
+        &self,
+        config_fingerprint: &str,
+        completed_at_ms: i64,
+    ) -> Result<i64, StorageError> {
+        let batch_id = self.index_staging_batch_id(config_fingerprint)?;
+        let transaction = self.connection.unchecked_transaction()?;
+        let updated = transaction.execute(
+            r#"
+            UPDATE index_batches
+            SET status = 'completed',
+                completed_at_ms = ?2,
+                entry_count = (SELECT COUNT(*) FROM index_entries WHERE batch_id = ?1)
+            WHERE id = ?1 AND status = 'building'
+            "#,
+            params![batch_id, completed_at_ms],
+        )?;
+        if updated != 1 {
+            return Err(StorageError::InvalidJournal(
+                "index staging batch disappeared before completion".to_owned(),
+            ));
+        }
+        transaction.execute(
+            "DELETE FROM index_refresh_staging WHERE config_fingerprint = ?1",
+            params![config_fingerprint],
+        )?;
+        transaction.commit()?;
+        Ok(batch_id)
+    }
+
+    pub fn load_index_batch(&self, batch_id: i64) -> Result<IndexSnapshot, StorageError> {
+        let completed_at_ms = self.connection.query_row(
+            "SELECT completed_at_ms FROM index_batches WHERE id = ?1",
+            params![batch_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        self.load_index_snapshot(batch_id, completed_at_ms)
+    }
+
+    pub fn build_search_index_for_batch(&self, batch_id: i64) -> Result<SearchIndex, StorageError> {
+        let mut statement = self.connection.prepare(
+            r#"
+            SELECT
+                path,
+                name,
+                kind,
+                COALESCE(parent, ''),
+                extension,
+                COALESCE(depth, 0),
+                COALESCE(root, ''),
+                modified_ms,
+                size_bytes,
+                COALESCE(search_text, ''),
+                COALESCE(content_index_state, 'not_indexed')
+            FROM index_entries
+            WHERE batch_id = ?1
+            ORDER BY path_key ASC, path ASC
+            "#,
+        )?;
+        let rows = statement.query_map(params![batch_id], indexed_entry_from_storage_row)?;
+        build_search_index_from_rows(rows)
+    }
+
+    pub fn build_search_index_for_staging_root(
+        &self,
+        config_fingerprint: &str,
+        root: &Path,
+    ) -> Result<SearchIndex, StorageError> {
+        let batch_id = self.index_staging_batch_id(config_fingerprint)?;
+        let root_key = normalize_path_key_for_mode(root, self.comparison_mode);
+        let mut statement = self.connection.prepare(
+            r#"
+            SELECT
+                path,
+                name,
+                kind,
+                COALESCE(parent, ''),
+                extension,
+                COALESCE(depth, 0),
+                COALESCE(root, ''),
+                modified_ms,
+                size_bytes,
+                COALESCE(search_text, ''),
+                COALESCE(content_index_state, 'not_indexed')
+            FROM index_entries
+            WHERE batch_id = ?1 AND root_key = ?2
+            ORDER BY path_key ASC, path ASC
+            "#,
+        )?;
+        let rows =
+            statement.query_map(params![batch_id, root_key], indexed_entry_from_storage_row)?;
+        build_search_index_from_rows(rows)
+    }
+
+    pub fn apply_index_deltas_to_batch(
+        &self,
+        batch_id: i64,
+        deltas: &[CommittedIndexDelta],
+        updated_at_ms: i64,
+    ) -> Result<(), StorageError> {
+        if deltas.is_empty() {
+            return Ok(());
+        }
+        let transaction = self.connection.unchecked_transaction()?;
+        for delta in deltas {
+            for removal in &delta.removals {
+                let removal_key = normalize_path_key_for_mode(removal, self.comparison_mode);
+                let existing_kind = transaction
+                    .query_row(
+                        "SELECT kind FROM index_entries WHERE batch_id = ?1 AND path_key = ?2 LIMIT 1",
+                        params![batch_id, removal_key],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+                if existing_kind.as_deref() == Some("directory") {
+                    delete_index_entry_scope(&transaction, batch_id, &removal_key)?;
+                } else {
+                    transaction.execute(
+                        "DELETE FROM index_entries WHERE batch_id = ?1 AND path_key = ?2",
+                        params![batch_id, removal_key],
+                    )?;
+                }
+            }
+            for entry in &delta.upserts {
+                let entry_key = normalize_path_text_key_for_mode(&entry.path, self.comparison_mode);
+                let existing_kind = transaction
+                    .query_row(
+                        "SELECT kind FROM index_entries WHERE batch_id = ?1 AND path_key = ?2 LIMIT 1",
+                        params![batch_id, entry_key],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+                if existing_kind.as_deref() == Some("directory")
+                    && entry.kind != IndexedEntryKind::Directory
+                {
+                    delete_index_entry_scope(&transaction, batch_id, &entry_key)?;
+                } else {
+                    transaction.execute(
+                        "DELETE FROM index_entries WHERE batch_id = ?1 AND path_key = ?2",
+                        params![batch_id, entry_key],
+                    )?;
+                }
+                transaction.execute(
+                    r#"
+                    INSERT INTO index_entries
+                        (
+                            batch_id, path, name, kind, search_text, updated_at_ms,
+                            parent, extension, depth, root, modified_ms, size_bytes,
+                            content_index_state, path_key, root_key, parent_key
+                        )
+                    VALUES (
+                        ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+                        ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16
+                    )
+                    "#,
+                    params![
+                        batch_id,
+                        entry.path,
+                        entry.name,
+                        index_kind_to_storage(&entry.kind),
+                        "",
+                        updated_at_ms,
+                        nullable_text(&entry.parent),
+                        entry.extension.as_deref(),
+                        entry.depth as i64,
+                        nullable_text(&entry.root),
+                        entry.modified_ms,
+                        entry.size_bytes.map(|size| size as i64),
+                        content_index_state_to_storage(&entry.content_index_state),
+                        entry_key,
+                        normalize_path_text_key_for_mode(&entry.root, self.comparison_mode),
+                        normalize_path_text_key_for_mode(&entry.parent, self.comparison_mode),
+                    ],
+                )?;
+            }
+        }
+        transaction.execute(
+            r#"
+            UPDATE index_batches
+            SET entry_count = (SELECT COUNT(*) FROM index_entries WHERE batch_id = ?1)
+            WHERE id = ?1
+            "#,
+            params![batch_id],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn index_manifest_for_batch(
+        &self,
+        batch_id: i64,
+        roots: &[PathBuf],
+    ) -> Result<Vec<DirectoryFingerprint>, StorageError> {
+        let root_keys: BTreeSet<_> = roots
+            .iter()
+            .map(|root| normalize_path_key_for_mode(root, self.comparison_mode))
+            .collect();
+        let mut manifest = BTreeMap::new();
+        for root in roots.iter().filter(|root| root.is_dir()) {
+            let root_text = root.to_string_lossy().into_owned();
+            let modified_ms = std::fs::metadata(root)
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_millis() as i64);
+            manifest.insert(
+                normalize_path_key_for_mode(root, self.comparison_mode),
+                DirectoryFingerprint {
+                    path: root_text.clone(),
+                    parent: None,
+                    root: root_text,
+                    modified_ms,
+                },
+            );
+        }
+        let mut statement = self.connection.prepare(
+            r#"
+            SELECT path, COALESCE(parent, ''), COALESCE(root, ''), modified_ms, kind
+            FROM index_entries
+            WHERE batch_id = ?1 AND kind IN ('directory', 'application')
+            ORDER BY path_key
+            "#,
+        )?;
+        let rows = statement.query_map(params![batch_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?;
+        for row in rows {
+            let (path, parent, root, modified_ms, kind) = row?;
+            if !root_keys.contains(&normalize_path_text_key_for_mode(
+                &root,
+                self.comparison_mode,
+            )) || (kind != "directory" && !Path::new(&path).is_dir())
+            {
+                continue;
+            }
+            manifest.insert(
+                normalize_path_text_key_for_mode(&path, self.comparison_mode),
+                DirectoryFingerprint {
+                    parent: (path != root && !parent.is_empty()).then_some(parent),
+                    path,
+                    root,
+                    modified_ms,
+                },
+            );
+        }
+        Ok(manifest.into_values().collect())
+    }
+
+    pub fn load_index_entries_for_path_scopes(
+        &self,
+        batch_id: i64,
+        scopes: &[PathBuf],
+    ) -> Result<Vec<IndexedEntry>, StorageError> {
+        let mut entries = BTreeMap::new();
+        for scope in scopes {
+            let scope_key = normalize_path_key_for_mode(scope, self.comparison_mode);
+            let mut statement = self.connection.prepare(
+                r#"
+                SELECT
+                    path,
+                    name,
+                    kind,
+                    COALESCE(parent, ''),
+                    extension,
+                    COALESCE(depth, 0),
+                    COALESCE(root, ''),
+                    modified_ms,
+                    size_bytes,
+                    COALESCE(search_text, ''),
+                    COALESCE(content_index_state, 'not_indexed')
+                FROM index_entries
+                WHERE batch_id = ?1
+                  AND (
+                      path_key = ?2
+                      OR (?2 = '/' AND substr(path_key, 1, 1) = '/')
+                      OR (?2 <> '/' AND substr(path_key, 1, length(?2) + 1) = ?2 || '/')
+                  )
+                ORDER BY path_key ASC, path ASC
+                "#,
+            )?;
+            let rows = statement
+                .query_map(params![batch_id, scope_key], indexed_entry_from_storage_row)?;
+            for row in rows {
+                let entry = row?;
+                entries.insert(
+                    normalize_path_text_key_for_mode(&entry.path, self.comparison_mode),
+                    entry,
+                );
+            }
+        }
+        Ok(entries.into_values().collect())
+    }
+
+    pub fn update_index_batch_content_states(
+        &self,
+        batch_id: i64,
+        entries: &[IndexedEntry],
+    ) -> Result<(), StorageError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let mut statement = transaction.prepare(
+            r#"
+            UPDATE index_entries
+            SET content_index_state = ?3
+            WHERE batch_id = ?1 AND path_key = ?2
+            "#,
+        )?;
+        for entry in entries {
+            statement.execute(params![
+                batch_id,
+                normalize_path_text_key_for_mode(&entry.path, self.comparison_mode),
+                content_index_state_to_storage(&entry.content_index_state),
+            ])?;
+        }
+        drop(statement);
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn set_index_batch_config_fingerprint(
+        &self,
+        batch_id: i64,
+        config_fingerprint: &str,
+    ) -> Result<(), StorageError> {
+        self.connection.execute(
+            r#"
+            INSERT INTO index_baseline_metadata (batch_id, config_fingerprint)
+            VALUES (?1, ?2)
+            ON CONFLICT(batch_id) DO UPDATE SET
+                config_fingerprint = excluded.config_fingerprint
+            "#,
+            params![batch_id, config_fingerprint],
+        )?;
+        Ok(())
+    }
+
+    pub fn active_index_config_fingerprint(&self) -> Result<Option<String>, StorageError> {
+        Ok(self
+            .connection
+            .query_row(
+                r#"
+                SELECT metadata.config_fingerprint
+                FROM index_runtime_state AS state
+                JOIN index_baseline_metadata AS metadata
+                    ON metadata.batch_id = state.active_baseline_id
+                WHERE state.singleton = 1
+                "#,
+                [],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    fn index_staging_batch_id(&self, config_fingerprint: &str) -> Result<i64, StorageError> {
+        self.connection
+            .query_row(
+                r#"
+                SELECT staging.batch_id
+                FROM index_refresh_staging AS staging
+                JOIN index_batches AS batches ON batches.id = staging.batch_id
+                WHERE staging.config_fingerprint = ?1 AND batches.status = 'building'
+                "#,
+                params![config_fingerprint],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                StorageError::InvalidJournal(
+                    "index staging batch is unavailable for this configuration".to_owned(),
+                )
+            })
+    }
+
+    pub fn index_staging_entry_count(
+        &self,
+        config_fingerprint: &str,
+    ) -> Result<usize, StorageError> {
+        let batch_id = self.index_staging_batch_id(config_fingerprint)?;
+        let count = self.connection.query_row(
+            "SELECT COUNT(*) FROM index_entries WHERE batch_id = ?1",
+            params![batch_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(non_negative_usize(count))
+    }
+
+    pub fn index_batch_entry_count(&self, batch_id: i64) -> Result<usize, StorageError> {
+        let count = self.connection.query_row(
+            "SELECT COUNT(*) FROM index_entries WHERE batch_id = ?1",
+            params![batch_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(non_negative_usize(count))
+    }
+
     pub fn save_completed_index_batch(
         &self,
         completed_at_ms: i64,
@@ -1568,7 +2559,7 @@ impl SqliteStorage {
         })();
 
         if let Err(error) = write_result {
-            let _ = self.discard_incomplete_index_batches();
+            let _ = self.discard_orphaned_index_batches();
             return Err(error);
         }
         Ok(batch_id)
@@ -1818,30 +2809,7 @@ impl SqliteStorage {
             ORDER BY path ASC, name ASC
             "#,
         )?;
-        let rows = statement.query_map(params![batch_id], |row| {
-            let path: String = row.get(0)?;
-            let name: String = row.get(1)?;
-            let search_text: String = row.get(9)?;
-            Ok(IndexedEntry {
-                path: path.clone(),
-                name: name.clone(),
-                kind: index_kind_from_storage(row.get::<_, String>(2)?.as_str()),
-                parent: row.get(3)?,
-                extension: row.get(4)?,
-                depth: row.get::<_, i64>(5)?.max(0) as usize,
-                root: row.get(6)?,
-                modified_ms: row.get(7)?,
-                size_bytes: row.get::<_, Option<i64>>(8)?.map(|size| size.max(0) as u64),
-                search_text: if search_text.is_empty() {
-                    build_search_text(&name, &path)
-                } else {
-                    search_text
-                },
-                content_index_state: content_index_state_from_storage(
-                    row.get::<_, String>(10)?.as_str(),
-                ),
-            })
-        })?;
+        let rows = statement.query_map(params![batch_id], indexed_entry_from_storage_row)?;
         let mut entries = Vec::new();
         for row in rows {
             entries.push(row?);
@@ -5274,6 +6242,173 @@ mod tests {
         storage.record_command("third", 300, true, 2).unwrap();
 
         assert_eq!(storage.recent_commands().unwrap(), vec!["third", "second"]);
+
+        drop(storage);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn index_staging_streams_entries_and_resumes_completed_roots_after_reopen() {
+        let path = temp_db_path("index-staging-resume");
+        let fingerprint = "balanced-c-and-d";
+        let root = PathBuf::from("/root");
+        let batch_id = {
+            let storage = SqliteStorage::open(path.clone()).unwrap();
+            let staging = storage
+                .open_or_create_index_staging(fingerprint, 10)
+                .unwrap();
+            storage
+                .append_index_staging_entries(fingerprint, &[indexed_entry("/root/a.md")], 11)
+                .unwrap();
+            storage
+                .mark_index_staging_root(fingerprint, &root, "configured-roots", false, 12)
+                .unwrap();
+            assert_eq!(
+                storage
+                    .load_index_batch(staging.batch_id)
+                    .unwrap()
+                    .entries
+                    .len(),
+                1
+            );
+            staging.batch_id
+        };
+
+        let storage = SqliteStorage::open(path.clone()).unwrap();
+        let resumed = storage
+            .open_or_create_index_staging(fingerprint, 20)
+            .unwrap();
+        assert_eq!(resumed.batch_id, batch_id);
+        assert_eq!(
+            resumed.completed_roots,
+            vec![normalize_path_key_for_mode(
+                &root,
+                PathComparisonMode::native()
+            )]
+        );
+        let completed_id = storage.complete_index_staging(fingerprint, 21).unwrap();
+        storage
+            .set_index_batch_config_fingerprint(completed_id, fingerprint)
+            .unwrap();
+        storage.activate_baseline(completed_id, 0).unwrap();
+        assert_eq!(
+            storage
+                .active_index_config_fingerprint()
+                .unwrap()
+                .as_deref(),
+            Some(fingerprint)
+        );
+
+        drop(storage);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn directory_checkpoint_resume_keeps_completed_work_and_retries_partial_scope() {
+        let path = temp_db_path("index-directory-checkpoint-resume");
+        let storage = SqliteStorage::open(path.clone()).unwrap();
+        let fingerprint = "resume-large-drive";
+        let root = PathBuf::from("/root");
+        let child = root.join("large-folder");
+        storage
+            .open_or_create_index_staging(fingerprint, 1)
+            .unwrap();
+        let initial = storage
+            .prepare_index_staging_root(fingerprint, &root, 2)
+            .unwrap();
+        assert_eq!(initial.pending_directories, vec![root.clone()]);
+
+        storage
+            .append_index_staging_entries(fingerprint, &[indexed_entry("/root/keep.md")], 3)
+            .unwrap();
+        storage
+            .checkpoint_index_staging_directory(
+                fingerprint,
+                &root,
+                &root,
+                std::slice::from_ref(&child),
+                &IndexScanStats {
+                    scanned: 2,
+                    accepted: 1,
+                    skipped: 1,
+                    failures: 0,
+                },
+                None,
+                4,
+            )
+            .unwrap();
+        storage
+            .append_index_staging_entries(
+                fingerprint,
+                &[indexed_entry("/root/large-folder/partial.md")],
+                5,
+            )
+            .unwrap();
+
+        let resumed = storage
+            .prepare_index_staging_root(fingerprint, &root, 6)
+            .unwrap();
+        assert_eq!(resumed.pending_directories, vec![child]);
+        assert_eq!(
+            resumed.completed_stats,
+            IndexScanStats {
+                scanned: 2,
+                accepted: 1,
+                skipped: 1,
+                failures: 0,
+            }
+        );
+        assert_eq!(storage.index_staging_entry_count(fingerprint).unwrap(), 1);
+        let preview = storage
+            .build_search_index_for_staging_root(fingerprint, &root)
+            .unwrap();
+        let results = preview.search(&QueryParser::new(Default::default()).parse("keep"));
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "keep.md");
+
+        drop(storage);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn failed_subtree_preserves_last_known_good_entries_in_staging() {
+        let path = temp_db_path("index-staging-preserve");
+        let storage = SqliteStorage::open(path.clone()).unwrap();
+        let old_locked = indexed_entry("/root/locked/old.md");
+        let old_available = indexed_entry("/root/available/old.md");
+        let baseline_id = storage
+            .save_completed_index_batch(1, &[old_locked.clone(), old_available])
+            .unwrap();
+        storage.activate_baseline(baseline_id, 0).unwrap();
+
+        let fingerprint = "partial-refresh";
+        let staging = storage
+            .open_or_create_index_staging(fingerprint, 2)
+            .unwrap();
+        storage
+            .append_index_staging_entries(
+                fingerprint,
+                &[indexed_entry("/root/available/new.md")],
+                3,
+            )
+            .unwrap();
+        storage
+            .preserve_active_baseline_paths_in_staging(
+                fingerprint,
+                &[PathBuf::from("/root/locked")],
+            )
+            .unwrap();
+
+        let paths = storage
+            .load_index_batch(staging.batch_id)
+            .unwrap()
+            .entries
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect::<BTreeSet<_>>();
+        assert!(paths.contains(&old_locked.path));
+        assert!(paths.contains("/root/available/new.md"));
+        assert!(!paths.contains("/root/available/old.md"));
 
         drop(storage);
         let _ = fs::remove_file(path);

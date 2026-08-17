@@ -280,6 +280,20 @@ impl LayeredSearchIndex {
         self.baseline.content_index_clone()
     }
 
+    pub(crate) fn attach_baseline_content_index(
+        &mut self,
+        generation: u64,
+        content_index: ContentIndex,
+        content_entries: &[IndexedEntry],
+    ) -> bool {
+        if generation > self.generation {
+            return false;
+        }
+        self.baseline
+            .attach_content_index_for_entries(content_index, content_entries);
+        true
+    }
+
     pub(crate) fn publish_content_delta(
         &mut self,
         generation: u64,

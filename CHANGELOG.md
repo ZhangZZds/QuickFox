@@ -5,6 +5,8 @@
 
 ## Unreleased
 
+## [1.6.3] - 2026-08-17
+
 ### Fixed
 
 - 修复 Windows 全盘刷新结束时，待命 watcher 的溢出、临时读取失败或不可访问子目录
@@ -14,12 +16,24 @@
   页显示为可继续恢复的降级状态。
 - C/D 等多个配置根目录改为逐盘扫描计划，并在开始扫描盘符时立即更新当前阶段和
   root，避免界面长时间停留在上一个 `user-hot-paths`/Downloads 阶段。
+- 全盘扫描改为每 2,048 条持续写入带配置指纹的 SQLite staging；扫描中数据库会持续
+  增长，异常退出后可跳过已完成的 root，不再把数百万条结果同时保留多份内存副本。
+- 部分子目录读取失败时保留该范围的 last-known-good 条目，并使目录 manifest 强制
+  重新校准；失败范围不会在一次不完整扫描后永久消失。
+- Windows 默认盘符通过系统 API 只枚举本地固定磁盘，数据盘优先于系统盘补全；
+  `Program Files` 不再参与通用全盘递归，应用入口改由系统和用户开始菜单提供。
+- 启动时会校验 active baseline 的配置指纹和目录 manifest；两者匹配时直接恢复增量
+  watcher，不再每次启动都重扫 C/D。
+- Windows C/D 等完整盘符最多并行扫描 2 个，并按目录持久化恢复断点；先完成的盘立即
+  可搜索，异常退出后从未完成目录继续。
+- 每个索引根目录使用独立原生 watcher；单盘离线或注册失败不再关闭其他盘的增量更新。
+- 设置页新增逐盘“等待中 / 扫描中 / 可搜索 / 部分可用”状态与独立统计，明确区分现有
+  搜索可用和后台恢复。
 
 ### Verification
 
-- `npm run check`：318 个前端测试通过；544 个 Rust 测试通过，6 个显式 release/
-  benchmark 测试按设计忽略；Prettier、ESLint、TypeScript/Vite build、rustfmt 和
-  Clippy 全部通过。
+- 318 个前端测试与 552 个 Rust 测试通过，6 个显式 release/benchmark 测试按设计
+  忽略；Prettier、ESLint、TypeScript/Vite build、rustfmt 和 Clippy 全部通过。
 
 ## [1.6.1] - 2026-08-13
 
@@ -106,5 +120,6 @@
 - GitHub Actions 会构建 macOS 与 Windows 安装包。Windows NTFS 多盘、休眠/唤醒和
   断盘恢复的完整结构化手工记录本次未补录；维护者已明确接受该发布验证边界。
 
+[1.6.3]: https://github.com/ZhangZZds/QuickFox/compare/v1.6.2...v1.6.3
 [1.6.1]: https://github.com/ZhangZZds/QuickFox/compare/v1.6.0...v1.6.1
 [1.6.0]: https://github.com/ZhangZZds/QuickFox/compare/v1.5.0...v1.6.0
