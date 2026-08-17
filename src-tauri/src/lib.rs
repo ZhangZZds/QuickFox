@@ -2241,7 +2241,7 @@ fn default_index_dirs() -> Vec<String> {
         if let Some(home) = home_dir() {
             return windows_default_index_dirs_from_sources(&home, drive_roots);
         }
-        return drive_roots;
+        drive_roots
     }
 
     #[cfg(not(target_os = "windows"))]
