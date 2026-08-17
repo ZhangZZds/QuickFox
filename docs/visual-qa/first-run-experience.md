@@ -2,7 +2,7 @@
 
 日期：2026-06-07
 
-对应 OpenSpec change: `improve-launcher-first-run-experience`
+对应功能：首次使用体验
 
 ## 覆盖场景
 

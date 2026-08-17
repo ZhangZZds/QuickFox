@@ -20,13 +20,13 @@
 - [x] 纯 2,000,000 baseline compact threshold：6 类查询最大单次 889 µs，满足每查询 < 250 ms；该组是单样本，不标记为 P95。
 - [x] 三条 benchmark 命令均 exit 0，均报告 `1 passed`。
 - [x] layered/batch 均为 baseline/overlay/tombstone = 2,000,000 或 100,000 / 5,000 / 5,000，估算 delta `20,177,198` bytes。
-- [ ] 最终前端/Rust/格式化/lint/clippy/OpenSpec 完整门禁数字由主代理补录。
+- [ ] 最终前端/Rust/格式化/lint/clippy 完整门禁数字由主代理补录。
 
 完整命令、逐查询数据、wall time、maximum RSS 和 peak memory footprint 见 `docs/large-index-performance.md` 的“2026-07-31 运行期增量 release 验证记录”。macOS `/usr/bin/time -l` 的 maximum RSS 与 peak footprint 覆盖完整 fixture 生命周期且计数口径不同，不等同 QuickFox ready 后常驻内存。
 
 ### 最终自动化待填（主代理）
 
-> 待填：最终执行日期、commit、`npm run check` 或拆分命令、前端测试总数、Rust 测试总数、`openspec validate complete-runtime-incremental-indexing --strict`、`git diff --check` 的实际 exit code/摘要。阶段性参考值：前端 104、Rust 482。
+> 待填：最终执行日期、commit、`npm run check` 或拆分命令、前端测试总数、Rust 测试总数、`git diff --check` 的实际 exit code/摘要。阶段性参考值：前端 104、Rust 482。
 
 ## 发布阻塞项
 
@@ -87,7 +87,6 @@
 - 最终 `npm run check` 通过：313 个前端测试、520 个 Rust 测试通过，6 个显式
   release/benchmark 测试按设计忽略；Prettier、ESLint、前端构建、rustfmt 和 Clippy
   均 exit 0。
-- `openspec validate --all --strict` 通过 8 个主规范，三个相关 change 已同步归档。
 - macOS 开发版连接真实用户数据库验证了空文件 create/remove：分别持久化为
   generation 5 `upsert` 和 generation 6 `remove`，active baseline 未变化。
 - 维护者确认设置页 tooltip 与新增文件搜索验收为 OK，并明确授权提交 `main`、发布

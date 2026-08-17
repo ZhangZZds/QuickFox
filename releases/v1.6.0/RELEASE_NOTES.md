@@ -31,7 +31,6 @@
   - 313 个前端测试通过
   - 520 个 Rust 测试通过，6 个显式 release/benchmark 测试按设计忽略
   - Prettier、ESLint、TypeScript、Vite build、rustfmt、Clippy 全部通过
-- `openspec validate --all --strict`：8/8 通过
 - macOS 真实用户数据库空文件验证：generation 5 `upsert`、generation 6 `remove`，
   active baseline 保持不变
 - 维护者确认 tooltip 与新增文件搜索的最终界面验收，并授权发布

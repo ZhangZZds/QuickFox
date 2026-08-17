@@ -178,10 +178,10 @@ mod tests {
 
     #[test]
     fn parses_content_with_smart_quotes() {
-        let query = FileQuery::parse("name:Agent content:”openspec”");
+        let query = FileQuery::parse("name:Agent content:”indexing”");
 
         assert_eq!(query.name_filters, vec!["Agent"]);
-        assert_eq!(query.content_queries, vec!["openspec"]);
+        assert_eq!(query.content_queries, vec!["indexing"]);
         assert!(query.ordinary_terms.is_empty());
     }
 }

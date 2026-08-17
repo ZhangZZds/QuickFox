@@ -11,7 +11,6 @@
 
 ## Verification
 
-- `openspec validate --all --strict`
 - `npm run check`
 - GitHub Actions Release workflow on tag `v1.4.0`
 

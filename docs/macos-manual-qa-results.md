@@ -8,7 +8,6 @@
 
 - `npm run check` 通过，覆盖前端格式化、ESLint、Vitest、构建、Rust
   `rustfmt`、`clippy` 和 Rust 单元测试。
-- `openspec validate fix-launcher-manual-qa-bugs --strict` 通过。
 - `npm run tauri dev` 能完成 Vite 与 Cargo 编译，并启动调试版
   `target/debug/quickfox`。
 - 调试版启动后全局键盘监听会初始化；当前机器未授权输入监控或辅助功能权限时，
@@ -31,7 +30,7 @@
 - 上/下方向键能召回最近输入历史。
 - 右键菜单使用点击坐标定位。
 - 结果列表使用内部滚动容器，隐藏页面级割裂滚动条。
-- 普通模糊搜索对低相关结果设置阈值，避免 `Openspec_123` 返回
+- 普通模糊搜索对低相关结果设置阈值，避免 `NoMatch_123` 返回
   PyCharm 内部资源。
 - `.app`、`.exe`、`.lnk`、`.desktop` 识别为应用类型；macOS `.app`
   包内部内容不会进入普通搜索结果。

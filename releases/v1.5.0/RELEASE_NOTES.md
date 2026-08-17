@@ -7,7 +7,7 @@
 - 降低索引刷新和启动快照的内存放大：扫描进度不再长期保留每个 accepted entry，refresh/report/snapshot 路径避免重复持有完整 entries。
 - 内容索引 snippet 不再让所有文本正文和按行拆分结果常驻内存，改为按命中文档从 Tantivy stored content 生成。
 - 前端索引状态触发搜索统一走 debounce，旧查询结果不会覆盖最新输入。
-- 补充 Windows C/D 多盘、200 万文件级发布验收清单，以及 OpenSpec 发布归档流程规范。
+- 补充 Windows C/D 多盘、200 万文件级发布验收清单和发布流程规范。
 
 ## Performance
 
@@ -31,7 +31,6 @@ Windows 真实 C/D 多盘发布构建验收已由维护者确认通过。
 
 ## Verification
 
-- `openspec validate --all --strict`
 - `npm run check`
 - `cargo test --release --manifest-path src-tauri/Cargo.toml two_million_entry_search_stays_within_latency_budget -- --ignored --nocapture`
 - Windows C/D 多盘发布构建手工验收通过

@@ -34,7 +34,6 @@
 - `npm run check`：313 个前端测试通过；529 个 Rust 测试通过，6 个显式 release/
   benchmark 测试按设计忽略；Prettier、ESLint、TypeScript/Vite build、rustfmt 和
   Clippy 全部通过。
-- `openspec validate prevent-index-storage-exhaustion --strict` 通过。
 
 ### Validation scope
 
@@ -80,7 +79,6 @@
 - `npm run check`：313 个前端测试通过；520 个 Rust 测试通过，6 个显式 release/
   benchmark 测试按设计忽略；Prettier、ESLint、TypeScript/Vite build、rustfmt 和
   Clippy 全部通过。
-- `openspec validate --all --strict`：8 个主规范全部通过。
 - macOS 真实用户数据库验证：新建空文件提交为 generation 5 `upsert`，删除提交为
   generation 6 `remove`，active baseline 未变化。
 - 维护者确认设置页 tooltip 与新增文件搜索验收通过，并授权发布 v1.6.0。

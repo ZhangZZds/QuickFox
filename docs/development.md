@@ -6,7 +6,6 @@
 src/                     前端 UI 与 Tauri client
 src-tauri/src/core/      Rust core 模块
 src-tauri/src/lib.rs     Tauri 集成层
-openspec/                OpenSpec proposal / design / specs / tasks
 docs/                    项目文档
 ```
 
@@ -18,7 +17,6 @@ npm run tauri dev
 npm run test
 npm run rust:test
 npm run check
-openspec validate build-quickfox-launcher
 npm run tauri build
 ```
 
@@ -26,11 +24,11 @@ npm run tauri build
 
 本项目默认遵循：
 
-1. OpenSpec 明确 proposal / design / tasks
-2. 按 TDD 先写失败测试
-3. 写最小实现让测试转绿
-4. 跑 `npm run check`
-5. 跑 `openspec validate build-quickfox-launcher`
+1. 明确本次变更目标、范围、兼容性和验收条件；复杂设计记录到 `docs/`
+2. 实现最小完整改动，不强制测试先后顺序
+3. 对配置、索引、存储、安全和平台行为补充必要的回归测试
+4. 运行与风险匹配的检查；核心变更和发布候选运行 `npm run check`
+5. 更新受影响的架构、开发、故障排查或验收文档
 
 ## 发布流程
 
@@ -82,7 +80,7 @@ url = "https://duckduckgo.com/?q={query}"
 
 短期索引性能边界：
 
-- QuickFox 当前不接入 Everything、Windows Search、NTFS USN Journal 或 MFT 读取；这些能力需要后续独立 OpenSpec 变更评估权限、平台差异和 fallback 语义
+- QuickFox 当前不接入 Everything、Windows Search、NTFS USN Journal 或 MFT 读取；引入这些能力前必须评估权限、平台差异和 fallback 语义并更新架构文档
 - 当前目标是让首次体验先快速可用，并让大目录补全可见、可控；不承诺 `C:\Users`、`D:\` 等大根目录瞬时完整索引
 - 内容索引只处理配置范围内、大小限制内、可识别为文本的文件；PDF/Office 等专用 extractor 仍属于后续扩展
 
@@ -129,4 +127,4 @@ cargo test --manifest-path src-tauri/Cargo.toml indexing_baseline_fixture_report
 
 - 以功能里程碑提交
 - 每次提交前至少保证相关测试与检查通过
-- 不在未验证状态下勾选 OpenSpec 任务
+- 提交信息说明实际验证结果和未覆盖风险

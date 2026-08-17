@@ -1,7 +1,7 @@
 # QuickFox Agent Rules
 
-本文件是 QuickFox 仓库的 Codex/agent 项目级规则。长期工程纪律放在这里；
-具体产品范围和变更细节放在 `openspec/` 和 `docs/superpowers/specs/`。
+本文件是 QuickFox 仓库的 Codex/agent 项目级规则。长期工程纪律放在这里，
+产品设计、开发记录和验收结果统一维护在 `docs/`。
 
 ## 沟通与文档
 
@@ -12,7 +12,7 @@
 
 ## 流程
 
-- 声称完成前必须执行 verification-before-completion，并给出实际验证结果。
+- 声称完成前必须执行与变更风险匹配的验证，并给出实际结果。
 - 遇到 bug、测试失败或异常行为时，先系统化定位根因，再修复。
 
 ## 架构边界
@@ -24,8 +24,8 @@
   系统路径。
 - Provider 只产出统一结果，不直接执行动作。
 - Action 执行必须通过 Rust core，保证平台适配和安全检查集中。
-- 第一版只做内部可扩展边界，不开放第三方插件 API，除非有新的 OpenSpec
-  变更明确要求。
+- 第一版只做内部可扩展边界，不开放第三方插件 API；新增公开扩展边界需要维护者
+  明确批准并更新架构文档。
 
 ## 代码质量
 
@@ -51,15 +51,10 @@
 - GitHub Actions 使用标准 GitHub-hosted runner，不使用 larger runner。
 - 普通 push/PR 只跑检查和构建验证，不默认发布安装包。
 - 发布打包应通过手动 workflow 或 tag release workflow 触发。
-- 包含 OpenSpec 变更的发布归档流程：
-  1. 确认 OpenSpec tasks 全部完成，并运行 `openspec validate <change> --strict`。
-  2. 将 delta specs 同步到 `openspec/specs/` 后，把变更目录移动到
-     `openspec/changes/archive/YYYY-MM-DD-<change>/`。
-  3. 运行完整本地检查，例如 `npm run check`，必要时补跑 release/ignored
-     benchmark 和平台手工验收记录。
-  4. 在 `main` 上提交归档、实现、文档和验证记录，推送到 GitHub。
-  5. 使用 tag 或手动 release workflow 生成安装包，并在 GitHub Release notes
-     中记录功能变化、验证结果、平台验收和已知风险。
+- 发布前确认版本号、Release notes 和相关检查结果；核心索引、配置、存储或平台行为
+  变更运行完整 `npm run check`，文档或低风险变更运行相关检查。
+- 正式版本在 `main` 上创建 tag，通过 release workflow 生成安装包；Release notes
+  记录功能变化、实际验证、未完成的平台验收和已知风险。
 
 ## 安全与隐私
 

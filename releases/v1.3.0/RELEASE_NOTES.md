@@ -8,14 +8,13 @@
 - 优化内容搜索结果预览：默认显示命中次数、命中行和当前命中行，鼠标悬停结果时懒展开上下文。
 - 引入 `ignore` 扫描器、项目 ignore 配置、强制系统噪音排除和 watcher/debounce 更新，减少大目录重复扫描与无关结果。
 - 扩展索引配置与设置页说明：包含性能模式、内容索引目录、内容文件大小限制、项目 ignore 和 watcher 开关。
-- 完成本轮 OpenSpec 归档，并同步搜索索引与配置历史主规格。
+- 整理搜索索引与配置历史设计文档。
 
 ## Verification
 
 - `npm run check`
 - `npm run rust:clippy`
 - `npm run rust:test`
-- `openspec validate optimize-file-indexing-performance --strict`
 - 索引基准已记录在归档变更的 baseline/dependency notes 中。
 
 ## Release Notes

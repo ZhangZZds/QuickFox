@@ -36,8 +36,6 @@
   - 318 个前端测试通过
   - 542 个 Rust 测试通过，6 个 release/benchmark 测试按设计忽略
   - Prettier、ESLint、TypeScript/Vite build、rustfmt、Clippy 全部通过
-- `openspec validate fix-index-settings-state-transitions --strict`
-- `openspec validate default-windows-full-drive-indexing --strict`
 - `git diff --check`
 - GitHub Actions 在 Ubuntu 与 Windows runner 上执行格式、lint、前后端测试和构建；
   release workflow 在 macOS 与 Windows runner 上生成安装包。

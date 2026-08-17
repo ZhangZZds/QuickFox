@@ -1398,7 +1398,7 @@ mod tests {
         }]);
         let parser = crate::core::search::QueryParser::new(Default::default());
 
-        let results = index.search(&parser.parse("Openspec_123"));
+        let results = index.search(&parser.parse("NoMatch_123"));
 
         assert!(results.is_empty());
     }
@@ -1705,7 +1705,7 @@ mod tests {
         let matching = quickfox.join("AGENTS.md");
         let name_only = cc.join("AGENTS.md");
         let other = src.join("agent");
-        fs::write(&matching, "specific openspec guidance").unwrap();
+        fs::write(&matching, "specific indexing guidance").unwrap();
         fs::write(&name_only, "agent notes without the content term").unwrap();
         fs::write(&other, "agent helper without the content term").unwrap();
 
@@ -1725,7 +1725,7 @@ mod tests {
         let index = SearchIndex::from_entries_with_content_index(entries, content_index);
         let parser = crate::core::search::QueryParser::new(Default::default());
 
-        let results = index.search(&parser.parse("name:Agent content:”openspec”"));
+        let results = index.search(&parser.parse("name:Agent content:”indexing”"));
 
         assert_eq!(results.len(), 1);
         assert_eq!(

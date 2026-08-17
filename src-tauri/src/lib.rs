@@ -11314,7 +11314,7 @@ mod tests {
         let file = root.path().join("AGENTS.md");
         fs::write(
             &file,
-            "intro\nAgent type: md\ncontent mentions openspec workflow\nnext line\n",
+            "intro\nAgent type: md\ncontent mentions indexing workflow\nnext line\n",
         )
         .unwrap();
         let root_text = root.path().to_string_lossy().to_string();
@@ -11369,7 +11369,7 @@ mod tests {
             &runtime.config,
             &runtime.index,
             &runtime.index_status(),
-            "content:openspec",
+            "content:indexing",
         );
 
         assert_eq!(name_results.len(), 1);

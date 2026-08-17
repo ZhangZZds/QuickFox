@@ -2,7 +2,7 @@
 
 日期：2026-06-08
 
-对应 OpenSpec change: `custom-hotkey-window-behavior-settings-help`
+对应功能：自定义唤醒键与设置页帮助
 
 ## 覆盖场景
 

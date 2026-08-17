@@ -27,7 +27,6 @@ QuickFox 进程，再删除 `quickfox.sqlite` 以及同名的 `-journal`、`-wal
   - 313 个前端测试通过
   - 529 个 Rust 测试通过，6 个 release/benchmark 测试按设计忽略
   - Prettier、ESLint、TypeScript/Vite build、rustfmt、Clippy 全部通过
-- `openspec validate prevent-index-storage-exhaustion --strict` 通过
 
 ## Validation scope
 

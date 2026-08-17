@@ -2,8 +2,6 @@
 
 QuickFox 是一个基于 Tauri 的跨平台快速启动器，灵感来自 Listary。
 
-当前仓库采用 OpenSpec + Superpowers 的规格驱动流程开发：
-
 - 前端：React + Vite + TypeScript
 - 后端：Rust + Tauri
 - 测试：Vitest、Rust unit tests
@@ -67,12 +65,6 @@ npm run rust:test
 
 ```bash
 npm run check
-```
-
-OpenSpec 校验：
-
-```bash
-openspec validate build-quickfox-launcher
 ```
 
 ## 构建
