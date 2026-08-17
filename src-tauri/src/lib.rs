@@ -249,6 +249,7 @@ struct IndexRefreshHandoff {
     tail_deltas: Vec<CommittedIndexDelta>,
     manifest: Vec<crate::core::targeted_index_scanner::DirectoryFingerprint>,
     authoritative_generation: u64,
+    post_install_calibration_required: bool,
 }
 
 #[derive(Debug, Default)]
@@ -568,6 +569,45 @@ fn refresh_trusted_incremental_state<R: tauri::Runtime>(
     let status = manual_calibrate_without_runtime_service(state, &mut storage)?;
     let _ = app.emit("quickfox://index-status", status.clone());
     Ok(status)
+}
+
+fn schedule_post_refresh_runtime_calibration<R: tauri::Runtime>(app: tauri::AppHandle<R>) {
+    let failure_app = app.clone();
+    if let Err(error) = SystemRefreshWorkerSpawner.spawn(Box::new(move || {
+        let state = app.state::<QuickFoxAppState>();
+        let control = state
+            .runtime
+            .lock()
+            .expect("quickfox runtime lock poisoned")
+            .runtime_indexing
+            .as_ref()
+            .map(|handle| handle.control());
+        let Some(control) = control else {
+            return;
+        };
+        let Some(storage) = storage_store() else {
+            eprintln!("QuickFox post-refresh calibration skipped: index storage is unavailable");
+            return;
+        };
+        if let Err(error) = flush_and_replay_runtime_calibration(&control, &state, &storage) {
+            eprintln!("QuickFox post-refresh calibration failed: {error}");
+        }
+        let status = state
+            .runtime
+            .lock()
+            .expect("quickfox runtime lock poisoned")
+            .index_status();
+        let _ = app.emit("quickfox://index-status", status);
+    })) {
+        eprintln!("QuickFox post-refresh calibration could not start: {error}");
+        let state = failure_app.state::<QuickFoxAppState>();
+        let status = state
+            .runtime
+            .lock()
+            .expect("quickfox runtime lock poisoned")
+            .index_status();
+        let _ = failure_app.emit("quickfox://index-status", status);
+    }
 }
 
 fn flush_and_replay_runtime_calibration(
@@ -2506,12 +2546,12 @@ fn build_scan_plans(config: &QuickFoxConfig) -> Vec<IndexScanPlan> {
     }
 
     if mode != IndexPerformanceMode::Fast && !configured_roots.is_empty() {
-        plans.push(scan_plan_for_stage(
-            "configured-roots",
-            30,
-            configured_roots.clone(),
-            &options,
-        ));
+        plans.extend(
+            configured_roots
+                .iter()
+                .cloned()
+                .map(|root| scan_plan_for_stage("configured-roots", 30, vec![root], &options)),
+        );
     }
 
     let remaining_drives = if mode == IndexPerformanceMode::Complete {
@@ -2520,21 +2560,21 @@ fn build_scan_plans(config: &QuickFoxConfig) -> Vec<IndexScanPlan> {
         Vec::new()
     };
     if !remaining_drives.is_empty() {
-        plans.push(scan_plan_for_stage(
-            "remaining-drives",
-            40,
-            remaining_drives,
-            &options,
-        ));
+        plans.extend(
+            remaining_drives
+                .into_iter()
+                .map(|root| scan_plan_for_stage("remaining-drives", 40, vec![root], &options)),
+        );
     }
 
     if plans.is_empty() && mode != IndexPerformanceMode::Fast {
-        plans.push(scan_plan_for_stage(
-            "configured-roots",
-            30,
-            options.include_dirs.clone(),
-            &options,
-        ));
+        plans.extend(
+            options
+                .include_dirs
+                .iter()
+                .cloned()
+                .map(|root| scan_plan_for_stage("configured-roots", 30, vec![root], &options)),
+        );
     }
 
     plans
@@ -3028,6 +3068,32 @@ fn start_background_index_refresh_with_spawner<R: tauri::Runtime>(
                     .as_ref()
                     .map(|stage| stage.name.clone())
                     .unwrap_or_else(|| "configured-roots".to_owned());
+                let current_root = plan
+                    .include_roots
+                    .first()
+                    .map(|root| root.to_string_lossy().into_owned());
+                let stage_stats = IndexScanStats::default();
+                let stage_entry_count = accumulator.entries_by_path.len();
+                let app_for_stage = app.clone();
+                let stage_state = app_for_stage.clone();
+                let stage_identity = identity.clone();
+                let stage_for_status = stage_name.clone();
+                update_result = app_for_stage.run_on_main_thread(move || {
+                    let state = stage_state.state::<QuickFoxAppState>();
+                    if let Some(status) = apply_index_refresh_stage_for_identity(
+                        &state,
+                        &stage_identity,
+                        stage_for_status,
+                        current_root,
+                        stage_stats,
+                        stage_entry_count,
+                    ) {
+                        let _ = stage_state.emit("quickfox://index-status", status);
+                    }
+                });
+                if update_result.is_err() {
+                    break;
+                }
                 let cancellation_state = app.state::<QuickFoxAppState>();
                 let scan_result = scanner.scan_plan_cancellable(plan, || {
                     !index_refresh_identity_is_current_in_state(&cancellation_state, &identity)
@@ -3149,6 +3215,9 @@ fn start_background_index_refresh_with_spawner<R: tauri::Runtime>(
                     .as_ref()
                     .map(|handoff| handoff.tail_deltas.clone())
                     .unwrap_or_default();
+                let post_install_calibration_required = handoff
+                    .as_ref()
+                    .is_some_and(|handoff| handoff.post_install_calibration_required);
                 let authoritative_generation = handoff
                     .as_ref()
                     .map(|handoff| handoff.authoritative_generation)
@@ -3238,6 +3307,12 @@ fn start_background_index_refresh_with_spawner<R: tauri::Runtime>(
                                     &state,
                                 ) {
                                     eprintln!("QuickFox runtime watcher startup failed: {error}");
+                                } else if post_install_calibration_required
+                                    && !should_build_content_index
+                                {
+                                    schedule_post_refresh_runtime_calibration(
+                                        app_for_state.clone(),
+                                    );
                                 }
                             }
                             if partial_apply && !should_build_content_index {
@@ -3407,6 +3482,11 @@ fn start_background_index_refresh_with_spawner<R: tauri::Runtime>(
                                             app_for_state.clone(),
                                             &state,
                                         );
+                                        if post_install_calibration_required {
+                                            schedule_post_refresh_runtime_calibration(
+                                                app_for_state.clone(),
+                                            );
+                                        }
                                         if partial_apply {
                                             schedule_configured_root_recovery(
                                                 app_for_state.clone(),
@@ -3448,6 +3528,11 @@ fn start_background_index_refresh_with_spawner<R: tauri::Runtime>(
                                                 app_for_state.clone(),
                                                 &state,
                                             );
+                                            if post_install_calibration_required {
+                                                schedule_post_refresh_runtime_calibration(
+                                                    app_for_state.clone(),
+                                                );
+                                            }
                                         }
                                     } else if finish_superseded_index_refresh(
                                         &state,
@@ -3899,9 +3984,12 @@ fn prepare_index_refresh_handoff(
         );
         failure.message
     })?;
-    if capture_handle.handoff() == RuntimeIndexingHandoffOutcome::RecoveryRequired {
-        record_index_refresh_runtime_failure(state, identity, RuntimeRestartFailureKind::Handoff);
-        return Err("standby capture handoff requires a recovery scan".to_owned());
+    let post_install_calibration_required =
+        capture_handle.handoff() == RuntimeIndexingHandoffOutcome::RecoveryRequired;
+    if post_install_calibration_required {
+        eprintln!(
+            "QuickFox standby capture was incomplete; publishing the completed baseline and calibrating it after installation"
+        );
     }
 
     let successor_storage = storage_store().ok_or_else(|| {
@@ -3945,6 +4033,7 @@ fn prepare_index_refresh_handoff(
         ),
         tail_deltas,
         manifest,
+        post_install_calibration_required,
     }))
 }
 
@@ -4426,6 +4515,36 @@ fn apply_index_refresh_progress_for_identity(
         current_root,
         payload,
     )
+}
+
+fn apply_index_refresh_stage_for_identity(
+    state: &QuickFoxAppState,
+    identity: &IndexRefreshIdentity,
+    stage: String,
+    current_root: Option<String>,
+    stats: IndexScanStats,
+    entry_count: usize,
+) -> Option<IndexStatus> {
+    let _fence = state
+        .index_refresh_fence
+        .lock()
+        .expect("index refresh fence poisoned");
+    let mut runtime = state
+        .runtime
+        .lock()
+        .expect("quickfox runtime lock poisoned");
+    if !index_refresh_identity_is_current(&runtime, identity)
+        || !runtime.index_lifecycle.update_progress(
+            identity.lifecycle_generation,
+            stage,
+            current_root,
+            stats,
+            entry_count,
+        )
+    {
+        return None;
+    }
+    Some(runtime.index_status())
 }
 
 fn apply_failed_index_refresh_for_identity(
@@ -11489,6 +11608,44 @@ mod tests {
     }
 
     #[test]
+    fn index_refresh_stage_switches_to_drive_before_scan_without_replacing_search_view() {
+        let config = QuickFoxConfig::default_with_index_dirs(vec!["D:\\".to_owned()]);
+        let mut runtime = build_runtime_from_snapshot(config, None);
+        runtime.index = LayeredSearchIndex::from_baseline(vec![IndexedEntry::legacy(
+            "C:\\Users\\me\\Downloads\\existing.md",
+            "existing.md",
+            IndexedEntryKind::File,
+        )]);
+        let refresh = begin_runtime_index_refresh(&mut runtime).expect("refresh starts");
+        let state = QuickFoxAppState {
+            runtime: Mutex::new(runtime),
+            index_refresh_fence: Mutex::new(()),
+            window_state: Mutex::new(LauncherWindowState::default()),
+            global_hotkey_status: Mutex::new(pending_global_hotkey_status()),
+        };
+
+        let status = apply_index_refresh_stage_for_identity(
+            &state,
+            &refresh.identity,
+            "configured-roots".to_owned(),
+            Some("D:\\".to_owned()),
+            IndexScanStats {
+                scanned: 48_494,
+                accepted: 48_475,
+                skipped: 319,
+                failures: 2,
+            },
+            48_475,
+        )
+        .expect("current refresh stage is published");
+
+        assert_eq!(status.stage, "configured-roots");
+        assert_eq!(status.current_root.as_deref(), Some("D:\\"));
+        assert_eq!(status.scanned, 48_494);
+        assert_eq!(state.runtime.lock().unwrap().index.entry_count(), 1);
+    }
+
+    #[test]
     fn runtime_reports_do_not_retain_duplicate_entries_after_index_updates() {
         let state = QuickFoxAppState {
             runtime: Mutex::new(QuickFoxRuntime {
@@ -12169,6 +12326,29 @@ mod tests {
             .map(|stage| stage.root_priority)
             .unwrap_or(0)
             < 30));
+    }
+
+    #[test]
+    fn configured_drive_roots_use_separate_plans_for_visible_progress() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let mut config = QuickFoxConfig::default_with_index_dirs(vec![
+            first.path().to_string_lossy().into_owned(),
+            second.path().to_string_lossy().into_owned(),
+        ]);
+        config.index.performance_mode = crate::core::config::IndexPerformanceMode::Balanced;
+
+        let configured_plans = build_scan_plans(&config)
+            .into_iter()
+            .filter(|plan| {
+                plan.stage.as_ref().map(|stage| stage.name.as_str()) == Some("configured-roots")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(configured_plans.len(), 2);
+        assert!(configured_plans
+            .iter()
+            .all(|plan| plan.include_roots.len() == 1));
     }
 
     #[test]

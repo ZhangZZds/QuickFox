@@ -607,10 +607,15 @@ impl RuntimeIndexingService {
         if self.recovery_required.load(Ordering::Acquire) {
             return Err("manual root calibration requires full refresh".to_owned());
         }
-        self.degraded_roots.clear();
-        self.status.state = IncrementalState::Watching;
-        self.status.dirty_roots = 0;
-        self.status.degradation_code = None;
+        if self.degraded_roots.is_empty() {
+            self.status.state = IncrementalState::Watching;
+            self.status.dirty_roots = 0;
+            self.status.degradation_code = None;
+        } else {
+            self.status.state = IncrementalState::Degraded;
+            self.status.dirty_roots = self.degraded_roots.len();
+            self.status.degradation_code = Some(IndexDegradationCode::CalibrationFailed);
+        }
         self.publish_status();
         Ok(self.last_committed_generation.load(Ordering::Acquire))
     }
@@ -678,6 +683,7 @@ impl RuntimeIndexingService {
 
     fn commit_ready_batch(&mut self) {
         let batch = self.coordinator.drain();
+        let attempted_dirty_roots: BTreeSet<_> = batch.dirty_roots.iter().cloned().collect();
         let mut dirty_roots = self.degraded_roots.clone();
         dirty_roots.extend(batch.dirty_roots.iter().cloned());
         let dirty_root_count = dirty_roots.len();
@@ -703,13 +709,13 @@ impl RuntimeIndexingService {
                 Err(TargetedScanError::Cancelled) => return,
                 Err(TargetedScanError::Io(_)) => {
                     self.degraded_roots.extend(self.roots.iter().cloned());
-                    self.publish_calibration_failure(self.degraded_roots.len());
+                    self.publish_calibration_failure(self.degraded_roots.len(), true);
                     return;
                 }
             };
         let failed_roots = self.failed_configured_roots(&scanned.failures);
         let failed_root_count = failed_roots.len();
-        for root in dirty_roots
+        for root in attempted_dirty_roots
             .iter()
             .filter(|root| !failed_roots.contains(*root))
         {
@@ -724,7 +730,7 @@ impl RuntimeIndexingService {
             || !scanned.manifest_removals.is_empty();
         if !has_durable_changes {
             if failed_root_count > 0 {
-                self.publish_calibration_failure(dirty_roots.len());
+                self.publish_calibration_failure(dirty_roots.len(), false);
             } else {
                 self.status.state = IncrementalState::Watching;
                 self.status.degradation_code = None;
@@ -752,7 +758,7 @@ impl RuntimeIndexingService {
             self.publish_degraded(IndexDegradationCode::JournalWriteFailed);
             self.request_baseline_refresh(BaselineRefreshReason::DirtyRoots);
             if failed_root_count > 0 {
-                self.publish_calibration_failure(dirty_roots.len());
+                self.publish_calibration_failure(dirty_roots.len(), false);
             }
             return;
         }
@@ -775,7 +781,7 @@ impl RuntimeIndexingService {
         self.next_generation = self.next_generation.saturating_add(1);
         self.publish_status();
         if failed_root_count > 0 {
-            self.publish_calibration_failure(remaining_dirty_root_count);
+            self.publish_calibration_failure(remaining_dirty_root_count, false);
         }
     }
 
@@ -820,13 +826,15 @@ impl RuntimeIndexingService {
         roots
     }
 
-    fn publish_calibration_failure(&mut self, dirty_root_count: usize) {
+    fn publish_calibration_failure(&mut self, dirty_root_count: usize, request_refresh: bool) {
         self.status.state = IncrementalState::Degraded;
         self.status.degradation_code = Some(IndexDegradationCode::CalibrationFailed);
         self.status.pending_events = 0;
         self.status.dirty_roots = dirty_root_count;
         self.publish_status();
-        self.request_baseline_refresh(BaselineRefreshReason::CalibrationFailed);
+        if request_refresh {
+            self.request_baseline_refresh(BaselineRefreshReason::CalibrationFailed);
+        }
     }
 
     fn request_baseline_refresh(&mut self, reason: BaselineRefreshReason) {
@@ -1696,7 +1704,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_not_found_scan_commits_successes_then_marks_root_dirty_once() {
+    fn partial_not_found_scan_commits_successes_without_rejecting_handoff() {
         let root = tempfile::tempdir().unwrap();
         let accepted = root.path().join("accepted.md");
         fs::write(&accepted, "accepted").unwrap();
@@ -1719,17 +1727,18 @@ mod tests {
             sender.try_send(IndexWatchEvent::Write(accepted)),
             crate::core::index_watcher::WatchSendOutcome::Queued
         );
-        wait_until("partial scan fallback", || {
+        wait_until("partial scan degradation", || {
             events.lock().unwrap().iter().any(|event| {
                 matches!(
                     event,
-                    RuntimeIndexingEvent::BaselineRefreshRequired {
-                        reason: BaselineRefreshReason::CalibrationFailed
-                    }
+                    RuntimeIndexingEvent::Status(RuntimeIncrementalStatus {
+                        degradation_code: Some(IndexDegradationCode::CalibrationFailed),
+                        ..
+                    })
                 )
             })
         });
-        handle.stop();
+        assert_eq!(handle.handoff(), RuntimeIndexingHandoffOutcome::Clean);
         let events = events.lock().unwrap();
 
         assert_eq!(
@@ -1757,7 +1766,7 @@ mod tests {
                     }
                 ))
                 .count(),
-            1
+            0
         );
         assert_eq!(
             SqliteStorage::open(database_path)
@@ -1770,7 +1779,7 @@ mod tests {
     }
 
     #[test]
-    fn all_permission_failures_keep_old_view_and_do_not_advance_generation() {
+    fn inaccessible_child_keeps_old_view_without_rejecting_handoff() {
         let root = tempfile::tempdir().unwrap();
         let old_path = root.path().join("old.md");
         fs::write(&old_path, "old").unwrap();
@@ -1822,17 +1831,18 @@ mod tests {
             sender.try_send(IndexWatchEvent::Write(root.path().join("locked"))),
             crate::core::index_watcher::WatchSendOutcome::Queued
         );
-        wait_until("permission failure fallback", || {
+        wait_until("permission failure degradation", || {
             events.lock().unwrap().iter().any(|event| {
                 matches!(
                     event,
-                    RuntimeIndexingEvent::BaselineRefreshRequired {
-                        reason: BaselineRefreshReason::CalibrationFailed
-                    }
+                    RuntimeIndexingEvent::Status(RuntimeIncrementalStatus {
+                        degradation_code: Some(IndexDegradationCode::CalibrationFailed),
+                        ..
+                    })
                 )
             })
         });
-        handle.stop();
+        assert_eq!(handle.handoff(), RuntimeIndexingHandoffOutcome::Clean);
 
         let events = events.lock().unwrap();
         assert!(events
@@ -1856,7 +1866,7 @@ mod tests {
                     }
                 ))
                 .count(),
-            1
+            0
         );
         assert!(SqliteStorage::open(database_path)
             .unwrap()
@@ -1873,7 +1883,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_scan_failures_keep_root_dirty_and_request_one_refresh_per_service_lifetime() {
+    fn repeated_scan_failures_keep_root_dirty_without_full_refresh_loop() {
         let root = tempfile::tempdir().unwrap();
         let failure_result = || TargetedScanResult {
             failures: vec![IndexFailure {
@@ -1908,7 +1918,7 @@ mod tests {
                     > expected_failures
             });
         }
-        handle.stop();
+        assert_eq!(handle.handoff(), RuntimeIndexingHandoffOutcome::Clean);
         let events = events.lock().unwrap();
 
         assert_eq!(
@@ -1921,7 +1931,7 @@ mod tests {
                     }
                 ))
                 .count(),
-            1
+            0
         );
         let final_status = events
             .iter()

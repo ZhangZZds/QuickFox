@@ -2025,7 +2025,7 @@ function incrementalStatusText(status?: RuntimeIncrementalStatus) {
       case "journalReplayFailed":
         return "增量索引恢复失败，需要完整刷新索引";
       case "calibrationFailed":
-        return "自动增量校准失败，需要完整刷新索引";
+        return "部分目录暂不可访问；可用索引已保留，后续会继续校准";
       case "fullRefreshFallback":
         return "自动增量不可用，需要完整刷新索引";
       default:

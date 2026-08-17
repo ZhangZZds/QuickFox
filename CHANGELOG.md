@@ -3,6 +3,24 @@
 本文件记录 QuickFox 的用户可见变化。完整安装包和历史版本说明见
 [GitHub Releases](https://github.com/ZhangZZds/QuickFox/releases)。
 
+## Unreleased
+
+### Fixed
+
+- 修复 Windows 全盘刷新结束时，待命 watcher 的溢出、临时读取失败或不可访问子目录
+  会触发 `standby capture handoff requires a recovery scan`，继而丢弃已经完成的 C/D
+  盘基线并反复重扫的问题；现在先发布可用基线，再在后台校准不确定目录。
+- 局部目录访问失败不再否决整盘索引或触发完整刷新循环；可访问文件保持可搜索，设置
+  页显示为可继续恢复的降级状态。
+- C/D 等多个配置根目录改为逐盘扫描计划，并在开始扫描盘符时立即更新当前阶段和
+  root，避免界面长时间停留在上一个 `user-hot-paths`/Downloads 阶段。
+
+### Verification
+
+- `npm run check`：318 个前端测试通过；544 个 Rust 测试通过，6 个显式 release/
+  benchmark 测试按设计忽略；Prettier、ESLint、TypeScript/Vite build、rustfmt 和
+  Clippy 全部通过。
+
 ## [1.6.1] - 2026-08-13
 
 ### Added
