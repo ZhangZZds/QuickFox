@@ -22,6 +22,9 @@ pub const CONTENT_INDEX_DIR_VERSION: &str = "content-v1";
 const CONTENT_BUILD_PREFIX: &str = "build-";
 const CONTENT_BUILD_MARKER: &str = ".quickfox-content-index-build";
 const CONTENT_BUILD_MARKER_CONTENT: &[u8] = b"quickfox-content-index-v1\n";
+const CONTENT_DIRECTORY_REMOVE_ATTEMPTS: usize = 6;
+const CONTENT_DIRECTORY_REMOVE_RETRY_DELAY: std::time::Duration =
+    std::time::Duration::from_millis(10);
 static ACTIVE_CONTENT_BUILD_DIRS: OnceLock<std::sync::Mutex<HashSet<PathBuf>>> = OnceLock::new();
 
 type ContentResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -116,16 +119,19 @@ struct ContentIndexDirectoryLease {
 
 impl Drop for ContentIndexDirectoryLease {
     fn drop(&mut self) {
-        let mut active = active_content_build_dirs()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        active.remove(&self.path);
+        {
+            let mut active = active_content_build_dirs()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            active.remove(&self.path);
+        }
         if let Some(marker_lock) = self.marker_lock.take() {
             let _ = marker_lock.unlock();
             drop(marker_lock);
         }
         if let Some(directory) = self.directory.take() {
-            if let Err(error) = directory.close() {
+            let path = directory.keep();
+            if let Err(error) = remove_content_index_dir(&path) {
                 eprintln!(
                     "QuickFox failed to reclaim a content index version: {:?}",
                     error.kind()
@@ -137,6 +143,35 @@ impl Drop for ContentIndexDirectoryLease {
 
 fn active_content_build_dirs() -> &'static std::sync::Mutex<HashSet<PathBuf>> {
     ACTIVE_CONTENT_BUILD_DIRS.get_or_init(|| std::sync::Mutex::new(HashSet::new()))
+}
+
+fn remove_content_index_dir(path: &Path) -> std::io::Result<()> {
+    remove_content_index_dir_with(path, |path| fs::remove_dir_all(path), std::thread::sleep)
+}
+
+fn remove_content_index_dir_with(
+    path: &Path,
+    mut remove: impl FnMut(&Path) -> std::io::Result<()>,
+    mut pause: impl FnMut(std::time::Duration),
+) -> std::io::Result<()> {
+    let mut delay = CONTENT_DIRECTORY_REMOVE_RETRY_DELAY;
+    for attempt in 0..CONTENT_DIRECTORY_REMOVE_ATTEMPTS {
+        match remove(path) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::DirectoryNotEmpty | std::io::ErrorKind::PermissionDenied
+                ) && attempt + 1 < CONTENT_DIRECTORY_REMOVE_ATTEMPTS =>
+            {
+                pause(delay);
+                delay = delay.saturating_mul(2);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("content directory cleanup attempt loop always returns")
 }
 
 fn reclaim_inactive_content_build_dirs(version_root: &Path, active: &HashSet<PathBuf>) {
@@ -194,13 +229,11 @@ fn reclaim_inactive_content_build_dirs(version_root: &Path, active: &HashSet<Pat
         let _ = marker.unlock();
         drop(marker);
         if has_marker {
-            if let Err(error) = fs::remove_dir_all(&path) {
-                if error.kind() != std::io::ErrorKind::NotFound {
-                    eprintln!(
-                        "QuickFox failed to reclaim an orphaned content index: {:?}",
-                        error.kind()
-                    );
-                }
+            if let Err(error) = remove_content_index_dir(&path) {
+                eprintln!(
+                    "QuickFox failed to reclaim an orphaned content index: {:?}",
+                    error.kind()
+                );
             }
         }
     }
@@ -948,6 +981,71 @@ mod tests {
 
         drop(reader);
         assert!(!version.exists());
+    }
+
+    #[test]
+    fn content_directory_cleanup_retries_transient_windows_removal_errors() {
+        let path = Path::new("content-build");
+        let mut attempts = 0;
+        let mut pauses = Vec::new();
+
+        let result = remove_content_index_dir_with(
+            path,
+            |_| {
+                attempts += 1;
+                if attempts < 3 {
+                    Err(std::io::Error::from(std::io::ErrorKind::DirectoryNotEmpty))
+                } else {
+                    Ok(())
+                }
+            },
+            |delay| pauses.push(delay),
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(attempts, 3);
+        assert_eq!(
+            pauses,
+            vec![
+                std::time::Duration::from_millis(10),
+                std::time::Duration::from_millis(20),
+            ]
+        );
+    }
+
+    #[test]
+    fn content_directory_cleanup_treats_missing_directory_as_success() {
+        let mut attempts = 0;
+
+        let result = remove_content_index_dir_with(
+            Path::new("content-build"),
+            |_| {
+                attempts += 1;
+                Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+            },
+            |_| panic!("missing directories should not trigger a retry"),
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn content_directory_cleanup_does_not_retry_non_transient_errors() {
+        let mut attempts = 0;
+
+        let error = remove_content_index_dir_with(
+            Path::new("content-build"),
+            |_| {
+                attempts += 1;
+                Err(std::io::Error::from(std::io::ErrorKind::InvalidInput))
+            },
+            |_| panic!("non-transient errors should not trigger a retry"),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(attempts, 1);
     }
 
     #[test]

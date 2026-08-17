@@ -18,6 +18,8 @@
   “重试/校准索引”继续收敛。
 - 连续保存新设置会取消旧 revision 的扫描；`fast` 不会因配置仍包含整盘 root 而继续
   扫描整盘。
+- Windows 释放内容索引版本时会对短暂的目录占用做有界重试，避免退出或切换索引后
+  因文件句柄刚释放而遗留临时目录。
 
 ## Upgrade notes
 
@@ -32,7 +34,7 @@
 
 - `npm run check`
   - 318 个前端测试通过
-  - 539 个 Rust 测试通过，6 个 release/benchmark 测试按设计忽略
+  - 542 个 Rust 测试通过，6 个 release/benchmark 测试按设计忽略
   - Prettier、ESLint、TypeScript/Vite build、rustfmt、Clippy 全部通过
 - `openspec validate fix-index-settings-state-transitions --strict`
 - `openspec validate default-windows-full-drive-indexing --strict`
