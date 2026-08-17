@@ -23,11 +23,12 @@ quickfox.sqlite-shm
 
 ## 重建建议
 
-新版本会自动迁移完全未修改过的旧版 Windows 全盘默认配置；如果你改过索引设置，
-程序会尊重现有配置，此时需要手工缩小范围。
+Windows 新配置默认索引当前可用盘符；系统会自动跳过 Windows、ProgramData、恢复/
+升级目录、回收站、卷元数据、AppData 和虚拟内存文件。v1.6.1 完全未修改过的自动
+热路径默认会迁移为盘符范围；如果你改过任一索引设置，程序会尊重现有配置。
 
-保留 `config.toml`，把 `[index].include_dirs` 设置为真正需要搜索的具体目录，不要直接
-使用 `C:\`、`D:\` 根目录。例如：
+如果机器规模仍超过 8 GiB baseline 或 5 GiB 剩余空间保护线，可以保留
+`config.toml`，把 `[index].include_dirs` 手工缩小为真正需要搜索的具体目录。例如：
 
 ```toml
 [index]

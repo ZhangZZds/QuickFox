@@ -10,8 +10,9 @@ use crate::core::file_matcher::{FileMatchCandidate, FileMatcher};
 use crate::core::file_query::FileQuery;
 use crate::core::index_entry::{path_is_same_or_descendant_for_mode, PathComparisonMode};
 pub use crate::core::index_entry::{
-    ContentIndexState, IndexAvailability, IndexFailure, IndexLifecycle, IndexReport,
-    IndexScanOptions, IndexStatus, IndexStatusKind, IndexedEntry, IndexedEntryKind,
+    ContentIndexState, IndexAvailability, IndexConfigApplyState, IndexConfigApplyStatus,
+    IndexFailure, IndexLifecycle, IndexReport, IndexScanOptions, IndexStatus, IndexStatusKind,
+    IndexedEntry, IndexedEntryKind,
 };
 use crate::core::index_scanner::{FileSystemScanner, IgnoreScanner, IndexScanPlan};
 use crate::core::search::{QueryRequest, SearchMode, SearchResult, SearchResultKind};
@@ -46,6 +47,14 @@ impl IndexScanner {
 
     pub fn scan_plan(&self, plan: IndexScanPlan) -> Result<IndexReport, std::io::Error> {
         IgnoreScanner::default().scan(plan)
+    }
+
+    pub fn scan_plan_cancellable(
+        &self,
+        plan: IndexScanPlan,
+        is_cancelled: impl Fn() -> bool,
+    ) -> Result<IndexReport, std::io::Error> {
+        IgnoreScanner::default().scan_cancellable(plan, is_cancelled)
     }
 }
 

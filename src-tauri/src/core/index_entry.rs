@@ -244,6 +244,25 @@ pub enum IndexAvailability {
     Complete,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum IndexConfigApplyState {
+    #[default]
+    Applied,
+    Applying,
+    Partial,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct IndexConfigApplyStatus {
+    pub state: IndexConfigApplyState,
+    pub desired_revision: u64,
+    pub applied_revision: u64,
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum IndexDegradationCode {
@@ -317,6 +336,8 @@ pub struct IndexStatus {
     pub failures: usize,
     #[serde(default)]
     pub incremental: RuntimeIncrementalStatus,
+    #[serde(default)]
+    pub config_apply: IndexConfigApplyStatus,
 }
 
 fn default_index_availability() -> IndexAvailability {
@@ -347,6 +368,7 @@ impl Default for IndexLifecycle {
                 skipped: 0,
                 failures: 0,
                 incremental: RuntimeIncrementalStatus::default(),
+                config_apply: IndexConfigApplyStatus::default(),
             },
         }
     }
@@ -370,6 +392,7 @@ impl IndexLifecycle {
                 skipped: 0,
                 failures: 0,
                 incremental: RuntimeIncrementalStatus::default(),
+                config_apply: IndexConfigApplyStatus::default(),
             },
         }
     }
@@ -449,6 +472,7 @@ impl IndexLifecycle {
             skipped: self.status.skipped,
             failures: self.status.failures,
             incremental: self.status.incremental.clone(),
+            config_apply: self.status.config_apply.clone(),
         };
         true
     }
@@ -616,6 +640,7 @@ mod tests {
             skipped: 3,
             failures: 1,
             incremental: RuntimeIncrementalStatus::default(),
+            config_apply: IndexConfigApplyStatus::default(),
         };
 
         let value = serde_json::to_value(status).unwrap();

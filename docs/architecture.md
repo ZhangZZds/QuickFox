@@ -159,16 +159,19 @@ baseline 的 name 候选使用 1–3 字符 n-gram：每个 posting 的有序 `E
 
 正文查询复用相同可见性语义，但查询时不遍历 baseline 构造隐藏路径。delta 提交时生成只含 overlay 路径和 tombstone 的不可变可见性快照，Tantivy 命中后按路径段过滤。没有正文索引时，普通 name/path 查询仍可用；`content:` 返回“内容索引仍在准备”。非法正文查询返回语法反馈；reader/search I/O 失败返回“内容索引查询失败”，并让运行时进入可观察降级与恢复。
 
-### 配置 revision 的两阶段切换
+### 配置 desired/applied revision
 
 仅切换 `watcher_enabled` 不重建 baseline：关闭会停止新事件消费但保留 baseline、journal 和搜索结果；重新开启会先校准全部 root，成功后才进入 `Watching`。
 
-include/exclude roots、exclude patterns、project ignore 或正文索引范围属于索引语义。保存这类配置时使用两阶段切换：
+include/exclude roots、exclude patterns、性能模式、project ignore 或正文索引范围属于索引语义。保存这类配置时，配置提交和索引应用是两个可观察阶段：
 
-1. 旧配置、旧 service 和旧查询视图继续工作；新 revision 建立 candidate watcher capture。
-2. candidate 完成校准并越过 generation/storage fence 后，才持久化配置并原子替换内存配置、索引视图和 service。
+1. 校验通过后先持久化 desired config，并递增 desired revision；保存命令不执行目录遍历，也不等待 watcher、baseline 或内容索引。
+2. 最近可用查询视图继续服务，新 revision 在后台建立 active roots、capture、baseline 和 service；完成后更新 applied revision。
+3. 设置页分别显示 `applying`、`applied`、`partial` 或 `failed`。后台失败不能回滚已经持久化的 desired config；用户重开设置仍看到最后保存值。
 
-任一 watcher、scanner、storage、配置持久化或 dispatch 步骤失败都会丢弃 candidate，保留旧配置/service/view，并进入统一的 `Degraded` 恢复路径。全量 baseline 激活也会先 drain durable successor，把 entries 与 manifest materialize 到同一权威 generation，防止刷新交接窗口丢事件。
+`fast`、`balanced`、`complete` 先生成唯一 active-root 集合，baseline、standby/runtime watcher 和 calibration 都使用该集合；`fast` 不会因为配置中仍保留 `D:\` 而重新扫描整盘。新 desired revision 会在 walker 条目边界取消旧 revision。单个 root 不可访问时，系统提交其他可用 root 的结果并标记 `partial`/dirty；缺失盘符恢复后由 root monitor 触发重试。全量 baseline 激活仍会先 drain durable successor，把 entries 与 manifest materialize 到同一权威 generation，防止刷新交接窗口丢事件。
+
+Windows 首次配置默认把当前可用的盘符根目录写入 `include_dirs`；未发现盘符时才回退当前用户 profile。默认仍为 `balanced`，应用入口和用户热路径先提供结果，全盘范围在后台补全。baseline、watcher 与 calibration 统一排除 `Windows`、`ProgramData`、`PerfLogs`、恢复/升级目录、卷元数据、回收站、`AppData` 和虚拟内存文件等系统噪音，但不排除 `Users`、Desktop 或 Documents。仅完整匹配 v1.6.1 自动热路径默认指纹的配置会迁移为盘符范围，用户修改过任一索引字段时保持原值。
 
 ### 有界资源与降级
 

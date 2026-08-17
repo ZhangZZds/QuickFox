@@ -628,12 +628,19 @@ fn matcher_decision(matcher: &Gitignore, path: &Path, is_dir: bool) -> IgnoreDec
     }
 }
 
-impl FileSystemScanner for IgnoreScanner {
-    fn scan(&self, plan: IndexScanPlan) -> Result<IndexReport, std::io::Error> {
+impl IgnoreScanner {
+    pub fn scan_cancellable(
+        &self,
+        plan: IndexScanPlan,
+        is_cancelled: impl Fn() -> bool,
+    ) -> Result<IndexReport, std::io::Error> {
         let rules = IndexPathRules::from_plan(&plan)?;
         let mut report = IndexReport::default();
 
         for root in rules.roots.clone() {
+            if is_cancelled() {
+                break;
+            }
             let root_label = path_to_string(&root);
             let stage_name = plan.stage.as_ref().map(|stage| stage.name.clone());
             report.scan_events.push(ScanEvent::RootStarted {
@@ -677,6 +684,9 @@ impl FileSystemScanner for IgnoreScanner {
                 });
 
             for entry in builder.build() {
+                if is_cancelled() {
+                    break;
+                }
                 match entry {
                     Ok(entry) => {
                         if entry.depth() == 0 {
@@ -712,6 +722,12 @@ impl FileSystemScanner for IgnoreScanner {
 
         sort_report_entries(&mut report);
         Ok(report)
+    }
+}
+
+impl FileSystemScanner for IgnoreScanner {
+    fn scan(&self, plan: IndexScanPlan) -> Result<IndexReport, std::io::Error> {
+        self.scan_cancellable(plan, || false)
     }
 }
 
@@ -1219,6 +1235,30 @@ mod tests {
             .iter()
             .any(|failure| failure.root == missing.to_string_lossy()));
         assert_eq!(report.scan_stats.failures, report.failures.len());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ignore_scanner_cancels_during_root_walk() {
+        let root = temp_dir("ignore-cancel-root");
+        for index in 0..128 {
+            fs::write(root.join(format!("file-{index}.md")), "test").unwrap();
+        }
+        let checks = AtomicUsize::new(0);
+
+        let report = IgnoreScanner::default()
+            .scan_cancellable(
+                IndexScanPlan {
+                    include_roots: vec![root.clone()],
+                    ..IndexScanPlan::default()
+                },
+                || checks.fetch_add(1, Ordering::Relaxed) >= 8,
+            )
+            .unwrap();
+
+        assert!(report.scan_stats.scanned < 128);
+        assert!(checks.load(Ordering::Relaxed) >= 9);
 
         let _ = fs::remove_dir_all(root);
     }

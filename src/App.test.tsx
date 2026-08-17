@@ -1477,6 +1477,132 @@ describe("App", () => {
     expect(screen.getByRole("form", { name: "设置" })).toBeInTheDocument();
   });
 
+  it("shows unsaved, saving, and background apply states without blocking the settings form", async () => {
+    let finishSave: (() => void) | undefined;
+    vi.mocked(saveConfig).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishSave = () => resolve("saved");
+        }),
+    );
+    vi.mocked(indexStatus)
+      .mockResolvedValueOnce({
+        kind: "ready",
+        incremental: indexStatusWithIncremental({}).incremental,
+        entryCount: 12,
+        message: null,
+        generation: 1,
+        completedAtMs: 100,
+      })
+      .mockResolvedValueOnce({
+        kind: "refreshing",
+        availability: "quickAvailable",
+        incremental: indexStatusWithIncremental({ state: "preparing" }).incremental,
+        configApply: {
+          state: "applying",
+          desiredRevision: 2,
+          appliedRevision: 1,
+          error: null,
+        },
+        entryCount: 12,
+        message: null,
+        generation: 2,
+        completedAtMs: 100,
+      });
+    render(<App initialView="settings" />);
+    await screen.findByDisplayValue("/tmp");
+
+    fireEvent.change(screen.getByRole("combobox", { name: "索引性能模式" }), {
+      target: { value: "complete" },
+    });
+    expect(screen.getByText("有未保存的更改")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "保存设置" }));
+    expect(screen.getByRole("button", { name: "保存中…" })).toBeDisabled();
+    expect(screen.getByText("正在保存配置…")).toBeInTheDocument();
+
+    await act(async () => finishSave?.());
+
+    expect(await screen.findAllByText("配置已保存，索引正在后台应用")).toHaveLength(2);
+    expect(screen.getByRole("form", { name: "设置" })).toBeInTheDocument();
+  });
+
+  it("reloads the last persisted performance mode after reopening settings", async () => {
+    let persistedConfig: QuickFoxConfig = {
+      ...appConfig,
+      index: { ...appConfig.index, performance_mode: "fast" },
+    };
+    vi.mocked(loadConfig).mockImplementation(async () => persistedConfig);
+    vi.mocked(saveConfig).mockImplementation(async (nextConfig) => {
+      persistedConfig = nextConfig as QuickFoxConfig;
+      return "saved";
+    });
+    const firstView = render(<App initialView="settings" />);
+    const mode = await screen.findByRole("combobox", { name: "索引性能模式" });
+    expect(mode).toHaveValue("fast");
+
+    fireEvent.change(mode, { target: { value: "balanced" } });
+    fireEvent.click(screen.getByRole("button", { name: "保存设置" }));
+    await waitFor(() => expect(saveConfig).toHaveBeenCalledOnce());
+    firstView.unmount();
+
+    render(<App initialView="settings" />);
+    expect(await screen.findByRole("combobox", { name: "索引性能模式" })).toHaveValue("balanced");
+  });
+
+  it("keeps edits visible and reports a real save failure", async () => {
+    vi.mocked(saveConfig).mockRejectedValueOnce(new Error("磁盘写入失败"));
+    render(<App initialView="settings" />);
+    await screen.findByDisplayValue("/tmp");
+
+    fireEvent.click(screen.getByRole("checkbox", { name: "命令执行" }));
+    fireEvent.click(screen.getByRole("button", { name: "保存设置" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("保存失败：磁盘写入失败");
+    expect(screen.getByRole("checkbox", { name: "命令执行" })).toBeChecked();
+    expect(screen.getByRole("button", { name: "保存设置" })).not.toBeDisabled();
+  });
+
+  it("shows partial index application separately from config persistence", async () => {
+    vi.mocked(indexStatus).mockResolvedValueOnce({
+      kind: "ready",
+      availability: "quickAvailable",
+      incremental: indexStatusWithIncremental({
+        state: "degraded",
+        dirtyRoots: 1,
+        degradationCode: "calibrationFailed",
+      }).incremental,
+      configApply: {
+        state: "partial",
+        desiredRevision: 2,
+        appliedRevision: 2,
+        error: "1 个索引位置无法访问，其他可用位置已应用",
+      },
+      entryCount: 12,
+      message: null,
+      generation: 2,
+      completedAtMs: 100,
+    });
+
+    render(<App initialView="settings" />);
+
+    expect(await screen.findByText("配置已保存，部分索引位置不可用")).toBeInTheDocument();
+    expect(screen.getByText("1 个索引位置无法访问，其他可用位置已应用")).toBeInTheDocument();
+  });
+
+  it("warns clearly before indexing an entire Windows drive", async () => {
+    render(<App initialView="settings" />);
+    const includeDirs = await screen.findByRole("textbox", { name: "索引目录" });
+
+    fireEvent.change(includeDirs, { target: { value: "D:\\" } });
+
+    expect(screen.getByRole("note")).toHaveTextContent("Windows 默认覆盖当前可用盘符");
+    expect(screen.getByRole("note")).toHaveTextContent("系统目录会自动跳过");
+    expect(screen.getByRole("note")).toHaveTextContent(
+      "无法访问或临时离线的位置不会阻止其他盘符应用",
+    );
+  });
+
   it("loads app paths through the Tauri client contract for settings", async () => {
     render(<App initialView="settings" />);
 
@@ -1845,10 +1971,10 @@ describe("App", () => {
     render(<App initialView="settings" />);
 
     const header = await screen.findByRole("region", { name: "索引工作区标题" });
-    fireEvent.click(within(header).getByRole("button", { name: "刷新索引" }));
+    fireEvent.click(within(header).getByRole("button", { name: "重试/校准索引" }));
 
     expect(refreshIndex).toHaveBeenCalledOnce();
-    expect(await screen.findByText("索引已刷新")).toBeInTheDocument();
+    expect(await screen.findByText("已开始索引校准")).toBeInTheDocument();
   });
 
   it("renders the basic settings view", () => {
@@ -1982,10 +2108,10 @@ describe("App", () => {
   it("refreshes the index from the settings search group", async () => {
     render(<App initialView="settings" />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "刷新索引" }));
+    fireEvent.click(await screen.findByRole("button", { name: "重试/校准索引" }));
 
     expect(refreshIndex).toHaveBeenCalledOnce();
-    expect(await screen.findByText("索引已刷新")).toBeInTheDocument();
+    expect(await screen.findByText("已开始索引校准")).toBeInTheDocument();
   });
 
   it("shows recent input history in Shift history mode", async () => {

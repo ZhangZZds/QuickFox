@@ -542,6 +542,10 @@ input {
   padding: 4px;
 }
 
+.settings-actions small {
+  line-height: 1.4;
+}
+
 .settings-tabs button {
   min-height: 36px;
   border: 0;
@@ -574,7 +578,7 @@ input {
 
 .settings-status-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   gap: 10px;
 }
 
@@ -722,6 +726,13 @@ input {
 .settings-error {
   color: #9f2f35;
   font-size: 13px;
+}
+
+.settings-warning {
+  color: #795b18;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.5;
 }
 
 .settings-form label {

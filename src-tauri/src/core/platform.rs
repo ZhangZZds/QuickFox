@@ -21,6 +21,7 @@ pub struct PathAdapter {
     platform: PlatformKind,
     home_dir: Option<String>,
     user_profile: Option<String>,
+    available_drive_roots: Vec<String>,
 }
 
 impl PathAdapter {
@@ -29,6 +30,7 @@ impl PathAdapter {
             platform,
             home_dir: None,
             user_profile: None,
+            available_drive_roots: Vec::new(),
         }
     }
 
@@ -42,8 +44,16 @@ impl PathAdapter {
         self
     }
 
+    pub fn with_available_drive_roots(mut self, roots: Vec<String>) -> Self {
+        self.available_drive_roots = roots;
+        self
+    }
+
     pub fn default_index_roots(&self) -> Vec<String> {
         match self.platform {
+            PlatformKind::Windows if !self.available_drive_roots.is_empty() => {
+                self.available_drive_roots.clone()
+            }
             PlatformKind::Windows => self
                 .user_profile
                 .clone()
@@ -619,7 +629,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn path_adapter_uses_user_profile_as_windows_default_index_root() {
+    fn path_adapter_uses_available_drives_as_windows_default_index_roots() {
+        let adapter = PathAdapter::new(PlatformKind::Windows)
+            .with_home_dir("/home/frank")
+            .with_user_profile("C:\\Users\\Frank")
+            .with_available_drive_roots(vec!["C:\\".to_owned(), "D:\\".to_owned()]);
+
+        assert_eq!(
+            adapter.default_index_roots(),
+            vec!["C:\\".to_owned(), "D:\\".to_owned()]
+        );
+    }
+
+    #[test]
+    fn path_adapter_falls_back_to_user_profile_without_windows_drives() {
         let adapter = PathAdapter::new(PlatformKind::Windows)
             .with_home_dir("/home/frank")
             .with_user_profile("C:\\Users\\Frank");

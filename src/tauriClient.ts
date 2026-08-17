@@ -204,6 +204,22 @@ export function defaultRuntimeIncrementalStatus(): RuntimeIncrementalStatus {
   };
 }
 
+export type IndexConfigApplyStatus = {
+  state: "applied" | "applying" | "partial" | "failed";
+  desiredRevision: number;
+  appliedRevision: number;
+  error?: string | null;
+};
+
+export function defaultIndexConfigApplyStatus(): IndexConfigApplyStatus {
+  return {
+    state: "applied",
+    desiredRevision: 0,
+    appliedRevision: 0,
+    error: null,
+  };
+}
+
 export type IndexStatus = {
   kind: "unbuilt" | "building" | "ready" | "refreshing" | "failed";
   availability?: "unavailable" | "quickAvailable" | "completing" | "contentIndexing" | "complete";
@@ -218,15 +234,19 @@ export type IndexStatus = {
   skipped?: number;
   failures?: number;
   incremental: RuntimeIncrementalStatus;
+  configApply?: IndexConfigApplyStatus;
 };
 
-type IndexStatusPayload = Omit<IndexStatus, "incremental"> & {
+type IndexStatusPayload = Omit<IndexStatus, "incremental" | "configApply"> & {
   incremental?: Partial<RuntimeIncrementalStatus> | null;
+  configApply?: Partial<IndexConfigApplyStatus> | null;
 };
 
 function normalizeIndexStatus(status: IndexStatusPayload): IndexStatus {
   const defaults = defaultRuntimeIncrementalStatus();
   const incremental = status.incremental;
+  const configApplyDefaults = defaultIndexConfigApplyStatus();
+  const configApply = status.configApply;
   return {
     ...status,
     incremental: {
@@ -237,6 +257,12 @@ function normalizeIndexStatus(status: IndexStatusPayload): IndexStatus {
       lastBatchEntries: incremental?.lastBatchEntries ?? defaults.lastBatchEntries,
       lastBatchDurationMs: incremental?.lastBatchDurationMs ?? defaults.lastBatchDurationMs,
       degradationCode: incremental?.degradationCode ?? defaults.degradationCode,
+    },
+    configApply: {
+      state: configApply?.state ?? configApplyDefaults.state,
+      desiredRevision: configApply?.desiredRevision ?? configApplyDefaults.desiredRevision,
+      appliedRevision: configApply?.appliedRevision ?? configApplyDefaults.appliedRevision,
+      error: configApply?.error ?? configApplyDefaults.error,
     },
   };
 }

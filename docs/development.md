@@ -67,7 +67,10 @@ url = "https://duckduckgo.com/?q={query}"
 ## 索引开发注意事项
 
 - 文件索引不应在启动路径同步扫描大目录；启动时先加载 SQLite 中最近完成的索引快照
+- 索引语义配置必须先持久化 desired revision，再异步应用索引；保存命令不得等待 scanner/watcher/baseline，也不得因后台失败回滚用户配置
+- Windows 首次配置默认使用当前可用盘符根目录并保持 `balanced`；系统目录排除规则必须同时进入 baseline、watcher 和 calibration，且不能排除 `Users` 普通数据
 - `fast` / `balanced` / `complete` 必须产生可测试的扫描计划差异：`fast` 只扫应用入口和热路径，`balanced` 先快速可用再后台补全配置目录，`complete` 覆盖完整配置范围和可用盘符
+- baseline、standby/runtime watcher、calibration 必须复用同一 active-root 计划；旧 revision 的全量 walk 必须在条目边界可取消，单 root 失败必须允许其他 root 形成 partial 结果
 - 阶段边界只在快速可用检查点和最终完成检查点写完整 SQLite 快照；中间补全阶段只更新内存索引和状态，避免反复写不断增长的聚合 batch
 - 内容索引必须晚于基础 name/path 索引；`content:` 在内容索引准备中应返回明确反馈，不能伪装成 name/path 命中
 - 后台刷新完成后用新批次替换内存索引，旧 generation 的刷新结果不能覆盖新请求

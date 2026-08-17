@@ -21,6 +21,7 @@ import {
   refreshIndex,
   saveConfig,
   search,
+  defaultIndexConfigApplyStatus,
   defaultRuntimeIncrementalStatus,
 } from "./tauriClient";
 
@@ -215,7 +216,10 @@ describe("tauriClient", () => {
     });
 
     expect(handler).toHaveBeenCalledWith(
-      expect.objectContaining({ incremental: defaultRuntimeIncrementalStatus() }),
+      expect.objectContaining({
+        incremental: defaultRuntimeIncrementalStatus(),
+        configApply: defaultIndexConfigApplyStatus(),
+      }),
     );
   });
 

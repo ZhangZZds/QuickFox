@@ -88,6 +88,8 @@ type AppProps = {
   onExecuteAction?: (action: LauncherAction) => unknown;
 };
 
+type SettingsSaveState = "idle" | "saving" | "saved" | "error";
+
 const fallbackConfig: QuickFoxConfig = {
   index: {
     include_dirs: [],
@@ -423,6 +425,9 @@ export function App({
 }: AppProps) {
   const [view, setView] = useState<"launcher" | "settings">(initialView);
   const [config, setConfig] = useState<QuickFoxConfig>(fallbackConfig);
+  const [savedConfig, setSavedConfig] = useState<QuickFoxConfig>(fallbackConfig);
+  const [settingsSaveState, setSettingsSaveState] = useState<SettingsSaveState>("idle");
+  const [settingsSaveError, setSettingsSaveError] = useState<string | null>(null);
   const [indexTextareaDrafts, setIndexTextareaDrafts] = useState<IndexTextareaDrafts>(() =>
     indexTextareaDraftsFromConfig(fallbackConfig),
   );
@@ -452,6 +457,12 @@ export function App({
       lastBatchDurationMs: 0,
       degradationCode: null,
     },
+    configApply: {
+      state: "applied",
+      desiredRevision: 0,
+      appliedRevision: 0,
+      error: null,
+    },
   });
   const [indexSearchRevision, setIndexSearchRevision] = useState(0);
   const [currentAppPaths, setCurrentAppPaths] = useState<AppPaths>({
@@ -479,6 +490,14 @@ export function App({
   webSearchEnginesRef.current = config.web_search.engines;
   const effectiveCommandEnabled = commandEnabled ?? config.command.enabled;
   const hotkeyPermissionSettingsUrl = currentHotkeyStatus.permissionSettingsUrl;
+  const settingsDirty = JSON.stringify(config) !== JSON.stringify(savedConfig);
+  const settingsSaveMessage = settingsSaveFeedback(
+    settingsSaveState,
+    settingsDirty,
+    settingsSaveError,
+    currentIndexStatus,
+  );
+  const includesWindowsDriveRoot = config.index.include_dirs.some(isWindowsDriveRoot);
 
   const isCommandQuery = query.trim().startsWith(">");
   const isCommandMode = isCommandQuery;
@@ -500,6 +519,7 @@ export function App({
         if (!cancelled) {
           const loadedConfig = nextConfig as QuickFoxConfig;
           setConfig(loadedConfig);
+          setSavedConfig(loadedConfig);
           setIndexTextareaDrafts(indexTextareaDraftsFromConfig(loadedConfig));
           setInputHistory(nextHistory as string[]);
           setCurrentIndexStatus(nextIndexStatus as IndexStatus);
@@ -770,11 +790,15 @@ export function App({
 
   const refreshSearchIndex = async () => {
     setRefreshStatus(null);
-    await refreshIndex();
-    const nextStatus = (await indexStatus()) as IndexStatus;
-    setCurrentIndexStatus(nextStatus);
-    setIndexSearchRevision((revision) => revision + 1);
-    setRefreshStatus("索引已刷新");
+    try {
+      await refreshIndex();
+      const nextStatus = (await indexStatus()) as IndexStatus;
+      setCurrentIndexStatus(nextStatus);
+      setIndexSearchRevision((revision) => revision + 1);
+      setRefreshStatus("已开始索引校准");
+    } catch (error) {
+      setRefreshStatus(`索引校准启动失败：${readErrorMessage(error)}`);
+    }
   };
 
   const openSettingsFromLauncher = async () => {
@@ -824,9 +848,26 @@ export function App({
   };
 
   const saveSettings = async () => {
-    await saveConfig(config);
-    const nextStatus = (await indexStatus()) as IndexStatus;
-    setCurrentIndexStatus(nextStatus);
+    if (settingsSaveState === "saving") {
+      return;
+    }
+    const configToSave = config;
+    setSettingsSaveState("saving");
+    setSettingsSaveError(null);
+    try {
+      await saveConfig(configToSave);
+      setSavedConfig(configToSave);
+      setSettingsSaveState("saved");
+      try {
+        const nextStatus = (await indexStatus()) as IndexStatus;
+        setCurrentIndexStatus(nextStatus);
+      } catch {
+        // 配置已经落盘；状态查询失败不能误报为保存失败。
+      }
+    } catch (error) {
+      setSettingsSaveState("error");
+      setSettingsSaveError(readErrorMessage(error));
+    }
   };
 
   const updateIndexTextarea = (
@@ -974,10 +1015,20 @@ export function App({
                 <button
                   type="button"
                   className="primary-button"
+                  disabled={settingsSaveState === "saving"}
                   onClick={() => void saveSettings()}
                 >
-                  保存设置
+                  {settingsSaveState === "saving" ? "保存中…" : "保存设置"}
                 </button>
+                {settingsSaveMessage ? (
+                  <small
+                    aria-live="polite"
+                    className={settingsSaveState === "error" ? "settings-error" : "settings-status"}
+                    role={settingsSaveState === "error" ? "alert" : "status"}
+                  >
+                    {settingsSaveMessage}
+                  </small>
+                ) : null}
               </section>
             </div>
             <div
@@ -1001,7 +1052,7 @@ export function App({
                   </div>
                   <div className="settings-index-refresh">
                     <button type="button" onClick={() => void refreshSearchIndex()}>
-                      刷新索引
+                      重试/校准索引
                     </button>
                     {refreshStatus ? (
                       <span className="settings-status">{refreshStatus}</span>
@@ -1017,7 +1068,7 @@ export function App({
                         索引目录
                         <HelpIcon
                           label="索引目录"
-                          text="每行填写一个完整目录路径，例如 C:\\Users\\frank\\Documents 或 D:\\Projects；保存后点击刷新索引生效。"
+                          text="每行填写一个完整目录路径，例如 C:\\Users\\frank\\Documents 或 D:\\Projects。Windows 默认覆盖当前可用盘符并自动跳过系统目录；保存会立即写入配置，全盘索引在后台补全。"
                         />
                       </span>
                       <textarea
@@ -1027,6 +1078,12 @@ export function App({
                           updateIndexTextarea("includeDirs", "include_dirs", event.target.value)
                         }
                       />
+                      {includesWindowsDriveRoot ? (
+                        <small className="settings-warning" role="note">
+                          Windows 默认覆盖当前可用盘符，系统目录会自动跳过；全盘补全可能耗时较长。
+                          无法访问或临时离线的位置不会阻止其他盘符应用，失败位置可稍后重试。
+                        </small>
+                      ) : null}
                     </label>
                     <label className="settings-field">
                       <span className="settings-field-title">
@@ -1554,6 +1611,36 @@ function linesFromTextarea(value: string) {
     .filter(Boolean);
 }
 
+function readErrorMessage(error: unknown) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function isWindowsDriveRoot(path: string) {
+  return /^[A-Za-z]:[\\/]*$/.test(path.trim());
+}
+
+function settingsSaveFeedback(
+  state: SettingsSaveState,
+  dirty: boolean,
+  error: string | null,
+  indexStatus: IndexStatus,
+) {
+  if (state === "error") return `保存失败：${error ?? "未知错误"}`;
+  if (state === "saving") return "正在保存配置…";
+  if (dirty) return "有未保存的更改";
+  if (state !== "saved") return null;
+  if (indexStatus.configApply?.state === "applying") {
+    return "配置已保存，索引正在后台应用";
+  }
+  if (indexStatus.configApply?.state === "partial") {
+    return "配置已保存，部分索引位置不可用";
+  }
+  if (indexStatus.configApply?.state === "failed") {
+    return "配置已保存，但索引应用失败，可重试校准";
+  }
+  return "配置已保存";
+}
+
 function indexTextareaDraftsFromConfig(config: QuickFoxConfig): IndexTextareaDrafts {
   return {
     includeDirs: config.index.include_dirs.join("\n"),
@@ -1886,6 +1973,11 @@ function IndexStatusSummary({ status }: { status: IndexStatus }) {
         <strong>第 {status.generation} 代</strong>
       </div>
       <div className="settings-status-card">
+        <span>配置应用</span>
+        <strong>{indexConfigApplyLabel(status)}</strong>
+        {status.configApply?.error ? <small>{status.configApply.error}</small> : null}
+      </div>
+      <div className="settings-status-card">
         <span>{status.kind === "failed" ? "失败摘要" : "最近完成"}</span>
         <strong>
           {status.completedAtMs
@@ -1895,6 +1987,19 @@ function IndexStatusSummary({ status }: { status: IndexStatus }) {
       </div>
     </section>
   );
+}
+
+function indexConfigApplyLabel(status: IndexStatus) {
+  switch (status.configApply?.state ?? "applied") {
+    case "applying":
+      return "配置已保存，索引正在后台应用";
+    case "partial":
+      return "配置已保存，部分索引位置不可用";
+    case "failed":
+      return "配置已保存，索引应用失败";
+    case "applied":
+      return "配置与索引已同步";
+  }
 }
 
 function incrementalStatusText(status?: RuntimeIncrementalStatus) {
