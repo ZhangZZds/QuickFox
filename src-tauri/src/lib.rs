@@ -2431,7 +2431,7 @@ fn windows_existing_drive_roots() -> Vec<String> {
         .collect()
 }
 
-#[cfg(any(target_os = "windows", test))]
+#[cfg(test)]
 fn windows_drive_roots_from_letters<I, F>(letters: I, exists: F) -> Vec<String>
 where
     I: IntoIterator<Item = char>,
