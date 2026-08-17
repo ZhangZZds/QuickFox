@@ -89,8 +89,9 @@ npm run build
 npm run tauri build
 ```
 
-普通 push / PR 只跑检查，不发布安装包。发布 macOS / Windows 安装包通过 GitHub
-tag workflow 触发：
+普通 push / PR 只跑检查，不发布安装包。在 GitHub Actions 中手动运行 `Release`
+workflow 会生成保留 14 天的 macOS / Windows 候选安装包，但不会创建 GitHub Release；
+真实 Windows 验收通过后，再用 tag 触发正式发布：
 
 ```bash
 git tag v1.3.1

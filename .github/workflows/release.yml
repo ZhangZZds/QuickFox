@@ -42,18 +42,25 @@ jobs:
         id: release_notes
         shell: bash
         run: |
-          NOTES_FILE="releases/${GITHUB_REF_NAME}/RELEASE_NOTES.md"
-          if [ -f "$NOTES_FILE" ]; then
-            {
-              echo "body<<EOF"
-              cat "$NOTES_FILE"
-              echo "EOF"
-            } >> "$GITHUB_OUTPUT"
-          else
-            echo "body=QuickFox desktop release." >> "$GITHUB_OUTPUT"
+          VERSION="$(node -p "require('./package.json').version")"
+          NOTES_FILE="releases/v${VERSION}/RELEASE_NOTES.md"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_EVENT_NAME" = "push" ] && [ "$GITHUB_REF_NAME" != "v${VERSION}" ]; then
+            echo "::error::Release tag ${GITHUB_REF_NAME} does not match package version v${VERSION}."
+            exit 1
           fi
+          if [ ! -f "$NOTES_FILE" ]; then
+            echo "::error::Missing release notes: ${NOTES_FILE}"
+            exit 1
+          fi
+          {
+            echo "body<<EOF"
+            cat "$NOTES_FILE"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Build and upload Tauri release
+        if: github.event_name == 'push'
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -64,3 +71,16 @@ jobs:
           releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}
+
+      - name: Build release candidate
+        if: github.event_name == 'workflow_dispatch'
+        run: npm run tauri -- build ${{ matrix.args }}
+
+      - name: Upload release candidate
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: QuickFox-v${{ steps.release_notes.outputs.version }}-${{ runner.os }}-${{ github.sha }}
+          path: src-tauri/target/release/bundle/**
+          if-no-files-found: error
+          retention-days: 14

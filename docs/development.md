@@ -34,7 +34,9 @@ npm run tauri build
 
 ## 发布流程
 
-本项目普通 CI 不产出安装包。正式发布使用 tag 触发：
+本项目普通 CI 不产出安装包。发布前可在 GitHub Actions 中手动运行 `Release`
+workflow，生成保留 14 天的 macOS / Windows 候选安装包；手动运行不会创建 GitHub
+Release。完成真实平台验收后，正式发布使用 tag 触发：
 
 ```bash
 npm run check
