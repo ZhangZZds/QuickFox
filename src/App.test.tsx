@@ -761,7 +761,7 @@ describe("App", () => {
     });
 
     const status = await screen.findByRole("region", { name: "启动器状态" });
-    expect(status).toHaveTextContent("configured-roots");
+    await waitFor(() => expect(status).toHaveTextContent("configured-roots"));
     expect(status).toHaveTextContent("/Users/frank/workspace");
     expect(status).toHaveTextContent("已扫描 120");
     expect(status).toHaveTextContent("收录 90");
@@ -1969,7 +1969,7 @@ describe("App", () => {
     render(<App initialView="settings" />);
 
     const summary = await screen.findByRole("region", { name: "索引状态摘要" });
-    expect(summary).toHaveTextContent(label);
+    await waitFor(() => expect(summary).toHaveTextContent(label));
   });
 
   it.each([

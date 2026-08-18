@@ -8,6 +8,7 @@ use crate::core::config::{
 use crate::core::content_index::{
     ContentDeltaOutcome, ContentDeltaTurn, ContentIndex, ContentIndexOptions,
 };
+#[cfg(not(target_os = "windows"))]
 use crate::core::generic_index_source::GenericIndexSource;
 use crate::core::index::{
     FileSearchIndex, IndexLifecycle, IndexReport, IndexScanOptions, IndexScanner, IndexStatus,
