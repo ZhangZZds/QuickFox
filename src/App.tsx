@@ -444,6 +444,8 @@ export function App({
   const [currentIndexStatus, setCurrentIndexStatus] = useState<IndexStatus>({
     kind: "unbuilt",
     availability: "unavailable",
+    phase: "loadingActive",
+    refreshReason: null,
     entryCount: 0,
     message: null,
     generation: 0,
@@ -985,7 +987,7 @@ export function App({
 
   if (view === "settings") {
     return (
-      <main className="launcher-shell" aria-label="QuickFox launcher">
+      <main className="launcher-shell settings-shell" aria-label="QuickFox launcher">
         <section className="launcher-panel settings-panel">
           <header className="panel-toolbar settings-toolbar">
             <h1>设置</h1>
@@ -1724,11 +1726,14 @@ function buildLauncherPresentation({
 }
 
 function launcherStatusForIndex(status: IndexStatus): LauncherStatusFeedback {
-  if (status.availability === "completing") {
+  const phase = effectiveIndexPhase(status);
+  const searchable = indexIsSearchable(status);
+
+  if (searchable && phase === "degraded") {
     return {
-      title: "文件搜索已部分可用",
-      message: "后台仍在补全索引；未找到结果时，可能仍在索引相关范围。",
-      detail: indexProgressSummary(status),
+      title: "未找到结果",
+      message: "现有文件搜索仍可用；后台索引维护遇到问题，可在设置中查看详情。",
+      detail: status.message ?? indexProgressSummary(status),
       actions: ["openSettings"],
     };
   }
@@ -1742,28 +1747,55 @@ function launcherStatusForIndex(status: IndexStatus): LauncherStatusFeedback {
     };
   }
 
-  switch (status.kind) {
-    case "unbuilt":
+  if (
+    searchable &&
+    (phase === "quickAvailable" ||
+      phase === "scanning" ||
+      phase === "prepared" ||
+      phase === "finalizing")
+  ) {
+    return {
+      title:
+        phase === "quickAvailable" || phase === "scanning" ? "文件搜索已部分可用" : "文件搜索可用",
+      message: indexPhaseSearchMessage(phase),
+      detail: indexProgressSummary(status),
+      actions: ["openSettings"],
+    };
+  }
+
+  switch (phase) {
+    case "loadingActive":
       return {
-        title: "文件搜索正在准备",
-        message: "首次索引尚未建立，计算器和网页搜索仍可使用。",
+        title: status.generation === 0 ? "文件搜索正在准备" : "正在加载已有文件索引",
+        message:
+          status.generation === 0
+            ? "首次索引尚未建立，计算器和网页搜索仍可使用。"
+            : "历史索引正在后台加载，计算器和网页搜索仍可使用。",
         actions: ["refreshIndex", "openSettings"],
       };
-    case "building":
+    case "quickAvailable":
+    case "scanning":
       return {
         title: "文件索引正在建立",
         message: "请稍等片刻；计算器和网页搜索仍可使用。",
         detail: indexProgressSummary(status),
         actions: ["refreshIndex", "openSettings"],
       };
-    case "refreshing":
+    case "prepared":
       return {
-        title: "文件索引正在更新",
-        message: "正在刷新文件快照；计算器和网页搜索仍可使用。",
+        title: "文件扫描已完成",
+        message: "正在准备最终索引；计算器和网页搜索仍可使用。",
         detail: indexProgressSummary(status),
         actions: [],
       };
-    case "failed":
+    case "finalizing":
+      return {
+        title: "文件索引正在最终合并",
+        message: "正在生成可搜索索引；计算器和网页搜索仍可使用。",
+        detail: indexProgressSummary(status),
+        actions: [],
+      };
+    case "degraded":
       return {
         title: "文件索引构建失败",
         message: "计算器和网页搜索仍可使用，可刷新索引或打开设置调整范围。",
@@ -1787,6 +1819,7 @@ function indexProgressSummary(status: IndexStatus) {
     typeof status.accepted === "number" ? `收录 ${status.accepted}` : null,
     typeof status.skipped === "number" ? `跳过 ${status.skipped}` : null,
     typeof status.failures === "number" ? `失败 ${status.failures}` : null,
+    status.refreshReason ? `触发原因：${indexRefreshReasonLabel(status.refreshReason)}` : null,
   ].filter(Boolean);
 
   return parts.length > 0 ? parts.join(" · ") : null;
@@ -1958,6 +1991,7 @@ function summarizeTitle(title: string): { head: string; tail: string } | null {
 }
 
 function IndexStatusSummary({ status }: { status: IndexStatus }) {
+  const searchable = indexIsSearchable(status);
   return (
     <section aria-label="索引状态摘要" className="settings-status-grid">
       <div className="settings-status-card">
@@ -1966,12 +2000,17 @@ function IndexStatusSummary({ status }: { status: IndexStatus }) {
         {status.message ? <small>{status.message}</small> : null}
       </div>
       <div className="settings-status-card">
-        <span>条目</span>
+        <span>{searchable ? "当前可搜索" : "索引条目统计"}</span>
         <strong>{status.entryCount} 项</strong>
+        <small>{searchable ? "已进入当前搜索视图" : "尚未声明为可搜索"}</small>
       </div>
       <div className="settings-status-card">
         <span>索引代次</span>
         <strong>第 {status.generation} 代</strong>
+      </div>
+      <div className="settings-status-card">
+        <span>刷新原因</span>
+        <strong>{indexRefreshReasonLabel(status.refreshReason)}</strong>
       </div>
       <div className="settings-status-card">
         <span>配置应用</span>
@@ -2058,7 +2097,15 @@ function IndexAuxiliaryDetails({
       </div>
       <div className="settings-meta-row">
         <span>当前阶段</span>
-        <span>{status.stage || indexStatusLabel(status)}</span>
+        <span>{indexPhaseLabel(effectiveIndexPhase(status))}</span>
+      </div>
+      <div className="settings-meta-row">
+        <span>阶段详情</span>
+        <span>{status.stage || "暂无"}</span>
+      </div>
+      <div className="settings-meta-row">
+        <span>刷新原因</span>
+        <span>{indexRefreshReasonLabel(status.refreshReason)}</span>
       </div>
       <div className="settings-meta-row">
         <span>当前扫描位置</span>
@@ -2084,7 +2131,7 @@ function IndexAuxiliaryDetails({
         <section aria-label="逐盘索引状态" className="settings-root-status-list">
           <div className="settings-root-status-heading">
             <strong>逐盘索引状态</strong>
-            <span>已完成的盘可立即搜索，不等待其他盘</span>
+            <span>仅“可搜索”范围已进入当前搜索视图</span>
           </div>
           {roots.map((root) => (
             <div className="settings-root-status-row" key={`${root.stage}:${root.root}`}>
@@ -2116,7 +2163,7 @@ function indexRootStateLabel(state: NonNullable<IndexStatus["roots"]>[number]["s
     case "ready":
       return "可搜索";
     case "degraded":
-      return "部分可用";
+      return "部分可搜索";
   }
 }
 
@@ -2142,16 +2189,100 @@ function formatCompletedAt(timestampMs: number) {
 }
 
 function indexStatusLabel(status: IndexStatus) {
-  switch (status.kind) {
-    case "building":
-      return "文件索引正在建立";
-    case "refreshing":
-      return "文件索引正在更新";
+  const phase = effectiveIndexPhase(status);
+  if (phase === "degraded" && !indexIsSearchable(status)) {
+    return status.message ?? "文件索引构建失败";
+  }
+  return indexPhaseLabel(phase);
+}
+
+function effectiveIndexPhase(status: IndexStatus): NonNullable<IndexStatus["phase"]> {
+  if (status.phase) {
+    return status.phase;
+  }
+  if (status.stage === "loadingActive" || status.stage === "loading-active") {
+    return "loadingActive";
+  }
+  if (status.stage === "prepared") {
+    return "prepared";
+  }
+  if (status.stage === "finalizing") {
+    return "finalizing";
+  }
+  if (status.kind === "failed") {
+    return "degraded";
+  }
+  if (status.kind === "ready") {
+    return "ready";
+  }
+  if (status.availability === "quickAvailable") {
+    return "quickAvailable";
+  }
+  if (status.kind === "building" || status.kind === "refreshing") {
+    return "scanning";
+  }
+  return "loadingActive";
+}
+
+function indexIsSearchable(status: IndexStatus) {
+  if (status.availability) {
+    return status.availability !== "unavailable";
+  }
+  return status.kind === "ready" || status.kind === "refreshing";
+}
+
+function indexPhaseLabel(phase: NonNullable<IndexStatus["phase"]>) {
+  switch (phase) {
+    case "loadingActive":
+      return "正在加载已有索引";
+    case "quickAvailable":
+      return "快速范围可搜索";
+    case "scanning":
+      return "正在扫描";
+    case "prepared":
+      return "扫描完成，等待最终构建";
+    case "finalizing":
+      return "正在生成最终索引";
     case "ready":
       return "文件索引可用";
-    case "failed":
-      return status.message ?? "文件索引构建失败";
-    case "unbuilt":
-      return "文件索引尚未建立";
+    case "degraded":
+      return "索引降级运行";
+  }
+}
+
+function indexPhaseSearchMessage(phase: NonNullable<IndexStatus["phase"]>) {
+  switch (phase) {
+    case "quickAvailable":
+    case "scanning":
+      return "已发布范围可搜索，后台仍在扫描其他范围；未找到结果时，可能仍在索引相关范围。";
+    case "prepared":
+      return "已发布范围可搜索，后台正在准备最终索引。";
+    case "finalizing":
+      return "已发布范围保持可搜索，后台正在生成最终索引。";
+    default:
+      return "现有文件搜索可用。";
+  }
+}
+
+function indexRefreshReasonLabel(reason?: IndexStatus["refreshReason"] | null) {
+  switch (reason) {
+    case "initialBuild":
+      return "首次构建";
+    case "configChanged":
+      return "索引配置已更改";
+    case "preparedResume":
+      return "继续已完成的扫描";
+    case "buildingResume":
+      return "继续上次扫描";
+    case "watcherOverflow":
+      return "文件变化事件过多";
+    case "dirtyRoot":
+      return "索引目录需要校准";
+    case "manualRefresh":
+      return "手动刷新";
+    case "storageRecovery":
+      return "索引存储恢复";
+    default:
+      return "暂无刷新任务";
   }
 }

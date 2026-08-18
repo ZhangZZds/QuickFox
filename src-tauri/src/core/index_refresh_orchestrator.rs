@@ -38,7 +38,7 @@ pub fn refresh_request_decision(
         (true, RefreshRequestReason::DeltaSafetyLimit) => {
             RefreshRequestDecision::AbsorbedByActiveRefresh
         }
-        (true, RefreshRequestReason::DirtyRoots) => RefreshRequestDecision::QueueRerun,
+        (true, RefreshRequestReason::DirtyRoots) => RefreshRequestDecision::AbsorbedByActiveRefresh,
     }
 }
 
@@ -246,14 +246,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn delta_safety_during_refresh_is_absorbed_without_pending_rerun() {
+    fn refresh_owned_changes_are_absorbed_without_pending_rerun() {
         assert_eq!(
             refresh_request_decision(true, RefreshRequestReason::DeltaSafetyLimit),
             RefreshRequestDecision::AbsorbedByActiveRefresh
         );
         assert_eq!(
             refresh_request_decision(true, RefreshRequestReason::DirtyRoots),
-            RefreshRequestDecision::QueueRerun
+            RefreshRequestDecision::AbsorbedByActiveRefresh
         );
     }
 

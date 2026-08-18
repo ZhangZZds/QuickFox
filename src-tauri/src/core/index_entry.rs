@@ -246,6 +246,32 @@ pub enum IndexAvailability {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
+pub enum IndexPhase {
+    #[default]
+    LoadingActive,
+    QuickAvailable,
+    Scanning,
+    Prepared,
+    Finalizing,
+    Ready,
+    Degraded,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum IndexRefreshReason {
+    InitialBuild,
+    ConfigChanged,
+    PreparedResume,
+    BuildingResume,
+    WatcherOverflow,
+    DirtyRoot,
+    ManualRefresh,
+    StorageRecovery,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub enum IndexConfigApplyState {
     #[default]
     Applied,
@@ -340,6 +366,12 @@ pub struct IndexStatus {
     pub incremental: RuntimeIncrementalStatus,
     #[serde(default)]
     pub config_apply: IndexConfigApplyStatus,
+    #[serde(default)]
+    pub phase: IndexPhase,
+    #[serde(default)]
+    pub refresh_reason: Option<IndexRefreshReason>,
+    #[serde(default)]
+    pub storage: Option<crate::core::index_generation::IndexStorageDiagnostics>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -394,6 +426,9 @@ impl Default for IndexLifecycle {
                 roots: Vec::new(),
                 incremental: RuntimeIncrementalStatus::default(),
                 config_apply: IndexConfigApplyStatus::default(),
+                phase: IndexPhase::LoadingActive,
+                refresh_reason: None,
+                storage: None,
             },
         }
     }
@@ -419,6 +454,9 @@ impl IndexLifecycle {
                 roots: Vec::new(),
                 incremental: RuntimeIncrementalStatus::default(),
                 config_apply: IndexConfigApplyStatus::default(),
+                phase: IndexPhase::Ready,
+                refresh_reason: None,
+                storage: None,
             },
         }
     }
@@ -448,6 +486,7 @@ impl IndexLifecycle {
         self.status.skipped = 0;
         self.status.failures = 0;
         self.status.roots.clear();
+        self.status.phase = IndexPhase::Scanning;
         self.generation
     }
 
@@ -472,6 +511,14 @@ impl IndexLifecycle {
         self.status.skipped = stats.skipped;
         self.status.failures = stats.failures;
         self.status.entry_count = entry_count;
+        self.status.phase = if matches!(
+            self.status.availability,
+            IndexAvailability::QuickAvailable | IndexAvailability::Completing
+        ) {
+            IndexPhase::QuickAvailable
+        } else {
+            IndexPhase::Scanning
+        };
         if let Some(root) = current_root {
             self.update_root_status(root, stage, IndexRootState::Scanning, stats, None);
         }
@@ -520,6 +567,7 @@ impl IndexLifecycle {
         self.status.skipped = stats.skipped;
         self.status.failures = stats.failures;
         self.status.entry_count = entry_count;
+        self.status.phase = IndexPhase::QuickAvailable;
         self.update_root_status(
             root,
             stage,
@@ -546,6 +594,7 @@ impl IndexLifecycle {
         } else {
             IndexAvailability::Completing
         };
+        self.status.phase = IndexPhase::Finalizing;
         true
     }
 
@@ -605,6 +654,9 @@ impl IndexLifecycle {
             roots: self.status.roots.clone(),
             incremental: self.status.incremental.clone(),
             config_apply: self.status.config_apply.clone(),
+            phase: IndexPhase::Ready,
+            refresh_reason: self.status.refresh_reason,
+            storage: self.status.storage.clone(),
         };
         true
     }
@@ -620,7 +672,44 @@ impl IndexLifecycle {
         }
         self.status.message = Some(message);
         self.status.generation = generation;
+        self.status.phase = IndexPhase::Degraded;
         true
+    }
+
+    pub fn mark_loading_active(&mut self) {
+        self.status.kind = IndexStatusKind::Unbuilt;
+        self.status.availability = IndexAvailability::Unavailable;
+        self.status.stage = "loading-active".to_owned();
+        self.status.phase = IndexPhase::LoadingActive;
+    }
+
+    pub fn mark_prepared(
+        &mut self,
+        generation: u64,
+        available_entry_count: usize,
+        stats: IndexScanStats,
+    ) -> bool {
+        if generation != self.generation {
+            return false;
+        }
+        self.status.stage = "prepared".to_owned();
+        self.status.current_root = None;
+        self.status.entry_count = available_entry_count;
+        self.status.scanned = stats.scanned;
+        self.status.accepted = stats.accepted;
+        self.status.skipped = stats.skipped;
+        self.status.failures = stats.failures;
+        self.status.availability = if available_entry_count == 0 {
+            IndexAvailability::Unavailable
+        } else {
+            IndexAvailability::Completing
+        };
+        self.status.phase = IndexPhase::Prepared;
+        true
+    }
+
+    pub fn set_refresh_reason(&mut self, reason: Option<IndexRefreshReason>) {
+        self.status.refresh_reason = reason;
     }
 }
 
@@ -774,6 +863,9 @@ mod tests {
             roots: Vec::new(),
             incremental: RuntimeIncrementalStatus::default(),
             config_apply: IndexConfigApplyStatus::default(),
+            phase: IndexPhase::Finalizing,
+            refresh_reason: Some(IndexRefreshReason::ManualRefresh),
+            storage: None,
         };
 
         let value = serde_json::to_value(status).unwrap();

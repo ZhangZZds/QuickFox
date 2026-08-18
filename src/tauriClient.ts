@@ -231,9 +231,30 @@ export type IndexRootStatus = {
   message?: string | null;
 };
 
+export type IndexPhase =
+  | "loadingActive"
+  | "quickAvailable"
+  | "scanning"
+  | "prepared"
+  | "finalizing"
+  | "ready"
+  | "degraded";
+
+export type IndexRefreshReason =
+  | "initialBuild"
+  | "configChanged"
+  | "preparedResume"
+  | "buildingResume"
+  | "watcherOverflow"
+  | "dirtyRoot"
+  | "manualRefresh"
+  | "storageRecovery";
+
 export type IndexStatus = {
   kind: "unbuilt" | "building" | "ready" | "refreshing" | "failed";
   availability?: "unavailable" | "quickAvailable" | "completing" | "contentIndexing" | "complete";
+  phase?: IndexPhase;
+  refreshReason?: IndexRefreshReason | null;
   entryCount: number;
   message?: string | null;
   generation: number;
@@ -261,6 +282,9 @@ function normalizeIndexStatus(status: IndexStatusPayload): IndexStatus {
   const configApply = status.configApply;
   return {
     ...status,
+    availability: status.availability ?? legacyAvailability(status),
+    phase: normalizeIndexPhase(status.phase, status),
+    refreshReason: status.refreshReason ?? null,
     roots: status.roots ?? [],
     incremental: {
       enabled: incremental?.enabled ?? defaults.enabled,
@@ -278,6 +302,61 @@ function normalizeIndexStatus(status: IndexStatusPayload): IndexStatus {
       error: configApply?.error ?? configApplyDefaults.error,
     },
   };
+}
+
+function normalizeIndexPhase(
+  phase: IndexStatusPayload["phase"] | string | null | undefined,
+  status: IndexStatusPayload,
+): IndexPhase {
+  switch (phase) {
+    case "loadingActive":
+    case "quickAvailable":
+    case "scanning":
+    case "prepared":
+    case "finalizing":
+    case "ready":
+    case "degraded":
+      return phase;
+    default:
+      return legacyIndexPhase(status);
+  }
+}
+
+function legacyAvailability(status: IndexStatusPayload): NonNullable<IndexStatus["availability"]> {
+  if (status.kind === "ready" || status.kind === "refreshing") {
+    return "complete";
+  }
+  return "unavailable";
+}
+
+function legacyIndexPhase(status: IndexStatusPayload): IndexPhase {
+  switch (status.stage) {
+    case "loadingActive":
+    case "loading-active":
+      return "loadingActive";
+    case "prepared":
+      return "prepared";
+    case "finalizing":
+      return "finalizing";
+  }
+
+  if (status.kind === "failed") {
+    return "degraded";
+  }
+  if (status.kind === "ready") {
+    return "ready";
+  }
+  if (
+    status.availability === "quickAvailable" ||
+    status.availability === "completing" ||
+    status.availability === "contentIndexing"
+  ) {
+    return "quickAvailable";
+  }
+  if (status.kind === "building" || status.kind === "refreshing") {
+    return "scanning";
+  }
+  return "loadingActive";
 }
 
 export type AppPaths = {

@@ -1,6 +1,6 @@
 [package]
 name = "quickfox"
-version = "1.6.3"
+version = "1.7.0"
 description = "Cross-platform quick launcher inspired by Listary"
 authors = ["ZhangZZds <zzds1992@gmail.com>"]
 edition = "2021"
@@ -25,7 +25,7 @@ tauri-plugin-single-instance = "2.4.3"
 toml = "0.8"
 keytap = { version = "0.4.0", default-features = false }
 ignore = "0.4.26"
-notify = "8.2.0"
+notify = { version = "8.2.0", features = ["macos_kqueue"] }
 notify-debouncer-mini = "0.7.0"
 tantivy = "0.26.1"
 nucleo-matcher = "0.3.1"
@@ -35,7 +35,7 @@ fs2 = "0.4.3"
 tempfile = "3.27.0"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem", "Win32_System_WindowsProgramming"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_WindowsProgramming"] }
 
 [dev-dependencies]
 tauri = { version = "2", features = ["macos-private-api", "tray-icon", "test"] }

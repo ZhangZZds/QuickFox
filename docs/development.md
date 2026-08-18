@@ -66,9 +66,10 @@ url = "https://duckduckgo.com/?q={query}"
 
 ## 索引开发注意事项
 
-- 文件索引不应在启动路径同步扫描大目录；启动时先加载 SQLite 中最近完成的索引快照
+- 文件索引不得在托盘创建前打开并恢复完整 SQLite；同步启动只创建最小 Runtime，active baseline 与 journal 必须在 setup 返回后异步挂载
 - 索引语义配置必须先持久化 desired revision，再异步应用索引；保存命令不得等待 scanner/watcher/baseline，也不得因后台失败回滚用户配置
 - Windows 首次配置默认使用当前可用盘符根目录并保持 `balanced`；系统目录排除规则必须同时进入 baseline、watcher 和 calibration，且不能排除 `Users` 普通数据
+- Windows 固定 NTFS 卷通过 `IndexSource` 选择无服务 Win32 批量枚举，非 NTFS、非固定卷、能力探测失败或需要 project-ignore 语义时回退 Generic Scanner；禁止静默提权
 - `fast` / `balanced` / `complete` 必须产生可测试的扫描计划差异：`fast` 只扫应用入口和热路径，`balanced` 先快速可用再后台补全配置目录，`complete` 覆盖完整配置范围和可用盘符
 - baseline、standby/runtime watcher、calibration 必须复用同一 active-root 计划；旧 revision 的全量 walk 必须在条目边界可取消，单 root 失败必须允许其他 root 形成 partial 结果
 - 大目录扫描必须流式写入单个 SQLite staging batch，不得在 scanner、进度 payload 和最终
@@ -82,6 +83,8 @@ url = "https://duckduckgo.com/?q={query}"
   才能直接恢复 watcher，否则保持旧搜索可用并在后台刷新
 - 内容索引必须晚于基础 name/path 索引；`content:` 在内容索引准备中应返回明确反馈，不能伪装成 name/path 命中
 - 后台刷新完成后用新批次替换内存索引，旧 generation 的刷新结果不能覆盖新请求
+- 完整刷新必须遵循 `building -> prepared -> active -> obsolete`，prepared 激活前不得释放 Root Preview；building/prepared 重启恢复不得新建全盘代际
+- watcher roots 必须先做祖先覆盖压缩；活跃全量刷新已覆盖的 dirty-root 事件由 capture/handoff 吸收，不排队第二轮全盘刷新
 - 搜索路径不得为每次查询 clone 完整 `SearchIndex`；FileProvider 应借用或共享运行时索引，并保持大索引查询候选数有上限
 - 文件 Provider 必须在索引不可用时降级为反馈，不影响计算器、网页搜索和命令 Provider
 - 新增索引字段、状态或存储迁移时，需要同时补 Rust storage/index 测试和设置页状态测试
@@ -90,7 +93,7 @@ url = "https://duckduckgo.com/?q={query}"
 
 短期索引性能边界：
 
-- QuickFox 当前不接入 Everything、Windows Search、NTFS USN Journal 或 MFT 读取；引入这些能力前必须评估权限、平台差异和 fallback 语义并更新架构文档
+- QuickFox 当前只探测 NTFS/USN 能力，不读取原始 MFT，也不安装高权限服务；引入 MFT/USN 枚举前必须完成威胁模型、安装/更新/卸载方案和标准用户 fallback 评审
 - 当前目标是让首次体验先快速可用，并让大目录补全可见、可控；不承诺 `C:\Users`、`D:\` 等大根目录瞬时完整索引
 - 内容索引只处理配置范围内、大小限制内、可识别为文本的文件；PDF/Office 等专用 extractor 仍属于后续扩展
 
@@ -101,6 +104,10 @@ cargo test --manifest-path src-tauri/Cargo.toml indexing_baseline_fixture_report
 ```
 
 输出行 `QUICKFOX_INDEX_BASELINE` 包含 `scan_ms`、`entries`、`ordinary_query_us`、`search_index_clones` 和 `content_query_results`，用于记录快速阶段耗时、补全阶段耗时、阶段边界写入次数和大索引查询耗时的本机基线。真实 Windows 大目录仍以 `docs/windows-manual-qa.md` 的手工验收为准。
+
+QuickFox 1.7 索引代际、200 万条目查询和 Windows Adapter 的自动化结果记录在
+`docs/index-reliability-and-performance-validation-2026-08-18.md`；真实 NTFS 扫描工具、
+权限决策和发布前采样要求见 `docs/windows-ntfs-index-source.md`。
 
 ## 新增 Action 的方法
 

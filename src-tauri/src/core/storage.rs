@@ -5,6 +5,11 @@ use crate::core::index_entry::{
     build_search_text, normalize_path_key_for_mode, normalize_path_text_key_for_mode,
     path_is_same_or_descendant_for_mode, ContentIndexState, IndexScanStats, PathComparisonMode,
 };
+use crate::core::index_generation::{
+    IndexGenerationRecord, IndexGenerationRecovery, IndexGenerationResumeKind,
+    IndexGenerationRootState, IndexGenerationScanSummary, IndexGenerationState,
+    IndexStorageDiagnostics, IndexStorageGcResult, INDEX_GENERATION_DATA_VERSION,
+};
 use crate::core::layered_index::CommittedIndexDelta;
 #[cfg(test)]
 use crate::core::targeted_index_scanner::baseline_manifest_from_entries;
@@ -15,12 +20,53 @@ use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const BASELINE_WRITE_CHUNK_SIZE: usize = 2_048;
 const BASELINE_DELETE_CHUNK_SIZE: usize = 4_096;
 const MIN_FREE_DISK_RESERVE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 const MAX_BASELINE_ESTIMATED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const INCREMENTAL_VACUUM_PAGES: i64 = 4_096;
+const STORAGE_LOCK_RETRY_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn retry_sqlite_busy<T>(
+    mut operation: impl FnMut() -> Result<T, rusqlite::Error>,
+) -> Result<T, rusqlite::Error> {
+    let started = Instant::now();
+    loop {
+        match operation() {
+            Err(error)
+                if is_sqlite_busy(&error) && started.elapsed() < STORAGE_LOCK_RETRY_TIMEOUT =>
+            {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            result => return result,
+        }
+    }
+}
+
+fn retry_storage_busy<T>(
+    mut operation: impl FnMut() -> Result<T, StorageError>,
+) -> Result<T, StorageError> {
+    let started = Instant::now();
+    loop {
+        match operation() {
+            Err(StorageError::Sqlite(ref error))
+                if is_sqlite_busy(error) && started.elapsed() < STORAGE_LOCK_RETRY_TIMEOUT =>
+            {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            result => return result,
+        }
+    }
+}
+
+fn is_sqlite_busy(error: &rusqlite::Error) -> bool {
+    matches!(
+        error.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+    )
+}
 
 fn non_negative_usize(value: i64) -> usize {
     usize::try_from(value.max(0)).unwrap_or(usize::MAX)
@@ -217,19 +263,21 @@ impl SqliteStorage {
         let connection = Connection::open(path)?;
         connection.busy_timeout(Duration::from_secs(10))?;
         if initialize_auto_vacuum {
-            connection.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
+            retry_sqlite_busy(|| connection.pragma_update(None, "auto_vacuum", "INCREMENTAL"))?;
         }
-        connection.pragma_update(None, "journal_mode", "WAL")?;
-        connection.pragma_update(None, "synchronous", "NORMAL")?;
-        connection.pragma_update(None, "wal_autocheckpoint", 1_000)?;
-        connection.pragma_update(None, "journal_size_limit", 64 * 1024 * 1024_i64)?;
-        connection.pragma_update(None, "foreign_keys", true)?;
+        retry_sqlite_busy(|| connection.pragma_update(None, "journal_mode", "WAL"))?;
+        retry_sqlite_busy(|| connection.pragma_update(None, "synchronous", "NORMAL"))?;
+        retry_sqlite_busy(|| connection.pragma_update(None, "wal_autocheckpoint", 1_000))?;
+        retry_sqlite_busy(|| {
+            connection.pragma_update(None, "journal_size_limit", 64 * 1024 * 1024_i64)
+        })?;
+        retry_sqlite_busy(|| connection.pragma_update(None, "foreign_keys", true))?;
         let storage = Self {
             connection,
             comparison_mode,
         };
-        storage.migrate()?;
-        storage.discard_orphaned_index_batches()?;
+        retry_storage_busy(|| storage.migrate())?;
+        retry_storage_busy(|| storage.discard_orphaned_index_batches())?;
         Ok(storage)
     }
 
@@ -365,6 +413,46 @@ impl SqliteStorage {
                 baseline_refresh_reason TEXT,
                 FOREIGN KEY (active_baseline_id) REFERENCES index_batches(id) ON DELETE SET NULL
             );
+
+            CREATE TABLE IF NOT EXISTS index_generations (
+                batch_id INTEGER PRIMARY KEY NOT NULL,
+                config_fingerprint TEXT NOT NULL,
+                state TEXT NOT NULL
+                    CHECK (state IN ('building', 'prepared', 'active', 'obsolete')),
+                data_version INTEGER NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                scan_summary_json TEXT NOT NULL DEFAULT '{}',
+                roots_json TEXT NOT NULL DEFAULT '[]',
+                FOREIGN KEY (batch_id) REFERENCES index_batches(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS index_generation_manifest (
+                batch_id INTEGER NOT NULL,
+                path TEXT NOT NULL,
+                parent TEXT,
+                root TEXT NOT NULL,
+                modified_ms INTEGER,
+                path_key TEXT NOT NULL,
+                parent_key TEXT,
+                root_key TEXT NOT NULL,
+                PRIMARY KEY (batch_id, path_key),
+                FOREIGN KEY (batch_id) REFERENCES index_generations(batch_id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS index_storage_maintenance (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                last_gc_json TEXT,
+                auto_vacuum_migration_required INTEGER NOT NULL DEFAULT 0
+                    CHECK (auto_vacuum_migration_required IN (0, 1))
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_index_generations_state
+                ON index_generations(state, updated_at_ms DESC);
+            CREATE INDEX IF NOT EXISTS idx_index_generations_compatibility
+                ON index_generations(config_fingerprint, data_version, state);
+            CREATE INDEX IF NOT EXISTS idx_index_generation_manifest_root
+                ON index_generation_manifest(batch_id, root_key);
             "#,
         )?;
         Self::ensure_index_batch_status_column(&transaction)?;
@@ -376,10 +464,15 @@ impl SqliteStorage {
         Self::backfill_delta_entry_keys(&transaction, self.comparison_mode)?;
         Self::ensure_manifest_key_columns(&transaction)?;
         Self::backfill_manifest_keys(&transaction, self.comparison_mode)?;
+        Self::backfill_generation_metadata(&transaction)?;
         transaction.execute_batch(
             r#"
             CREATE INDEX IF NOT EXISTS idx_index_entries_batch_root_parent
                 ON index_entries(batch_id, root_key, parent_key);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_index_generations_single_active
+                ON index_generations(state) WHERE state = 'active';
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_index_generations_single_pending
+                ON index_generations((1)) WHERE state IN ('building', 'prepared');
             "#,
         )?;
         if table_has_columns(&transaction, "index_delta_entries", &["path", "parent_key"])? {
@@ -409,10 +502,95 @@ impl SqliteStorage {
         }
         let user_version: i64 =
             transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if user_version < 4 {
-            transaction.pragma_update(None, "user_version", 4)?;
+        if user_version < 5 {
+            transaction.pragma_update(None, "user_version", 5)?;
         }
         transaction.commit()?;
+        self.record_auto_vacuum_migration_requirement()?;
+        Ok(())
+    }
+
+    fn backfill_generation_metadata(connection: &Connection) -> Result<(), StorageError> {
+        let runtime_active = connection
+            .query_row(
+                "SELECT active_baseline_id FROM index_runtime_state WHERE singleton = 1",
+                [],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()?
+            .flatten();
+        let fallback_active = if runtime_active.is_none() {
+            connection
+                .query_row(
+                    "SELECT id FROM index_batches WHERE status = 'completed' ORDER BY completed_at_ms DESC, id DESC LIMIT 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+        } else {
+            None
+        };
+        let active = runtime_active.or(fallback_active);
+        connection.execute(
+            r#"
+            INSERT OR IGNORE INTO index_generations
+                (batch_id, config_fingerprint, state, data_version, created_at_ms, updated_at_ms)
+            SELECT
+                batches.id,
+                COALESCE(metadata.config_fingerprint, ''),
+                CASE
+                    WHEN batches.id = ?1 THEN 'active'
+                    WHEN batches.status = 'building' AND staging.batch_id IS NOT NULL THEN 'building'
+                    ELSE 'obsolete'
+                END,
+                ?2,
+                batches.completed_at_ms,
+                batches.completed_at_ms
+            FROM index_batches AS batches
+            LEFT JOIN index_baseline_metadata AS metadata ON metadata.batch_id = batches.id
+            LEFT JOIN index_refresh_staging AS staging ON staging.batch_id = batches.id
+            "#,
+            params![active, INDEX_GENERATION_DATA_VERSION],
+        )?;
+        connection.execute(
+            "UPDATE index_generations SET state = 'obsolete' WHERE state = 'active' AND batch_id <> ?1",
+            params![active],
+        )?;
+        connection.execute(
+            r#"
+            UPDATE index_generations
+            SET state = 'obsolete'
+            WHERE state IN ('building', 'prepared')
+              AND batch_id <> COALESCE(
+                  (
+                      SELECT batch_id
+                      FROM index_generations
+                      WHERE state IN ('building', 'prepared')
+                      ORDER BY updated_at_ms DESC, batch_id DESC
+                      LIMIT 1
+                  ),
+                  batch_id
+              )
+            "#,
+            [],
+        )?;
+        Ok(())
+    }
+
+    fn record_auto_vacuum_migration_requirement(&self) -> Result<(), StorageError> {
+        let mode: i64 = self
+            .connection
+            .pragma_query_value(None, "auto_vacuum", |row| row.get(0))?;
+        self.connection.execute(
+            r#"
+            INSERT INTO index_storage_maintenance
+                (singleton, auto_vacuum_migration_required)
+            VALUES (1, ?1)
+            ON CONFLICT(singleton) DO UPDATE SET
+                auto_vacuum_migration_required = excluded.auto_vacuum_migration_required
+            "#,
+            params![i64::from(mode != 2)],
+        )?;
         Ok(())
     }
 
@@ -1239,9 +1417,36 @@ impl SqliteStorage {
         baseline_generation: u64,
         manifest: &[DirectoryFingerprint],
     ) -> Result<(), StorageError> {
+        self.activate_generation_with_manifest(baseline_id, baseline_generation, None, manifest)
+    }
+
+    pub fn activate_prepared_generation(
+        &self,
+        baseline_id: i64,
+        baseline_generation: u64,
+        config_fingerprint: &str,
+        manifest: &[DirectoryFingerprint],
+    ) -> Result<(), StorageError> {
+        self.activate_generation_with_manifest(
+            baseline_id,
+            baseline_generation,
+            Some(config_fingerprint),
+            manifest,
+        )
+    }
+
+    fn activate_generation_with_manifest(
+        &self,
+        baseline_id: i64,
+        baseline_generation: u64,
+        config_fingerprint: Option<&str>,
+        manifest: &[DirectoryFingerprint],
+    ) -> Result<(), StorageError> {
         validate_manifest_rows(manifest, self.comparison_mode)?;
         validate_manifest_tree_rows(manifest, self.comparison_mode)?;
         let transaction = self.connection.unchecked_transaction()?;
+        confirm_generation_config(&transaction, baseline_id, config_fingerprint)?;
+        replace_generation_manifest(&transaction, baseline_id, manifest, self.comparison_mode)?;
         activate_baseline_in_transaction(&transaction, baseline_id, baseline_generation)?;
         let tail = load_committed_index_deltas_after(
             &transaction,
@@ -1261,6 +1466,10 @@ impl SqliteStorage {
         transaction.execute(
             "DELETE FROM index_delta_batches WHERE generation <= ?1",
             params![generation_to_i64(baseline_generation)?],
+        )?;
+        transaction.execute(
+            "DELETE FROM index_refresh_staging WHERE batch_id = ?1",
+            params![baseline_id],
         )?;
         transaction.commit()?;
         Ok(())
@@ -1625,25 +1834,34 @@ impl SqliteStorage {
             .connection
             .query_row(
                 r#"
-                SELECT staging.batch_id
+                SELECT staging.batch_id, generations.state
                 FROM index_refresh_staging AS staging
                 JOIN index_batches AS batches ON batches.id = staging.batch_id
-                WHERE staging.config_fingerprint = ?1 AND batches.status = 'building'
+                JOIN index_generations AS generations ON generations.batch_id = staging.batch_id
+                WHERE staging.config_fingerprint = ?1
+                  AND (
+                      (batches.status = 'building' AND generations.state = 'building')
+                      OR (batches.status = 'completed' AND generations.state = 'prepared')
+                  )
                 "#,
                 params![config_fingerprint],
-                |row| row.get::<_, i64>(0),
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()?;
-        if let Some(batch_id) = existing {
+        if let Some((batch_id, generation_state)) = existing {
             let mut statement = self.connection.prepare(
                 r#"
                 SELECT root_key
                 FROM index_refresh_staging_roots
-                WHERE config_fingerprint = ?1 AND state = 'completed'
+                WHERE config_fingerprint = ?1
+                  AND (state = 'completed' OR ?2 = 'prepared')
                 ORDER BY root_key
                 "#,
             )?;
-            let roots = statement.query_map(params![config_fingerprint], |row| row.get(0))?;
+            let roots = statement
+                .query_map(params![config_fingerprint, generation_state], |row| {
+                    row.get(0)
+                })?;
             let mut completed_roots = Vec::new();
             for root in roots {
                 completed_roots.push(root?);
@@ -1655,7 +1873,14 @@ impl SqliteStorage {
         }
 
         let transaction = self.connection.unchecked_transaction()?;
-        transaction.execute("DELETE FROM index_refresh_staging", [])?;
+        transaction.execute(
+            "UPDATE index_generations SET state = 'obsolete', updated_at_ms = ?1 WHERE state IN ('building', 'prepared')",
+            params![started_at_ms],
+        )?;
+        transaction.execute(
+            "DELETE FROM index_refresh_staging WHERE batch_id IN (SELECT batch_id FROM index_generations WHERE state = 'obsolete')",
+            [],
+        )?;
         transaction.execute(
             r#"
             INSERT INTO index_batches (completed_at_ms, entry_count, status)
@@ -1664,6 +1889,19 @@ impl SqliteStorage {
             params![started_at_ms],
         )?;
         let batch_id = transaction.last_insert_rowid();
+        transaction.execute(
+            r#"
+            INSERT INTO index_generations
+                (batch_id, config_fingerprint, state, data_version, created_at_ms, updated_at_ms)
+            VALUES (?1, ?2, 'building', ?3, ?4, ?4)
+            "#,
+            params![
+                batch_id,
+                config_fingerprint,
+                INDEX_GENERATION_DATA_VERSION,
+                started_at_ms
+            ],
+        )?;
         transaction.execute(
             r#"
             INSERT INTO index_refresh_staging
@@ -2077,6 +2315,25 @@ impl SqliteStorage {
         config_fingerprint: &str,
         completed_at_ms: i64,
     ) -> Result<i64, StorageError> {
+        let prepared = self
+            .connection
+            .query_row(
+                r#"
+                SELECT staging.batch_id
+                FROM index_refresh_staging AS staging
+                JOIN index_batches AS batches ON batches.id = staging.batch_id
+                JOIN index_generations AS generations ON generations.batch_id = staging.batch_id
+                WHERE staging.config_fingerprint = ?1
+                  AND batches.status = 'completed'
+                  AND generations.state = 'prepared'
+                "#,
+                params![config_fingerprint],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        if let Some(batch_id) = prepared {
+            return Ok(batch_id);
+        }
         let batch_id = self.index_staging_batch_id(config_fingerprint)?;
         let transaction = self.connection.unchecked_transaction()?;
         let updated = transaction.execute(
@@ -2094,9 +2351,45 @@ impl SqliteStorage {
                 "index staging batch disappeared before completion".to_owned(),
             ));
         }
+        let (summary, roots) = generation_checkpoint_payload(&transaction, config_fingerprint)?;
+        let transitioned = transaction.execute(
+            r#"
+            UPDATE index_generations
+            SET state = 'prepared',
+                updated_at_ms = ?2,
+                scan_summary_json = ?3,
+                roots_json = ?4
+            WHERE batch_id = ?1 AND state = 'building'
+            "#,
+            params![
+                batch_id,
+                completed_at_ms,
+                serde_json::to_string(&summary)?,
+                serde_json::to_string(&roots)?,
+            ],
+        )?;
+        if transitioned != 1 {
+            return Err(StorageError::InvalidJournal(
+                "index generation disappeared before preparation".to_owned(),
+            ));
+        }
         transaction.execute(
-            "DELETE FROM index_refresh_staging WHERE config_fingerprint = ?1",
-            params![config_fingerprint],
+            "DELETE FROM index_generation_manifest WHERE batch_id = ?1",
+            params![batch_id],
+        )?;
+        transaction.execute(
+            r#"
+            INSERT INTO index_generation_manifest
+                (batch_id, path, parent, root, modified_ms, path_key, parent_key, root_key)
+            SELECT batch_id, path, NULLIF(parent, ''), root, modified_ms,
+                   path_key, NULLIF(parent_key, ''), root_key
+            FROM index_entries
+            WHERE batch_id = ?1
+              AND kind IN ('directory', 'application')
+              AND path_key IS NOT NULL
+              AND root_key IS NOT NULL
+            "#,
+            params![batch_id],
         )?;
         transaction.commit()?;
         Ok(batch_id)
@@ -2410,6 +2703,10 @@ impl SqliteStorage {
             "#,
             params![batch_id, config_fingerprint],
         )?;
+        self.connection.execute(
+            "UPDATE index_generations SET config_fingerprint = ?2, updated_at_ms = ?3 WHERE batch_id = ?1",
+            params![batch_id, config_fingerprint, unix_timestamp_ms()],
+        )?;
         Ok(())
     }
 
@@ -2428,6 +2725,263 @@ impl SqliteStorage {
                 |row| row.get(0),
             )
             .optional()?)
+    }
+
+    pub fn index_generation(
+        &self,
+        batch_id: i64,
+    ) -> Result<Option<IndexGenerationRecord>, StorageError> {
+        load_generation_record(
+            &self.connection,
+            "generations.batch_id = ?1",
+            params![batch_id],
+        )
+    }
+
+    pub fn compatible_index_generation_recovery(
+        &self,
+        config_fingerprint: &str,
+        data_version: i64,
+    ) -> Result<IndexGenerationRecovery, StorageError> {
+        let active = load_generation_record(
+            &self.connection,
+            "generations.config_fingerprint = ?1 AND generations.data_version = ?2 AND generations.state = 'active'",
+            params![config_fingerprint, data_version],
+        )?;
+        let pending = load_generation_record(
+            &self.connection,
+            r#"generations.config_fingerprint = ?1
+               AND generations.data_version = ?2
+               AND generations.state IN ('prepared', 'building')
+               ORDER BY CASE generations.state WHEN 'prepared' THEN 0 ELSE 1 END,
+                        generations.updated_at_ms DESC
+               LIMIT 1"#,
+            params![config_fingerprint, data_version],
+        )?;
+        let resume = match pending.as_ref().map(|generation| generation.state) {
+            Some(IndexGenerationState::Prepared) => IndexGenerationResumeKind::Prepared,
+            Some(IndexGenerationState::Building) => IndexGenerationResumeKind::Building,
+            Some(IndexGenerationState::Active | IndexGenerationState::Obsolete) => {
+                unreachable!("pending query only selects resumable states")
+            }
+            None if active.is_some() => IndexGenerationResumeKind::Idle,
+            None => IndexGenerationResumeKind::Create,
+        };
+        Ok(IndexGenerationRecovery {
+            active,
+            pending,
+            resume,
+        })
+    }
+
+    pub fn prepared_generation_manifest(
+        &self,
+        batch_id: i64,
+    ) -> Result<Vec<DirectoryFingerprint>, StorageError> {
+        let mut statement = self.connection.prepare(
+            r#"
+            SELECT path, parent, root, modified_ms
+            FROM index_generation_manifest
+            WHERE batch_id = ?1
+            ORDER BY path_key
+            "#,
+        )?;
+        let rows = statement.query_map(params![batch_id], |row| {
+            Ok(DirectoryFingerprint {
+                path: row.get(0)?,
+                parent: row.get(1)?,
+                root: row.get(2)?,
+                modified_ms: row.get(3)?,
+            })
+        })?;
+        let mut manifest = Vec::new();
+        for row in rows {
+            manifest.push(row?);
+        }
+        Ok(manifest)
+    }
+
+    pub fn set_prepared_generation_manifest(
+        &self,
+        batch_id: i64,
+        manifest: &[DirectoryFingerprint],
+    ) -> Result<(), StorageError> {
+        validate_manifest_rows(manifest, self.comparison_mode)?;
+        validate_manifest_tree_rows(manifest, self.comparison_mode)?;
+        let transaction = self.connection.unchecked_transaction()?;
+        let state = transaction
+            .query_row(
+                "SELECT state FROM index_generations WHERE batch_id = ?1",
+                params![batch_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if state.as_deref() != Some("prepared") {
+            return Err(StorageError::InvalidJournal(
+                "only a prepared generation can receive its final manifest".to_owned(),
+            ));
+        }
+        replace_generation_manifest(&transaction, batch_id, manifest, self.comparison_mode)?;
+        transaction.execute(
+            "UPDATE index_generations SET updated_at_ms = ?2 WHERE batch_id = ?1",
+            params![batch_id, unix_timestamp_ms()],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn index_storage_diagnostics(&self) -> Result<IndexStorageDiagnostics, StorageError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT batch_id FROM index_generations ORDER BY created_at_ms, batch_id")?;
+        let ids = statement
+            .query_map([], |row| row.get::<_, i64>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut generations = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(generation) = self.index_generation(id)? {
+                generations.push(generation);
+            }
+        }
+        let database_path = self.connection.path().map(PathBuf::from);
+        let database_size_bytes = database_path
+            .as_deref()
+            .and_then(|path| std::fs::metadata(path).ok())
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        let wal_size_bytes = database_path
+            .map(|path| PathBuf::from(format!("{}-wal", path.to_string_lossy())))
+            .and_then(|path| std::fs::metadata(path).ok())
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        let freelist_page_count = pragma_u64(&self.connection, "freelist_count")?;
+        let page_count = pragma_u64(&self.connection, "page_count")?;
+        let auto_vacuum: i64 = self
+            .connection
+            .pragma_query_value(None, "auto_vacuum", |row| row.get(0))?;
+        let (migration_required, last_gc_json) = self
+            .connection
+            .query_row(
+                "SELECT auto_vacuum_migration_required, last_gc_json FROM index_storage_maintenance WHERE singleton = 1",
+                [],
+                |row| Ok((row.get::<_, i64>(0)? != 0, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?
+            .unwrap_or((auto_vacuum != 2, None));
+        let last_gc = last_gc_json
+            .map(|json| serde_json::from_str(&json))
+            .transpose()?;
+        Ok(IndexStorageDiagnostics {
+            active_generation: generations
+                .iter()
+                .find(|generation| generation.state == IndexGenerationState::Active)
+                .map(|generation| generation.batch_id),
+            pending_generation: generations
+                .iter()
+                .filter(|generation| {
+                    matches!(
+                        generation.state,
+                        IndexGenerationState::Building | IndexGenerationState::Prepared
+                    )
+                })
+                .max_by_key(|generation| generation.updated_at_ms)
+                .map(|generation| generation.batch_id),
+            generations,
+            database_size_bytes,
+            wal_size_bytes,
+            freelist_page_count,
+            page_count,
+            auto_vacuum_incremental: auto_vacuum == 2,
+            auto_vacuum_migration_required: migration_required,
+            last_gc,
+        })
+    }
+
+    pub fn garbage_collect_index_generations(&self) -> Result<IndexStorageGcResult, StorageError> {
+        let freelist_pages_before = pragma_u64(&self.connection, "freelist_count")?;
+        let transaction = self.connection.unchecked_transaction()?;
+        transaction.execute(
+            r#"
+            UPDATE index_generations
+            SET state = 'obsolete', updated_at_ms = ?1
+            WHERE state IN ('building', 'prepared')
+              AND batch_id NOT IN (
+                  SELECT batch_id
+                  FROM index_generations
+                  WHERE state IN ('building', 'prepared')
+                  ORDER BY updated_at_ms DESC, batch_id DESC
+                  LIMIT 1
+              )
+            "#,
+            params![unix_timestamp_ms()],
+        )?;
+        let obsolete_count: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM index_generations WHERE state = 'obsolete'",
+            [],
+            |row| row.get(0),
+        )?;
+        let mut deleted_entries = 0_u64;
+        loop {
+            let removed = transaction.execute(
+                r#"
+                DELETE FROM index_entries
+                WHERE rowid IN (
+                    SELECT entries.rowid
+                    FROM index_entries AS entries
+                    JOIN index_generations AS generations
+                        ON generations.batch_id = entries.batch_id
+                    WHERE generations.state = 'obsolete'
+                    LIMIT ?1
+                )
+                "#,
+                params![BASELINE_DELETE_CHUNK_SIZE as i64],
+            )?;
+            deleted_entries = deleted_entries.saturating_add(removed as u64);
+            if removed == 0 {
+                break;
+            }
+        }
+        transaction.execute(
+            "DELETE FROM index_batches WHERE id IN (SELECT batch_id FROM index_generations WHERE state = 'obsolete')",
+            [],
+        )?;
+        transaction.commit()?;
+        self.connection.execute_batch(&format!(
+            "PRAGMA incremental_vacuum({INCREMENTAL_VACUUM_PAGES}); PRAGMA wal_checkpoint(PASSIVE);"
+        ))?;
+        let result = IndexStorageGcResult {
+            deleted_generations: obsolete_count.max(0) as u64,
+            deleted_entries,
+            freelist_pages_before,
+            freelist_pages_after: pragma_u64(&self.connection, "freelist_count")?,
+            completed_at_ms: unix_timestamp_ms(),
+        };
+        self.connection.execute(
+            r#"
+            INSERT INTO index_storage_maintenance (singleton, last_gc_json)
+            VALUES (1, ?1)
+            ON CONFLICT(singleton) DO UPDATE SET last_gc_json = excluded.last_gc_json
+            "#,
+            params![serde_json::to_string(&result)?],
+        )?;
+        Ok(result)
+    }
+
+    /// Performs the one-time, potentially expensive conversion for databases created without
+    /// incremental auto-vacuum. Call this from a background maintenance task.
+    pub fn migrate_auto_vacuum(&self) -> Result<bool, StorageError> {
+        let mode: i64 = self
+            .connection
+            .pragma_query_value(None, "auto_vacuum", |row| row.get(0))?;
+        if mode == 2 {
+            self.record_auto_vacuum_migration_requirement()?;
+            return Ok(false);
+        }
+        self.connection.execute_batch(
+            "PRAGMA wal_checkpoint(TRUNCATE); PRAGMA auto_vacuum = INCREMENTAL; VACUUM;",
+        )?;
+        self.record_auto_vacuum_migration_requirement()?;
+        Ok(true)
     }
 
     fn index_staging_batch_id(&self, config_fingerprint: &str) -> Result<i64, StorageError> {
@@ -2554,6 +3108,22 @@ impl SqliteStorage {
                     "baseline batch disappeared before completion".to_owned(),
                 ));
             }
+            transaction.execute(
+                "UPDATE index_generations SET state = 'obsolete', updated_at_ms = ?1 WHERE state IN ('building', 'prepared')",
+                params![completed_at_ms],
+            )?;
+            transaction.execute(
+                "DELETE FROM index_refresh_staging WHERE batch_id IN (SELECT batch_id FROM index_generations WHERE state = 'obsolete')",
+                [],
+            )?;
+            transaction.execute(
+                r#"
+                INSERT INTO index_generations
+                    (batch_id, config_fingerprint, state, data_version, created_at_ms, updated_at_ms)
+                VALUES (?1, '', 'prepared', ?2, ?3, ?3)
+                "#,
+                params![batch_id, INDEX_GENERATION_DATA_VERSION, completed_at_ms],
+            )?;
             transaction.commit()?;
             Ok(())
         })();
@@ -3598,6 +4168,210 @@ fn generation_to_i64(generation: u64) -> Result<i64, StorageError> {
     })
 }
 
+fn generation_checkpoint_payload(
+    connection: &Connection,
+    config_fingerprint: &str,
+) -> Result<(IndexGenerationScanSummary, Vec<IndexGenerationRootState>), StorageError> {
+    let summary = connection.query_row(
+        r#"
+        SELECT COALESCE(SUM(scanned), 0),
+               COALESCE(SUM(accepted), 0),
+               COALESCE(SUM(skipped), 0),
+               COALESCE(SUM(failures), 0)
+        FROM index_refresh_staging_directories
+        WHERE config_fingerprint = ?1 AND state IN ('completed', 'failed')
+        "#,
+        params![config_fingerprint],
+        |row| {
+            Ok(IndexGenerationScanSummary {
+                scanned: row.get::<_, i64>(0)?.max(0) as u64,
+                accepted: row.get::<_, i64>(1)?.max(0) as u64,
+                skipped: row.get::<_, i64>(2)?.max(0) as u64,
+                failures: row.get::<_, i64>(3)?.max(0) as u64,
+            })
+        },
+    )?;
+    let mut statement = connection.prepare(
+        r#"
+        SELECT root, stage, state
+        FROM index_refresh_staging_roots
+        WHERE config_fingerprint = ?1
+        ORDER BY root_key
+        "#,
+    )?;
+    let rows = statement.query_map(params![config_fingerprint], |row| {
+        Ok(IndexGenerationRootState {
+            root: row.get(0)?,
+            stage: row.get(1)?,
+            degraded: row.get::<_, String>(2)? == "degraded",
+        })
+    })?;
+    let mut roots = Vec::new();
+    for row in rows {
+        roots.push(row?);
+    }
+    Ok((summary, roots))
+}
+
+fn load_generation_record<P: rusqlite::Params>(
+    connection: &Connection,
+    predicate: &str,
+    parameters: P,
+) -> Result<Option<IndexGenerationRecord>, StorageError> {
+    let sql = format!(
+        r#"
+        SELECT generations.batch_id,
+               generations.config_fingerprint,
+               generations.state,
+               generations.data_version,
+               batches.entry_count,
+               generations.created_at_ms,
+               generations.updated_at_ms,
+               generations.scan_summary_json,
+               generations.roots_json
+        FROM index_generations AS generations
+        JOIN index_batches AS batches ON batches.id = generations.batch_id
+        WHERE {predicate}
+        "#
+    );
+    let row = connection
+        .query_row(&sql, parameters, |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
+            ))
+        })
+        .optional()?;
+    row.map(
+        |(
+            batch_id,
+            config_fingerprint,
+            state,
+            data_version,
+            entry_count,
+            created_at_ms,
+            updated_at_ms,
+            scan_summary_json,
+            roots_json,
+        )| {
+            let state = IndexGenerationState::from_storage(&state).ok_or_else(|| {
+                StorageError::InvalidJournal("index generation has an unknown state".to_owned())
+            })?;
+            Ok(IndexGenerationRecord {
+                batch_id,
+                config_fingerprint,
+                state,
+                data_version,
+                entry_count: entry_count.max(0) as u64,
+                created_at_ms,
+                updated_at_ms,
+                scan_summary: serde_json::from_str(&scan_summary_json)?,
+                roots: serde_json::from_str(&roots_json)?,
+            })
+        },
+    )
+    .transpose()
+}
+
+fn confirm_generation_config(
+    connection: &Connection,
+    baseline_id: i64,
+    expected_fingerprint: Option<&str>,
+) -> Result<(), StorageError> {
+    let generation = connection
+        .query_row(
+            "SELECT config_fingerprint, state FROM index_generations WHERE batch_id = ?1",
+            params![baseline_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    let Some((generation_fingerprint, state)) = generation else {
+        return Ok(());
+    };
+    if let Some(expected) = expected_fingerprint {
+        if state != "prepared" {
+            return Err(StorageError::InvalidJournal(
+                "only a prepared index generation can be activated".to_owned(),
+            ));
+        }
+        if generation_fingerprint != expected {
+            return Err(StorageError::InvalidJournal(
+                "prepared index generation configuration does not match activation request"
+                    .to_owned(),
+            ));
+        }
+        connection.execute(
+            r#"
+            INSERT INTO index_baseline_metadata (batch_id, config_fingerprint)
+            VALUES (?1, ?2)
+            ON CONFLICT(batch_id) DO UPDATE SET
+                config_fingerprint = excluded.config_fingerprint
+            "#,
+            params![baseline_id, expected],
+        )?;
+    } else if !generation_fingerprint.is_empty() {
+        let metadata_fingerprint = connection
+            .query_row(
+                "SELECT config_fingerprint FROM index_baseline_metadata WHERE batch_id = ?1",
+                params![baseline_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if metadata_fingerprint.as_deref() != Some(generation_fingerprint.as_str()) {
+            return Err(StorageError::InvalidJournal(
+                "index generation and baseline metadata configurations disagree".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn replace_generation_manifest(
+    connection: &Connection,
+    batch_id: i64,
+    manifest: &[DirectoryFingerprint],
+    mode: PathComparisonMode,
+) -> Result<(), StorageError> {
+    connection.execute(
+        "DELETE FROM index_generation_manifest WHERE batch_id = ?1",
+        params![batch_id],
+    )?;
+    let mut statement = connection.prepare(
+        r#"
+        INSERT INTO index_generation_manifest
+            (batch_id, path, parent, root, modified_ms, path_key, parent_key, root_key)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        "#,
+    )?;
+    for row in manifest {
+        statement.execute(params![
+            batch_id,
+            row.path,
+            row.parent,
+            row.root,
+            row.modified_ms,
+            normalize_path_text_key_for_mode(&row.path, mode),
+            row.parent
+                .as_deref()
+                .map(|parent| normalize_path_text_key_for_mode(parent, mode)),
+            normalize_path_text_key_for_mode(&row.root, mode),
+        ])?;
+    }
+    Ok(())
+}
+
+fn pragma_u64(connection: &Connection, name: &str) -> Result<u64, StorageError> {
+    let value: i64 = connection.pragma_query_value(None, name, |row| row.get(0))?;
+    Ok(value.max(0) as u64)
+}
+
 fn activate_baseline_in_transaction(
     connection: &Connection,
     baseline_id: i64,
@@ -3613,6 +4387,31 @@ fn activate_baseline_in_transaction(
             "active baseline must reference a persisted index batch".to_owned(),
         ));
     }
+    let now = unix_timestamp_ms();
+    connection.execute(
+        r#"
+        INSERT OR IGNORE INTO index_generations
+            (batch_id, config_fingerprint, state, data_version, created_at_ms, updated_at_ms)
+        SELECT batches.id, COALESCE(metadata.config_fingerprint, ''), 'prepared', ?2,
+               batches.completed_at_ms, ?3
+        FROM index_batches AS batches
+        LEFT JOIN index_baseline_metadata AS metadata ON metadata.batch_id = batches.id
+        WHERE batches.id = ?1
+        "#,
+        params![baseline_id, INDEX_GENERATION_DATA_VERSION, now],
+    )?;
+    connection.execute(
+        "UPDATE index_generations SET state = 'obsolete', updated_at_ms = ?1 WHERE state = 'active' AND batch_id <> ?2",
+        params![now, baseline_id],
+    )?;
+    connection.execute(
+        "UPDATE index_generations SET state = 'active', updated_at_ms = ?2 WHERE batch_id = ?1",
+        params![baseline_id, now],
+    )?;
+    connection.execute(
+        "DELETE FROM index_refresh_staging WHERE batch_id = ?1",
+        params![baseline_id],
+    )?;
     let generation = generation_to_i64(baseline_generation)?;
     connection.execute(
         r#"
@@ -3943,7 +4742,12 @@ mod tests {
         std::thread::sleep(Duration::from_secs(6));
         storage.connection.execute_batch("COMMIT;").unwrap();
 
-        assert!(reopened.join().unwrap().is_ok());
+        let reopened = reopened.join().unwrap();
+        assert!(
+            reopened.is_ok(),
+            "storage reopen failed: {:?}",
+            reopened.err()
+        );
         drop(storage);
         let _ = fs::remove_file(path);
     }
@@ -6409,6 +7213,310 @@ mod tests {
         assert!(paths.contains(&old_locked.path));
         assert!(paths.contains("/root/available/new.md"));
         assert!(!paths.contains("/root/available/old.md"));
+
+        drop(storage);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn prepared_generation_survives_reopen_with_checkpoint_metadata() {
+        let path = temp_db_path("prepared-generation-recovery");
+        let config_fingerprint = "balanced-root";
+        let root = PathBuf::from("/root");
+        let batch_id = {
+            let storage = SqliteStorage::open(path.clone()).unwrap();
+            let staging = storage
+                .open_or_create_index_staging(config_fingerprint, 10)
+                .unwrap();
+            storage
+                .prepare_index_staging_root(config_fingerprint, &root, 11)
+                .unwrap();
+            storage
+                .append_index_staging_entries(
+                    config_fingerprint,
+                    &[
+                        IndexedEntry {
+                            path: "/root".to_owned(),
+                            name: "root".to_owned(),
+                            kind: IndexedEntryKind::Directory,
+                            parent: String::new(),
+                            root: "/root".to_owned(),
+                            ..IndexedEntry::legacy("", "", IndexedEntryKind::Directory)
+                        },
+                        indexed_entry("/root/file.md"),
+                    ],
+                    12,
+                )
+                .unwrap();
+            storage
+                .checkpoint_index_staging_directory(
+                    config_fingerprint,
+                    &root,
+                    &root,
+                    &[],
+                    &IndexScanStats {
+                        scanned: 2,
+                        accepted: 2,
+                        skipped: 0,
+                        failures: 0,
+                    },
+                    None,
+                    13,
+                )
+                .unwrap();
+            storage
+                .mark_index_staging_root(config_fingerprint, &root, "configured-roots", false, 14)
+                .unwrap();
+            assert_eq!(
+                storage
+                    .complete_index_staging(config_fingerprint, 15)
+                    .unwrap(),
+                staging.batch_id
+            );
+            staging.batch_id
+        };
+
+        let storage = SqliteStorage::open(path.clone()).unwrap();
+        let reopened_staging = storage
+            .open_or_create_index_staging(config_fingerprint, 20)
+            .unwrap();
+        assert_eq!(reopened_staging.batch_id, batch_id);
+        assert_eq!(
+            reopened_staging.completed_roots,
+            vec![normalize_path_key_for_mode(
+                &root,
+                PathComparisonMode::native()
+            )]
+        );
+        assert_eq!(
+            storage
+                .complete_index_staging(config_fingerprint, 21)
+                .unwrap(),
+            batch_id
+        );
+        let recovery = storage
+            .compatible_index_generation_recovery(config_fingerprint, INDEX_GENERATION_DATA_VERSION)
+            .unwrap();
+        assert_eq!(recovery.resume, IndexGenerationResumeKind::Prepared);
+        let prepared = recovery.pending.unwrap();
+        assert_eq!(prepared.batch_id, batch_id);
+        assert_eq!(prepared.state, IndexGenerationState::Prepared);
+        assert_eq!(prepared.entry_count, 2);
+        assert_eq!(prepared.scan_summary.scanned, 2);
+        assert_eq!(prepared.roots.len(), 1);
+        assert_eq!(
+            storage.prepared_generation_manifest(batch_id).unwrap(),
+            vec![DirectoryFingerprint {
+                path: "/root".to_owned(),
+                parent: None,
+                root: "/root".to_owned(),
+                modified_ms: None,
+            }]
+        );
+
+        drop(storage);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn compatibility_recovery_distinguishes_create_building_and_idle_active() {
+        let path = temp_db_path("generation-compatibility");
+        let storage = SqliteStorage::open(path.clone()).unwrap();
+        let config_fingerprint = "same-config";
+        assert_eq!(
+            storage
+                .compatible_index_generation_recovery(
+                    config_fingerprint,
+                    INDEX_GENERATION_DATA_VERSION,
+                )
+                .unwrap()
+                .resume,
+            IndexGenerationResumeKind::Create
+        );
+
+        let building = storage
+            .open_or_create_index_staging(config_fingerprint, 1)
+            .unwrap();
+        let recovery = storage
+            .compatible_index_generation_recovery(config_fingerprint, INDEX_GENERATION_DATA_VERSION)
+            .unwrap();
+        assert_eq!(recovery.resume, IndexGenerationResumeKind::Building);
+        assert_eq!(recovery.pending.unwrap().batch_id, building.batch_id);
+
+        let prepared_id = storage
+            .complete_index_staging(config_fingerprint, 2)
+            .unwrap();
+        storage
+            .activate_prepared_generation(prepared_id, 0, config_fingerprint, &[])
+            .unwrap();
+        let recovery = storage
+            .compatible_index_generation_recovery(config_fingerprint, INDEX_GENERATION_DATA_VERSION)
+            .unwrap();
+        assert_eq!(recovery.resume, IndexGenerationResumeKind::Idle);
+        assert_eq!(recovery.active.unwrap().batch_id, prepared_id);
+        assert!(recovery.pending.is_none());
+
+        drop(storage);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn ten_compatible_reopens_do_not_create_additional_generations() {
+        let path = temp_db_path("generation-reopen-stability");
+        let config_fingerprint = "stable-config";
+        {
+            let storage = SqliteStorage::open(path.clone()).unwrap();
+            let staging = storage
+                .open_or_create_index_staging(config_fingerprint, 1)
+                .unwrap();
+            let prepared_id = storage
+                .complete_index_staging(config_fingerprint, 2)
+                .unwrap();
+            assert_eq!(prepared_id, staging.batch_id);
+            storage
+                .activate_prepared_generation(prepared_id, 0, config_fingerprint, &[])
+                .unwrap();
+        }
+
+        for _ in 0..10 {
+            let storage = SqliteStorage::open(path.clone()).unwrap();
+            let recovery = storage
+                .compatible_index_generation_recovery(
+                    config_fingerprint,
+                    INDEX_GENERATION_DATA_VERSION,
+                )
+                .unwrap();
+            assert_eq!(recovery.resume, IndexGenerationResumeKind::Idle);
+            assert!(recovery.active.is_some());
+            assert!(recovery.pending.is_none());
+            assert_eq!(
+                storage
+                    .index_storage_diagnostics()
+                    .unwrap()
+                    .generations
+                    .len(),
+                1
+            );
+        }
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn prepared_activation_is_atomic_and_preserves_old_active_on_mismatch() {
+        let path = temp_db_path("atomic-generation-activation");
+        let storage = SqliteStorage::open(path.clone()).unwrap();
+        let old_id = storage
+            .save_completed_index_batch(1, &[indexed_entry("/root/old.md")])
+            .unwrap();
+        storage
+            .set_index_batch_config_fingerprint(old_id, "old-config")
+            .unwrap();
+        storage.activate_baseline(old_id, 0).unwrap();
+
+        let new_id = storage
+            .save_completed_index_batch(2, &[indexed_entry("/root/new.md")])
+            .unwrap();
+        storage
+            .set_index_batch_config_fingerprint(new_id, "new-config")
+            .unwrap();
+        let manifest = [fingerprint("/root", None, "/root", 2)];
+        assert!(storage
+            .activate_prepared_generation(new_id, 4, "wrong-config", &manifest)
+            .is_err());
+        assert_eq!(
+            storage.runtime_state().unwrap().unwrap().active_baseline_id,
+            Some(old_id)
+        );
+        assert_eq!(
+            storage.index_generation(old_id).unwrap().unwrap().state,
+            IndexGenerationState::Active
+        );
+        assert_eq!(
+            storage.index_generation(new_id).unwrap().unwrap().state,
+            IndexGenerationState::Prepared
+        );
+
+        storage
+            .activate_prepared_generation(new_id, 4, "new-config", &manifest)
+            .unwrap();
+        assert_eq!(
+            storage.runtime_state().unwrap().unwrap().active_baseline_id,
+            Some(new_id)
+        );
+        assert_eq!(
+            storage.index_generation(old_id).unwrap().unwrap().state,
+            IndexGenerationState::Obsolete
+        );
+        assert_eq!(
+            storage.index_generation(new_id).unwrap().unwrap().state,
+            IndexGenerationState::Active
+        );
+        assert_eq!(
+            storage
+                .directory_manifest_for_root(&PathBuf::from("/root"))
+                .unwrap(),
+            manifest
+        );
+
+        drop(storage);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn generation_gc_keeps_active_and_latest_pending_and_reports_diagnostics() {
+        let path = temp_db_path("generation-gc");
+        let storage = SqliteStorage::open(path.clone()).unwrap();
+        let active_id = storage
+            .save_completed_index_batch(1, &[indexed_entry("/root/active.md")])
+            .unwrap();
+        storage.activate_baseline(active_id, 0).unwrap();
+        let obsolete_id = storage
+            .save_completed_index_batch(2, &[indexed_entry("/root/obsolete.md")])
+            .unwrap();
+        let pending_id = storage
+            .save_completed_index_batch(3, &[indexed_entry("/root/pending.md")])
+            .unwrap();
+
+        let gc = storage.garbage_collect_index_generations().unwrap();
+        assert!(gc.deleted_generations >= 1);
+        assert!(gc.deleted_entries >= 1);
+        assert!(storage.index_generation(obsolete_id).unwrap().is_none());
+        assert_eq!(
+            storage.index_generation(active_id).unwrap().unwrap().state,
+            IndexGenerationState::Active
+        );
+        assert_eq!(
+            storage.index_generation(pending_id).unwrap().unwrap().state,
+            IndexGenerationState::Prepared
+        );
+        let diagnostics = storage.index_storage_diagnostics().unwrap();
+        assert_eq!(diagnostics.active_generation, Some(active_id));
+        assert_eq!(diagnostics.pending_generation, Some(pending_id));
+        assert_eq!(diagnostics.last_gc, Some(gc));
+
+        drop(storage);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn legacy_database_reports_deferred_auto_vacuum_migration() {
+        let path = temp_db_path("legacy-auto-vacuum");
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute_batch("PRAGMA auto_vacuum = NONE; CREATE TABLE legacy (id INTEGER);")
+                .unwrap();
+        }
+        let storage = SqliteStorage::open(path.clone()).unwrap();
+        let diagnostics = storage.index_storage_diagnostics().unwrap();
+        assert!(!diagnostics.auto_vacuum_incremental);
+        assert!(diagnostics.auto_vacuum_migration_required);
+        assert!(storage.migrate_auto_vacuum().unwrap());
+        let diagnostics = storage.index_storage_diagnostics().unwrap();
+        assert!(diagnostics.auto_vacuum_incremental);
+        assert!(!diagnostics.auto_vacuum_migration_required);
+        assert!(!storage.migrate_auto_vacuum().unwrap());
 
         drop(storage);
         let _ = fs::remove_file(path);

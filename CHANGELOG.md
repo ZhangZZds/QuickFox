@@ -5,6 +5,53 @@
 
 ## Unreleased
 
+## [1.7.0] - 2026-08-18
+
+### Added
+
+- 新增 `building -> prepared -> active -> obsolete` 索引代际协议、逐目录恢复断点和原子
+  激活事务；相同配置的 building/prepared 在重启后继续原阶段，不再无条件重扫磁盘。
+- 新增统一 `IndexSource` 边界。Windows 固定 NTFS 卷使用无服务 Win32 批量枚举，能力
+  或语义不匹配时自动回退 Generic Scanner；USN 只做能力探测，不提权或安装服务。
+- 索引状态新增七个明确阶段、八类刷新原因，以及 active/pending generation、数据库、
+  WAL、freelist、auto-vacuum 和最近 GC 等存储诊断。
+
+### Changed
+
+- 启动同步阶段只创建托盘、快捷键和最小 Runtime；SQLite Active 恢复、校准、GC 和旧库
+  vacuum 迁移移到 setup 后的后台任务，第二实例不再加载完整索引。
+- 全量刷新搜索视图改为 Active + Root Preview + Incremental Overlay。已完成根在扫描和
+  finalizing 期间持续可搜索，只有新 Active 成功安装后才释放 Preview。
+- watcher 根先做祖先覆盖压缩，并按根隔离失败；活跃全量刷新会吸收同 revision 的
+  dirty-root 事件，避免紧接着排队第二轮全盘刷新。
+- 新 SQLite 使用 incremental auto-vacuum 和有界 WAL；激活后异步回收 obsolete/orphan
+  generation，旧 `auto_vacuum=NONE` 数据库通过后台维护迁移。
+- 设置页移除 1440 × 960 内容上限，使用完整窗口可视区域；后台恢复或维护降级不会用
+  阻塞性错误覆盖仍然可用的搜索结果。
+
+### Fixed
+
+- 修复 finalizing 前释放 Root Preview，导致已经完成的盘符结果暂时消失的问题。
+- 修复 prepared/building 异常退出后创建新 generation 并从头扫描的问题。
+- 修复嵌套热点目录重复注册 watcher、单根异常影响其他磁盘以及 dirty 事件触发连续全盘
+  刷新的问题。
+- 修复 generation 配置指纹和根路径可能进入前端存储诊断序列化的问题。
+
+### Verification
+
+- `npm run check` 通过：339 个前端测试、572 个默认 Rust 测试通过；6 个显式
+  release/benchmark 测试按设计默认忽略。
+- 额外以 release 模式运行两项 200 万条目测试并通过：常驻内存估算约 440.7 MiB，受测
+  常用查询最慢约 51.6ms。
+- Prettier、ESLint、TypeScript/Vite build、rustfmt、Clippy `-D warnings` 和
+  `git diff --check` 全部通过。
+
+### Validation scope
+
+- Windows 标准用户环境下约 200 万 NTFS 文件的 90 秒完整扫描目标、托盘与第二实例
+  P95、真实 SQLite 三轮刷新体积及四阶段强杀恢复仍需发布包实机记录；本版本不把 macOS
+  合成基线等同于 Windows 验收结论。
+
 ## [1.6.3] - 2026-08-17
 
 ### Fixed
@@ -121,5 +168,6 @@
   断盘恢复的完整结构化手工记录本次未补录；维护者已明确接受该发布验证边界。
 
 [1.6.3]: https://github.com/ZhangZZds/QuickFox/compare/v1.6.2...v1.6.3
+[1.7.0]: https://github.com/ZhangZZds/QuickFox/compare/v1.6.3...v1.7.0
 [1.6.1]: https://github.com/ZhangZZds/QuickFox/compare/v1.6.0...v1.6.1
 [1.6.0]: https://github.com/ZhangZZds/QuickFox/compare/v1.5.0...v1.6.0
