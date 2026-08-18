@@ -107,9 +107,63 @@ describe("tauriClient", () => {
     });
 
     await expect(indexStatus()).resolves.toMatchObject({
+      availability: "complete",
+      phase: "ready",
+      refreshReason: null,
       roots: [],
       incremental: defaultRuntimeIncrementalStatus(),
     });
+  });
+
+  it("preserves the explicit lifecycle phase and refresh reason from the new protocol", async () => {
+    invokeMock.mockResolvedValueOnce({
+      kind: "refreshing",
+      availability: "completing",
+      phase: "finalizing",
+      refreshReason: "preparedResume",
+      entryCount: 42,
+      generation: 4,
+      completedAtMs: 100,
+    });
+
+    await expect(indexStatus()).resolves.toMatchObject({
+      phase: "finalizing",
+      refreshReason: "preparedResume",
+      availability: "completing",
+    });
+  });
+
+  it("derives prepared and finalizing phases from legacy stage values", async () => {
+    invokeMock
+      .mockResolvedValueOnce({
+        kind: "building",
+        availability: "completing",
+        stage: "prepared",
+        entryCount: 10,
+        generation: 2,
+      })
+      .mockResolvedValueOnce({
+        kind: "building",
+        availability: "completing",
+        stage: "finalizing",
+        entryCount: 10,
+        generation: 2,
+      });
+
+    await expect(indexStatus()).resolves.toMatchObject({ phase: "prepared" });
+    await expect(indexStatus()).resolves.toMatchObject({ phase: "finalizing" });
+  });
+
+  it("falls back safely when a backend sends an unsupported phase", async () => {
+    invokeMock.mockResolvedValueOnce({
+      kind: "unbuilt",
+      availability: "unavailable",
+      phase: "unavailable",
+      entryCount: 0,
+      generation: 0,
+    });
+
+    await expect(indexStatus()).resolves.toMatchObject({ phase: "loadingActive" });
   });
 
   it("keeps unknown path and backend error fields out of the incremental contract", async () => {
@@ -218,6 +272,9 @@ describe("tauriClient", () => {
 
     expect(handler).toHaveBeenCalledWith(
       expect.objectContaining({
+        availability: "complete",
+        phase: "ready",
+        refreshReason: null,
         roots: [],
         incremental: defaultRuntimeIncrementalStatus(),
         configApply: defaultIndexConfigApplyStatus(),

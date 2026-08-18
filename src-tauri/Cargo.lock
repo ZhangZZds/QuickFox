@@ -3250,7 +3250,7 @@ dependencies = [
 
 [[package]]
 name = "quickfox"
-version = "1.6.3"
+version = "1.7.0"
 dependencies = [
  "arboard",
  "content_inspector",

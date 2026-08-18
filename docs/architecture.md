@@ -41,6 +41,14 @@ QuickFox 采用 Tauri 双端架构：
   - journal 提交、幂等恢复与 manifest repository 边界
 - `src-tauri/src/core/index_refresh_orchestrator.rs`
   - 启动/配置 revision/全量刷新时的 capture、校准与 generation fence
+- `src-tauri/src/core/index_generation.rs`
+  - `building`、`prepared`、`active`、`obsolete` 代际协议、恢复判定和存储诊断
+- `src-tauri/src/core/index_source.rs`
+  - 流式全量索引来源、进度、取消和目录断点接口
+- `src-tauri/src/core/generic_index_source.rs`
+  - 通用文件系统扫描降级路径
+- `src-tauri/src/core/windows_ntfs_index_source.rs`
+  - Windows 固定 NTFS 卷能力探测和无服务 Win32 批量枚举；不静默提权
 - `src-tauri/src/core/runtime_indexing.rs`
   - watcher、coordinator、scanner、journal 和 layered view 的运行期服务
 - `src-tauri/src/core/content_index.rs`
@@ -105,7 +113,7 @@ Tauri 启动时会初始化一份运行时状态，包含：
 - 最近一次索引报告
 - 当前索引状态
 
-启动时优先从 SQLite 读取最近完成的 baseline，再按 generation 重放 committed journal。恢复出的 name/path 视图会立即提供查询；没有 baseline 时文件 Provider 不阻塞其他 Provider，并返回文件索引暂不可用的反馈。启动校准和正文索引构建均在 Tauri setup 返回后的后台 worker 中进行。
+启动同步路径只创建单实例、托盘、快捷键和空的最小 Runtime。SQLite schema、最近 active baseline 和 committed journal 在 Tauri setup 返回后的后台 worker 中恢复，完成后通过短临界区挂载到查询视图。第二实例因此不需要加载完整 SQLite。恢复期间应用、历史、计算器、网页搜索和命令 Provider 可用；没有 baseline 时文件 Provider 返回暂不可用反馈。
 
 搜索和刷新索引都基于这份状态工作，而不是每次由前端硬编码构造假数据。计算器、网页搜索和命令 Provider 不依赖文件索引，因此索引构建期间仍可用。
 
@@ -157,6 +165,10 @@ baseline 在候选截断前过滤已被 overlay 替换或 tombstone 屏蔽的条
 
 baseline 的 name 候选使用 1–3 字符 n-gram：每个 posting 的有序 `EntryId` 使用 delta-varint 压缩。短查询和数字子串也由该索引生成候选，而不是退化为遍历整个 entry table；命中 fingerprint 后仍回读 packed name 复核，避免 hash 碰撞改变结果。路径 fuzzy 先按首字符和必要 ASCII 字符集合缩小范围，最终仍交给 matcher 验证 subsequence 语义。
 
+全量刷新使用明确代际：扫描写入 `building` 并逐目录保存断点，完成扫描后转为 `prepared`，最终索引与 manifest 就绪后在单个事务中切换为 `active`，旧 active 转为 `obsolete`。启动遇到同配置 `building` 时从目录前沿续扫，遇到 `prepared` 时直接恢复 Preview 并继续 finalization，不创建新扫描代际。搜索视图始终是 `ActiveBaseline + RootPreviews + IncrementalOverlay`；只有新 active 安装成功后才释放 Preview，finalizing 失败时旧 active 和 Preview 继续服务。
+
+Windows 固定 NTFS 卷优先使用 `FindFirstFileExW(FindExInfoBasic, FIND_FIRST_EX_LARGE_FETCH)` 流式枚举，并保留每目录恢复断点。Adapter 会探测卷类型和 USN Journal，但当前不会读取原始 MFT，也不会安装服务或触发提权；权限、文件系统或语义不适用时回退 Generic Scanner。MFT/USN 高权限服务仍需独立安全设计和维护者批准。
+
 正文查询复用相同可见性语义，但查询时不遍历 baseline 构造隐藏路径。delta 提交时生成只含 overlay 路径和 tombstone 的不可变可见性快照，Tantivy 命中后按路径段过滤。没有正文索引时，普通 name/path 查询仍可用；`content:` 返回“内容索引仍在准备”。非法正文查询返回语法反馈；reader/search I/O 失败返回“内容索引查询失败”，并让运行时进入可观察降级与恢复。
 
 ### 配置 desired/applied revision
@@ -188,6 +200,8 @@ Windows 首次配置默认把当前可用的盘符根目录写入 `include_dirs`
 | 单文件正文                   | 默认最大 2 MiB                 | 过大/二进制/不支持文件只跳过正文       |
 
 结构化 degradation code 为：`watcherInitializationFailed`、`watcherRuntimeFailed`、`watcherOverflow`、`channelOverflow`、`journalWriteFailed`、`journalReplayFailed`、`calibrationFailed`、`fullRefreshFallback`。前端同时只接收 enabled/state、pending 数、dirty root 数、最近批次条目/耗时和 code；不得包含完整路径或原始 watcher 事件。
+
+索引状态另外提供 `phase`、`refreshReason` 和缓存的 SQLite 诊断。诊断包括 active/pending 代际、各代际条目数、主库/WAL 大小、freelist/page 数、auto-vacuum 迁移状态和最近 GC；采集与维护在后台执行，状态查询本身不打开数据库。
 
 ### 正文索引版本目录与 GC
 

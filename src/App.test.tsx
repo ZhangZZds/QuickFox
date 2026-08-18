@@ -798,6 +798,56 @@ describe("App", () => {
     expect(status).toHaveTextContent("D:\\");
   });
 
+  it("does not claim entries are searchable before the backend publishes them", async () => {
+    vi.mocked(indexStatus).mockResolvedValueOnce({
+      kind: "building",
+      availability: "unavailable",
+      phase: "finalizing",
+      refreshReason: "initialBuild",
+      incremental: indexStatusWithIncremental({}).incremental,
+      entryCount: 90,
+      message: null,
+      generation: 2,
+      completedAtMs: null,
+    });
+    vi.mocked(search).mockResolvedValueOnce([]);
+
+    render(<App />);
+    fireEvent.change(screen.getByLabelText("搜索文件、目录、计算器、网页搜索或命令"), {
+      target: { value: "notes" },
+    });
+
+    const status = await screen.findByRole("region", { name: "启动器状态" });
+    expect(status).toHaveTextContent("文件索引正在最终合并");
+    expect(status).not.toHaveTextContent("文件搜索可用");
+  });
+
+  it("keeps active search non-blocking when background maintenance is degraded", async () => {
+    vi.mocked(indexStatus).mockResolvedValueOnce({
+      kind: "failed",
+      availability: "complete",
+      phase: "degraded",
+      refreshReason: "storageRecovery",
+      incremental: indexStatusWithIncremental({}).incremental,
+      entryCount: 120,
+      message: "旧代际清理失败，稍后重试",
+      generation: 8,
+      completedAtMs: 100,
+    });
+    vi.mocked(search).mockResolvedValueOnce([]);
+
+    render(<App />);
+    fireEvent.change(screen.getByLabelText("搜索文件、目录、计算器、网页搜索或命令"), {
+      target: { value: "notes" },
+    });
+
+    const status = await screen.findByRole("region", { name: "启动器状态" });
+    expect(status).toHaveTextContent("未找到结果");
+    expect(status).toHaveTextContent("现有文件搜索仍可用");
+    expect(status).not.toHaveTextContent("文件索引构建失败");
+    expect(within(status).queryByRole("button", { name: "刷新索引" })).not.toBeInTheDocument();
+  });
+
   it("debounces ordinary file searches during continuous typing", async () => {
     vi.useFakeTimers();
     vi.mocked(search).mockResolvedValueOnce(fileResults);
@@ -1893,6 +1943,56 @@ describe("App", () => {
     expect(screen.getAllByText("索引完成").length).toBeGreaterThan(0);
   });
 
+  it.each([
+    ["loadingActive", "正在加载已有索引"],
+    ["quickAvailable", "快速范围可搜索"],
+    ["scanning", "正在扫描"],
+    ["prepared", "扫描完成，等待最终构建"],
+    ["finalizing", "正在生成最终索引"],
+    ["ready", "文件索引可用"],
+    ["degraded", "索引降级运行"],
+  ] as const)("shows the %s index lifecycle phase", async (phase, label) => {
+    vi.mocked(indexStatus).mockResolvedValueOnce({
+      kind: phase === "ready" ? "ready" : phase === "degraded" ? "failed" : "building",
+      availability:
+        phase === "ready" || phase === "quickAvailable" || phase === "degraded"
+          ? "complete"
+          : "unavailable",
+      phase,
+      incremental: indexStatusWithIncremental({}).incremental,
+      entryCount: 12,
+      message: null,
+      generation: 2,
+      completedAtMs: null,
+    });
+
+    render(<App initialView="settings" />);
+
+    const summary = await screen.findByRole("region", { name: "索引状态摘要" });
+    expect(summary).toHaveTextContent(label);
+  });
+
+  it.each([
+    ["initialBuild", "首次构建"],
+    ["configChanged", "索引配置已更改"],
+    ["preparedResume", "继续已完成的扫描"],
+    ["buildingResume", "继续上次扫描"],
+    ["watcherOverflow", "文件变化事件过多"],
+    ["dirtyRoot", "索引目录需要校准"],
+    ["manualRefresh", "手动刷新"],
+    ["storageRecovery", "索引存储恢复"],
+  ] as const)("shows the %s refresh reason", async (refreshReason, label) => {
+    vi.mocked(indexStatus).mockResolvedValueOnce({
+      ...indexStatusWithIncremental({}),
+      refreshReason,
+    });
+
+    render(<App initialView="settings" />);
+
+    const summary = await screen.findByRole("region", { name: "索引状态摘要" });
+    expect(summary).toHaveTextContent(label);
+  });
+
   it("shows index mode and completion progress details in settings", async () => {
     vi.mocked(indexStatus).mockResolvedValueOnce({
       kind: "building",
@@ -1948,7 +2048,7 @@ describe("App", () => {
     expect(roots).toHaveTextContent("D:\\");
     expect(roots).toHaveTextContent("可搜索");
     expect(roots).toHaveTextContent("C:\\");
-    expect(roots).toHaveTextContent("部分可用");
+    expect(roots).toHaveTextContent("部分可搜索");
   });
 
   it("shows the index settings as a layered workspace", async () => {
@@ -1959,6 +2059,13 @@ describe("App", () => {
     expect(within(indexSection).getByRole("region", { name: "索引状态摘要" })).toBeInTheDocument();
     expect(within(indexSection).getByRole("region", { name: "主规则编辑" })).toBeInTheDocument();
     expect(within(indexSection).getByRole("region", { name: "辅助信息" })).toBeInTheDocument();
+  });
+
+  it("marks the settings shell for viewport-filling layout", async () => {
+    render(<App initialView="settings" />);
+    await screen.findByDisplayValue("/tmp");
+
+    expect(screen.getByRole("main", { name: "QuickFox launcher" })).toHaveClass("settings-shell");
   });
 
   it("keeps regex prefix and maintenance paths in the index auxiliary column", async () => {

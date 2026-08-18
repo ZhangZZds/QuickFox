@@ -2,13 +2,18 @@
 
 use crate::core::index_entry::IndexDegradationCode;
 use notify::event::{ModifyKind, RenameMode};
-use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{Event, EventKind, RecursiveMode, Watcher};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+#[cfg(all(target_os = "macos", test))]
+use notify::KqueueWatcher as PlatformWatcher;
+#[cfg(not(all(target_os = "macos", test)))]
+use notify::RecommendedWatcher as PlatformWatcher;
 
 pub const DEFAULT_WATCH_CHANNEL_CAPACITY: usize = 8_192;
 
@@ -254,7 +259,7 @@ impl WatcherFailure {
 
 #[derive(Debug)]
 pub struct RuntimeIndexWatcher {
-    _watchers: Vec<RecommendedWatcher>,
+    _watchers: Vec<PlatformWatcher>,
     _registration_probe: tempfile::TempDir,
     watched_roots: Vec<PathBuf>,
     inbox: Option<WatchEventInbox>,
@@ -316,8 +321,8 @@ impl RuntimeIndexWatcher {
             let (registration_ack, registration_ack_receiver) = mpsc::channel();
             let callback_probe = probe_path.clone();
             let root_sender = callback_sender.clone();
-            let mut watcher =
-                match notify::recommended_watcher(move |result: notify::Result<Event>| {
+            let mut watcher = match PlatformWatcher::new(
+                move |result: notify::Result<Event>| {
                     if result.as_ref().is_ok_and(|event| {
                         event
                             .paths
@@ -328,15 +333,17 @@ impl RuntimeIndexWatcher {
                         return;
                     }
                     dispatch_notify_result(result, &root_sender);
-                }) {
-                    Ok(watcher) => watcher,
-                    Err(error) => {
-                        let failure = WatcherFailure::new(root.clone(), error.to_string());
-                        callback_sender.record_failure(failure.clone());
-                        latest_failure = Some(failure);
-                        continue;
-                    }
-                };
+                },
+                notify::Config::default(),
+            ) {
+                Ok(watcher) => watcher,
+                Err(error) => {
+                    let failure = WatcherFailure::new(root.clone(), error.to_string());
+                    callback_sender.record_failure(failure.clone());
+                    latest_failure = Some(failure);
+                    continue;
+                }
+            };
 
             // Each root owns an independent native watcher. A registration or runtime failure on
             // one volume therefore cannot tear down event delivery for another volume.
